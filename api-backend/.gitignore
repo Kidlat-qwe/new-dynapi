@@ -1,0 +1,5 @@
+node_modules/
+.env
+*.log
+# Firebase service account key (contains private key)
+*-firebase-adminsdk-*.json

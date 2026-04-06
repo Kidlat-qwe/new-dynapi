@@ -1,0 +1,866 @@
+@import "tailwindcss";
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  overflow: hidden;
+}
+
+#root {
+  width: 100%;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* When modal is open, apply a global blur effect and make text red */
+body.modal-open > * {
+  filter: blur(4px);
+  color: red !important;
+}
+
+/* Ensure the modal is never blurred and text remains normal color */
+.no-blur,
+.no-blur * {
+  filter: none !important;
+  color: initial !important; /* Reset to default text color */
+}
+
+/* Ensure the z-50 elements (modal) are never blurred and text remains normal color */
+.z-50,
+.z-50 * {
+  filter: none !important;
+  color: initial !important; /* Reset to default text color */
+}
+
+/* Fix for jQuery :contains selector not working in vanilla JS */
+.blur-sidebar {
+  filter: blur(4px);
+}
+
+.blur-header {
+  filter: blur(4px);
+}
+
+/* Fix for content pages to prevent unnecessary scrolling */
+.content-container {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+@keyframes slide-up {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.3s ease-out;
+}
+
+/* PDF Print Styles */
+.printing table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.printing th,
+.printing td {
+  border: 1px solid #000;
+  padding: 4px;
+  text-align: center;
+}
+
+.printing th {
+  background-color: #f3f4f6;
+  font-weight: 600;
+}
+
+.printing .rounded-lg {
+  border-radius: 0 !important;
+}
+
+.printing .shadow-sm,
+.printing .shadow-lg,
+.printing .shadow-xl {
+  box-shadow: none !important;
+}
+
+/* Match the exact layout from the screenshot */
+.printing .attendance-header {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.printing .attendance-header label {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.printing .attendance-header input,
+.printing .attendance-header select {
+  border: 1px solid #000;
+  padding: 4px;
+  width: 100%;
+}
+
+/* Styling for day abbreviations */
+.printing .day-abbr {
+  font-size: 10px;
+  text-align: center;
+}
+
+/* Status display styling */
+.printing .status-p {
+  content: "P";
+}
+
+.printing .status-a {
+  content: "X";
+}
+
+.printing .status-l {
+  background: linear-gradient(to top left, transparent 50%, #000 50%);
+}
+
+/* Summary table styling */
+.printing .summary-section {
+  margin-top: 24px;
+  page-break-before: always;
+}
+
+.printing .guidelines-section {
+  width: 35%;
+  border-right: 1px solid #000;
+  padding: 12px;
+  vertical-align: top;
+  font-size: 12px;
+}
+
+.printing .stats-section {
+  width: 65%;
+  padding: 12px;
+  vertical-align: top;
+}
+
+.printing .signature-line {
+  border-bottom: 1px solid #000;
+  display: inline-block;
+  min-width: 200px;
+  text-align: center;
+  margin: 0 auto;
+  font-weight: 600;
+}
+
+/* PDF Template Styles */
+.pdf-template {
+  display: none !important; /* Hidden by default and when generating PDF */
+  font-family: Arial, sans-serif;
+  position: absolute;
+  left: -9999px;
+  top: -9999px;
+  visibility: hidden;
+}
+
+body.generating-pdf .pdf-template {
+  /* Keep hidden but still renderable for html2canvas */
+  display: block !important;
+  position: absolute;
+  left: -9999px; 
+  top: -9999px;
+  visibility: visible;
+}
+
+.first-page, .second-page {
+  position: relative;
+  width: 100%;
+  padding: 10mm;
+  padding-top: 5mm;
+  box-sizing: border-box;
+  background-color: white;
+  margin-bottom: 15mm;
+}
+
+/* Apply pdf-hide class for elements that should be hidden in PDF */
+body.generating-pdf .pdf-hide {
+  display: none !important;
+}
+
+/* Header Grid */
+.header-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-top: 5px;
+  margin-bottom: 12px;
+}
+
+.header-item {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 3px;
+}
+
+.header-label {
+  font-weight: bold;
+  font-size: 12px;
+  margin-bottom: 2px;
+}
+
+.header-value {
+  border: 1px solid #000;
+  padding: 4px 8px;
+  font-size: 14px;
+  background-color: white;
+  min-height: 22px;
+}
+
+/* Attendance Table */
+.attendance-table {
+  width: 100%;
+  border-collapse: collapse;
+  border: 1.5px solid #000;
+  font-family: Arial, sans-serif;
+}
+
+.attendance-table th,
+.attendance-table td {
+  border: 1px solid #000;
+  padding: 4px;
+  text-align: center;
+  font-size: 12px;
+  height: 22px;
+}
+
+.name-column {
+  text-align: left;
+  padding-left: 8px;
+  min-width: 150px;
+  font-weight: bold;
+}
+
+.day-column {
+  width: 24px;
+  font-weight: bold;
+}
+
+.day-abbr {
+  font-size: 10px;
+  font-weight: normal;
+}
+
+.total-header, .remarks-column {
+  font-weight: bold;
+}
+
+.remarks-subtext {
+  font-size: 9px;
+  font-weight: normal;
+  font-style: italic;
+}
+
+.total-absent, .total-late {
+  width: 30px;
+  position: relative;
+}
+
+.total-late::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  background: linear-gradient(to top left, transparent 50%, #000 50%);
+  z-index: 1;
+}
+
+.student-name {
+  text-align: left;
+  padding-left: 8px;
+}
+
+.day-cell {
+  font-weight: normal;
+}
+
+.status-present {
+  font-weight: bold;
+}
+
+.status-absent {
+  font-weight: bold;
+}
+
+.status-late {
+  position: relative;
+}
+
+.status-late::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  background: linear-gradient(to top left, transparent 50%, #000 50%);
+  z-index: 1;
+}
+
+.remarks-cell {
+  text-align: left;
+  padding-left: 8px;
+}
+
+.summary-row {
+  background-color: #f3f4f6;
+}
+
+.summary-label {
+  text-align: left;
+  padding-left: 8px;
+  font-size: 11px;
+  font-weight: bold;
+}
+
+.combined-row {
+  background-color: #e5e7eb;
+}
+
+/* Guidelines Table */
+.guidelines-table {
+  width: 100%;
+  border-collapse: collapse;
+  border: 1.5px solid #000;
+  margin-top: 20px;
+}
+
+.guidelines-table td {
+  border: 1px solid #000;
+  vertical-align: top;
+}
+
+.guidelines-section {
+  width: 32%;
+  padding: 10px;
+  border-right: 1.5px solid #000;
+}
+
+.stats-section {
+  width: 68%;
+  padding: 10px;
+}
+
+.section-title {
+  font-weight: bold;
+  font-size: 14px;
+  margin-bottom: 8px;
+}
+
+.subsection-title {
+  font-weight: bold;
+  font-size: 12px;
+  margin-top: 8px;
+  margin-bottom: 4px;
+}
+
+.reason-item {
+  font-size: 11px;
+  margin: 2px 0;
+}
+
+.stats-table {
+  width: 100%;
+  border-collapse: collapse;
+  border: 1.5px solid #000;
+}
+
+.stats-table th, 
+.stats-table td {
+  border: 1px solid #000;
+  padding: 5px;
+  text-align: center;
+  font-size: 12px;
+}
+
+.stats-header {
+  background-color: white;
+  font-weight: bold;
+}
+
+.gender-header {
+  width: 8%;
+  font-weight: bold;
+}
+
+.stats-label {
+  text-align: left;
+  padding-left: 8px;
+}
+
+.stats-value {
+  font-weight: normal;
+}
+
+.certification {
+  margin-top: 24px;
+}
+
+.certification-text {
+  text-align: left;
+  margin-top: 20px;
+  margin-left: 20px;
+  font-size: 12px;
+}
+
+.signature-block {
+  margin: 25px 0;
+  text-align: center;
+}
+
+.signature-name {
+  border-bottom: 1px solid #000;
+  display: inline-block;
+  min-width: 250px;
+  font-weight: bold;
+  padding-bottom: 2px;
+}
+
+.signature-title {
+  margin-top: 5px;
+}
+
+.attestation-text {
+  text-align: left;
+  margin-left: 20px;
+  font-size: 12px;
+}
+
+/* Additional specific styling to match the screenshots */
+body.generating-pdf {
+  background-color: white;
+}
+
+.pdf-template .header-grid {
+  margin-bottom: 20px;
+}
+
+.pdf-template .attendance-table {
+  margin-bottom: 0;
+}
+
+.pdf-template .status-present {
+  font-weight: bold;
+}
+
+.pdf-template .status-absent::after {
+  content: "X";
+  font-weight: bold;
+}
+
+/* Match Late Cell (half-shaded diagonal split) */
+.pdf-template .status-late {
+  position: relative;
+  overflow: hidden;
+}
+
+.pdf-template .status-late::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(315deg, transparent calc(50% - 1px), black calc(50% - 1px), black calc(50% + 1px), transparent calc(50% + 1px));
+}
+
+/* Specific table header styling */
+.pdf-template .day-column {
+  font-weight: bold;
+  background-color: #f2f2f2;
+}
+
+.pdf-template .day-abbr {
+  font-size: 8px;
+  font-weight: normal;
+  color: #333;
+}
+
+/* Total columns styling */
+.pdf-template .total-header {
+  background-color: #f2f2f2;
+  font-weight: bold;
+}
+
+.pdf-template .total-value {
+  font-weight: bold;
+}
+
+/* Summary row styling */
+.pdf-template .summary-row {
+  background-color: #f2f2f2;
+}
+
+.pdf-template .combined-row {
+  background-color: #e5e7eb;
+}
+
+/* Second page styling specifics */
+.pdf-template .section-title {
+  font-size: 14px;
+  font-weight: bold;
+  margin: 8px 0;
+}
+
+.pdf-template .subsection-title {
+  font-size: 12px;
+  font-weight: bold;
+  margin: 6px 0 3px;
+}
+
+.pdf-template .guidelines-content {
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.pdf-template .guidelines-section {
+  padding: 10px;
+}
+
+.pdf-template .stats-section {
+  padding: 10px;
+}
+
+.pdf-template .stats-label {
+  font-size: 11px;
+}
+
+.pdf-template .certification-text {
+  margin-top: 20px;
+}
+
+.pdf-template .signature-block {
+  margin: 25px 0;
+}
+
+.pdf-template .signature-name {
+  padding-bottom: 2px;
+  min-width: 200px;
+  font-weight: bold;
+}
+
+/* Updated styling to match the exact image format */
+.pdf-template .attendance-table {
+  width: 100%;
+  border-collapse: collapse;
+  border: 1px solid #000;
+  font-family: Arial, sans-serif;
+}
+
+.pdf-template .attendance-table th,
+.pdf-template .attendance-table td {
+  border: 1px solid #000;
+  padding: 4px;
+  text-align: center;
+  font-size: 12px;
+  height: 20px;
+}
+
+.pdf-template .name-column {
+  text-align: left;
+  padding-left: 8px;
+  min-width: 160px;
+  font-weight: bold;
+}
+
+.pdf-template .day-column {
+  width: 24px;
+  font-weight: bold;
+}
+
+.pdf-template .day-abbr {
+  font-size: 10px;
+  font-weight: normal;
+}
+
+.pdf-template .total-header, 
+.pdf-template .remarks-column {
+  font-weight: bold;
+}
+
+.pdf-template .total-column {
+  width: 40px;
+  font-weight: bold;
+}
+
+.pdf-template .student-name {
+  text-align: left;
+  padding-left: 8px;
+  font-weight: normal;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.pdf-template .student-name div {
+  margin: 0;
+  padding: 0;
+}
+
+.pdf-template .day-cell {
+  font-weight: normal;
+  position: relative;
+  width: 24px;
+  height: 20px;
+}
+
+/* Updated diagonal-shade class to match the image exactly */
+.pdf-template .diagonal-shade {
+  position: relative;
+  overflow: hidden;
+}
+
+.pdf-template .diagonal-shade::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(to bottom right, black 49.5%, transparent 50.5%);
+  z-index: 1;
+}
+
+/* Update summary rows to match the image exactly */
+.pdf-template .summary-row {
+  background-color: #f3f4f6;
+}
+
+.pdf-template .summary-label {
+  text-align: left;
+  padding-left: 8px;
+  font-size: 11px;
+  font-weight: bold;
+  text-transform: uppercase;
+}
+
+.pdf-template .combined-row {
+  background-color: #e5e7eb;
+}
+
+/* Remarks column styling */
+.pdf-template .remarks-column {
+  min-width: 150px;
+}
+
+.pdf-template .remarks-subtext {
+  font-size: 9px;
+  font-weight: normal;
+  font-style: italic;
+  color: #666;
+}
+
+.pdf-template .remarks-cell {
+  text-align: left;
+  padding-left: 8px;
+  font-size: 11px;
+}
+
+/* Specific styling to match the image */
+.pdf-template .total-value {
+  font-weight: bold;
+  font-size: 14px;
+}
+
+/* Fix for getStatusDisplay */
+.pdf-template .getStatusDisplay-A,
+.pdf-template .getStatusDisplay-a {
+  content: "X";
+}
+
+/* Custom class for day of week display */
+.pdf-template .day-abbr {
+  font-size: 9px;
+  color: #333;
+  font-weight: normal;
+  font-family: Arial, sans-serif;
+}
+
+/* Grades PDF Template Styles */
+.grades-pdf-template {
+  display: none !important; /* Hidden by default, shown only when generating PDF */
+  font-family: Arial, sans-serif !important;
+  color: black !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  background-color: white !important;
+  position: absolute !important;
+  left: -9999px !important;
+  top: -9999px !important;
+  visibility: hidden !important;
+}
+
+body.generating-grades-pdf .grades-pdf-template {
+  display: block !important;
+  position: absolute !important;
+  left: -9999px !important;
+  top: -9999px !important;
+  width: 100% !important;
+  visibility: visible !important;
+  background-color: white !important;
+  overflow: auto !important;
+}
+
+body.generating-grades-pdf {
+  background-color: white !important;
+  overflow: hidden !important;
+}
+
+.grades-pdf-template .first-page {
+  position: relative;
+  width: 100%;
+  padding: 10mm;
+  box-sizing: border-box;
+  background-color: white !important;
+  margin-bottom: 20mm;
+}
+
+/* Header Grid */
+.grades-pdf-template .header-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.grades-pdf-template .header-item {
+  display: flex;
+  flex-direction: column;
+}
+
+.grades-pdf-template .header-label {
+  font-weight: bold !important;
+  font-size: 12px !important;
+}
+
+.grades-pdf-template .header-value {
+  border: 1px solid #000 !important;
+  padding: 4px 8px !important;
+  font-size: 14px !important;
+}
+
+/* Grades Table */
+.grades-pdf-template .grades-table {
+  width: 100% !important;
+  border-collapse: collapse !important;
+  border: 1px solid #000 !important;
+  font-family: Arial, sans-serif !important;
+  margin-top: 15px !important;
+  margin-bottom: 20px !important;
+}
+
+.grades-pdf-template .grades-table th,
+.grades-pdf-template .grades-table td {
+  border: 1px solid #000 !important;
+  padding: 4px !important;
+  text-align: center !important;
+  font-size: 12px !important;
+  height: 20px !important;
+}
+
+/* Special styling for grade headers */
+.grades-pdf-template .grades-table thead tr:first-child th:nth-last-child(1),
+.grades-pdf-template .grades-table thead tr:first-child th:nth-last-child(2) {
+  border-left: 1px solid black !important;
+  border-right: 1px solid black !important;
+  border-top: 1px solid black !important;
+  border-bottom: none !important;
+}
+
+/* Special styling for cells below grade headers */
+.grades-pdf-template .grades-table thead tr:nth-child(2) th:nth-last-child(1),
+.grades-pdf-template .grades-table thead tr:nth-child(2) th:nth-last-child(2) {
+  border-left: 1px solid black !important;
+  border-right: 1px solid black !important;
+  border-top: none !important;
+  border-bottom: 1px solid black !important;
+}
+
+.grades-pdf-template .grades-table th {
+  background-color: #f2f2f2 !important;
+  font-weight: bold !important;
+}
+
+.grades-pdf-template .grades-table td {
+  background-color: white !important;
+}
+
+/* Signature Section */
+.grades-pdf-template .signature-section {
+  margin-top: 30px !important;
+}
+
+.grades-pdf-template .certification-text {
+  font-size: 12px !important;
+  margin-bottom: 20px !important;
+  text-align: center !important;
+}
+
+.grades-pdf-template .signature-blocks {
+  display: flex !important;
+  justify-content: space-around !important;
+  margin-top: 30px !important;
+}
+
+.grades-pdf-template .signature-block {
+  text-align: center !important;
+  margin: 20px 0 !important;
+}
+
+.grades-pdf-template .signature-name {
+  border-bottom: 1px solid #000 !important;
+  display: inline-block !important;
+  min-width: 200px !important;
+  text-align: center !important;
+  font-weight: bold !important;
+  padding-bottom: 4px !important;
+}
+
+.grades-pdf-template .signature-title {
+  font-size: 12px !important;
+  margin-top: 4px !important;
+}
+
+/* Enhanced diagonal shading for Late status */
+.diagonal-shade {
+  position: relative !important;
+  overflow: hidden !important;
+}
+
+/* Use border triangle for shading */
+.diagonal-shade::before {
+  content: none;
+}
+
+/* Additional overlay for better PDF rendering */
+.diagonal-shade-overlay {
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  background: linear-gradient(to bottom right, black 49.5%, transparent 50.5%) !important;
+  z-index: 2 !important;
+}
