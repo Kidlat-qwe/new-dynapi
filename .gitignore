@@ -3,3 +3,10 @@
 **/.env
 **/*firebase-adminsdk*.json
 
+
+# Local-only / secrets
+**/.env
+**/.env.*
+**/*firebase-adminsdk*.json
+api-backend/external-backend/funtalk-backend/uploads/
+
