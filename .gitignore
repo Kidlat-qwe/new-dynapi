@@ -1,0 +1,5 @@
+
+# Secrets
+**/.env
+**/*firebase-adminsdk*.json
+
