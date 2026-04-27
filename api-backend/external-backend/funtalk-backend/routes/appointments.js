@@ -40,17 +40,20 @@ router.post(
   '/',
   authenticate,
   [
-    body('teacherId').isInt().withMessage('Teacher ID is required'),
+    body('teacherId').optional({ nullable: true, checkFalsy: true }).isInt().withMessage('Teacher ID must be a valid integer'),
     body('appointmentDate').isISO8601().withMessage('Valid appointment date is required'),
     body('appointmentTime').matches(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).withMessage('Valid time format is required (HH:MM)'),
     body('studentName').trim().notEmpty().withMessage('Student name is required'),
-    body('studentAge').optional().isInt({ min: 1, max: 120 }),
-    body('studentLevel').optional().isString(),
-    body('materialId').optional().isInt(),
-    body('classType').optional().isString(),
-    body('additionalNotes').optional().isString(),
-    body('studentId').optional().isInt(),
-    body('schoolId').optional().isInt().withMessage('School ID must be a valid integer'), // For admin/superadmin to book on behalf of school
+    body('studentAge').optional({ nullable: true, checkFalsy: true }).isInt({ min: 1, max: 120 }),
+    body('studentLevel').optional({ nullable: true, checkFalsy: true }).isString(),
+    body('materialId').optional({ nullable: true, checkFalsy: true }).isInt(),
+    body('classType').optional({ nullable: true, checkFalsy: true }).isIn(['one_on_one', 'group', 'vip']),
+    body('duration').optional({ nullable: true, checkFalsy: true }).isIn(['25', '50', '75', '100']),
+    body('materialType').optional({ nullable: true, checkFalsy: true }).isIn(['teacher_provided', 'student_provided', 'free_talk']),
+    body('teacherRequirements').optional().isArray(),
+    body('additionalNotes').optional({ nullable: true }).isString(),
+    body('studentId').optional({ nullable: true, checkFalsy: true }).isInt(),
+    body('schoolId').optional({ nullable: true, checkFalsy: true }).isInt().withMessage('School ID must be a valid integer'), // For admin/superadmin to book on behalf of school
     handleValidationErrors,
   ],
   appointmentController.createAppointment
@@ -67,6 +70,9 @@ router.put(
   [
     body('status').isIn(['pending', 'approved', 'completed', 'cancelled', 'no_show']).withMessage('Invalid status'),
     body('changeReason').optional().isString(),
+    body('teacherId').optional({ nullable: true, checkFalsy: true }).isInt(),
+    body('meetingLink').optional({ nullable: true, checkFalsy: true }).isURL().withMessage('Meeting link must be a valid URL'),
+    body('meetingPlatform').optional({ nullable: true, checkFalsy: true }).isIn(['zoom', 'agora', 'google_meet', 'other']),
     handleValidationErrors,
   ],
   appointmentController.updateAppointmentStatus

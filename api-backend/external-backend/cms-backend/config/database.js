@@ -32,21 +32,17 @@ const pool = new Pool({
 });
 
 // Log database connection info (without sensitive data)
-if (process.env.QUIET_STARTUP !== '1') {
-  console.log('📊 Database Configuration:', {
-    host: dbHost,
-    database: process.env.DB_NAME || 'psms_db',
-    port: process.env.DB_PORT || 5432,
-    ssl: useSSL,
-    user: process.env.DB_USER || 'postgres',
-  });
-}
+console.log('📊 Database Configuration:', {
+  host: dbHost,
+  database: process.env.DB_NAME || 'psms_db',
+  port: process.env.DB_PORT || 5432,
+  ssl: useSSL,
+  user: process.env.DB_USER || 'postgres',
+});
 
 // Test database connection
 pool.on('connect', () => {
-  if (process.env.QUIET_STARTUP !== '1') {
-    console.log('✅ Database connected successfully');
-  }
+  console.log('✅ Database connected successfully');
 });
 
 pool.on('error', (err) => {
@@ -60,9 +56,7 @@ export const query = async (text, params) => {
   try {
     const res = await pool.query(text, params);
     const duration = Date.now() - start;
-    if (process.env.DEBUG_DB_QUERIES === '1') {
-      console.log('Executed query', { text, duration, rows: res.rowCount });
-    }
+    console.log('Executed query', { text, duration, rows: res.rowCount });
     return res;
   } catch (error) {
     console.error('Database query error:', error);

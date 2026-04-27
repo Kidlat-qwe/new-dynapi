@@ -15,7 +15,10 @@ router.get(
   '/',
   authenticate,
   [
-    query('schoolId').optional().isInt().withMessage('School ID must be a valid integer'),
+    query('schoolId')
+      .optional()
+      .custom((value) => value === undefined || value === null || value === '' || value === 'undefined' || value === 'null' || Number.isInteger(Number(value)))
+      .withMessage('School ID must be a valid integer'),
     handleValidationErrors,
   ],
   studentController.getStudents
@@ -39,13 +42,30 @@ router.post(
   isSchool,
   [
     body('studentName').trim().notEmpty().withMessage('Student name is required'),
-    body('studentAge').optional().isInt({ min: 1, max: 120 }),
-    body('studentLevel').optional().isString(),
-    body('studentEmail').optional().isEmail(),
-    body('studentPhone').optional().isString(),
-    body('parentName').optional().isString(),
-    body('parentContact').optional().isString(),
-    body('notes').optional().isString(),
+    body('studentAge')
+      .exists({ checkFalsy: true })
+      .withMessage('Age is required')
+      .isInt({ min: 1, max: 120 })
+      .withMessage('Age must be a whole number between 1 and 120'),
+    body('studentLevel').optional({ nullable: true, checkFalsy: true }).isString(),
+    body('studentEmail')
+      .trim()
+      .notEmpty()
+      .withMessage('Email is required')
+      .isEmail()
+      .withMessage('Please provide a valid email address'),
+    body('studentPhone').optional({ nullable: true, checkFalsy: true }).isString(),
+    body('parentName')
+      .trim()
+      .notEmpty()
+      .withMessage('Parent name is required')
+      .isString(),
+    body('parentContact')
+      .trim()
+      .notEmpty()
+      .withMessage('Parent contact is required')
+      .isString(),
+    body('notes').optional({ nullable: true }).isString(),
     handleValidationErrors,
   ],
   studentController.createStudent
@@ -61,14 +81,31 @@ router.put(
   authenticate,
   isSchool,
   [
-    body('studentName').optional().trim().notEmpty(),
-    body('studentAge').optional().isInt({ min: 1, max: 120 }),
-    body('studentLevel').optional().isString(),
-    body('studentEmail').optional().isEmail(),
-    body('studentPhone').optional().isString(),
-    body('parentName').optional().isString(),
-    body('parentContact').optional().isString(),
-    body('notes').optional().isString(),
+    body('studentName').optional({ nullable: true, checkFalsy: true }).trim().notEmpty(),
+    body('studentAge')
+      .exists({ checkFalsy: true })
+      .withMessage('Age is required')
+      .isInt({ min: 1, max: 120 })
+      .withMessage('Age must be a whole number between 1 and 120'),
+    body('studentLevel').optional({ nullable: true, checkFalsy: true }).isString(),
+    body('studentEmail')
+      .trim()
+      .notEmpty()
+      .withMessage('Email is required')
+      .isEmail()
+      .withMessage('Please provide a valid email address'),
+    body('studentPhone').optional({ nullable: true, checkFalsy: true }).isString(),
+    body('parentName')
+      .trim()
+      .notEmpty()
+      .withMessage('Parent name is required')
+      .isString(),
+    body('parentContact')
+      .trim()
+      .notEmpty()
+      .withMessage('Parent contact is required')
+      .isString(),
+    body('notes').optional({ nullable: true }).isString(),
     body('isActive').optional().isBoolean(),
     handleValidationErrors,
   ],

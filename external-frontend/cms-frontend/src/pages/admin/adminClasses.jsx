@@ -5,6 +5,8 @@ import { apiRequest } from '../../config/api';
 import FixedTablePagination from '../../components/table/FixedTablePagination';
 import { useAuth } from '../../contexts/AuthContext';
 import { formatDateManila, formatSessionCode } from '../../utils/dateUtils';
+import { calculateSessionDate } from '../../utils/sessionCalculation';
+import { appAlert, appPrompt, appConfirm } from '../../utils/appAlert';
 
 const AdminClasses = () => {
   const ITEMS_PER_PAGE = 10;
@@ -89,13 +91,14 @@ const AdminClasses = () => {
   const [noteDraft, setNoteDraft] = useState('');
   const [agendaDraft, setAgendaDraft] = useState('');
   const [isEnrollModalOpen, setIsEnrollModalOpen] = useState(false);
-  const [enrollStep, setEnrollStep] = useState('enrollment-option'); // 'enrollment-option', 'ack-receipt-selection', 'package-selection', 'student-selection', 'review'
+  const [enrollStep, setEnrollStep] = useState('enrollment-option'); // 'enrollment-option', 'ack-receipt-selection', 'package-selection', 'installment-setup', 'student-selection', 'review'
   const [selectedClassForEnrollment, setSelectedClassForEnrollment] = useState(null);
   const [selectedEnrollmentOption, setSelectedEnrollmentOption] = useState(null); // 'package', 'per-phase', 'reservation', 'ack-receipt'
   const [ackReceipts, setAckReceipts] = useState([]);
   const [ackReceiptsLoading, setAckReceiptsLoading] = useState(false);
   const [ackReceiptsError, setAckReceiptsError] = useState('');
   const [ackSearchTerm, setAckSearchTerm] = useState('');
+  const [debouncedAckSearch, setDebouncedAckSearch] = useState('');
   const [selectedAckReceipt, setSelectedAckReceipt] = useState(null);
   const [isViewStudentsModalOpen, setIsViewStudentsModalOpen] = useState(false);
   const [viewStudentsStep, setViewStudentsStep] = useState('phase-selection'); // 'phase-selection' or 'students-list'
@@ -172,7 +175,24 @@ const AdminClasses = () => {
   const [selectedTargetClassForMove, setSelectedTargetClassForMove] = useState(null);
   const [moveStudentSubmitting, setMoveStudentSubmitting] = useState(false);
   const [moveSourceClass, setMoveSourceClass] = useState(null);
+  const [openViewStudentMenuKey, setOpenViewStudentMenuKey] = useState(null);
+  const [viewStudentMenuPosition, setViewStudentMenuPosition] = useState({ top: 0, right: 0 });
+  const [viewStudentMenuTarget, setViewStudentMenuTarget] = useState(null);
+  const [isChangePackageModalOpen, setIsChangePackageModalOpen] = useState(false);
+  const [studentToChangePackage, setStudentToChangePackage] = useState(null);
+  const [changePackageSourceClass, setChangePackageSourceClass] = useState(null);
+  const [changePackageOptions, setChangePackageOptions] = useState([]);
+  const [loadingChangePackageOptions, setLoadingChangePackageOptions] = useState(false);
+  const [selectedTargetPackageForChange, setSelectedTargetPackageForChange] = useState(null);
+  const [changePackagePreview, setChangePackagePreview] = useState(null);
+  const [loadingChangePackagePreview, setLoadingChangePackagePreview] = useState(false);
+  const [changePackageSubmitting, setChangePackageSubmitting] = useState(false);
   const [showInstallmentSettings, setShowInstallmentSettings] = useState(false);
+  const [installmentScopeSettings, setInstallmentScopeSettings] = useState({
+    phase_start: '',
+    phase_end: '',
+    include_downpayment: true,
+  });
   const [showPackageDetails, setShowPackageDetails] = useState(true); // Default to open/expanded
   const [installmentSettings, setInstallmentSettings] = useState({
     invoice_issue_date: '',
@@ -410,8 +430,29 @@ const initializePackageMerchSelections = useCallback(
 
   const fetchStudents = async (branchId) => {
     try {
-      const response = await apiRequest(`/users?user_type=Student&branch_id=${branchId}&limit=100`);
-      setStudents(response.data || []);
+      const normalizedBranchId = branchId ?? adminBranchId ?? null;
+      if (!normalizedBranchId) {
+        setStudents([]);
+        return;
+      }
+
+      const allStudents = [];
+      const limit = 100; // backend max limit
+      let page = 1;
+      let hasMore = true;
+
+      while (hasMore) {
+        const response = await apiRequest(
+          `/users?user_type=Student&branch_id=${normalizedBranchId}&limit=${limit}&page=${page}`
+        );
+        const pageData = response.data || [];
+        allStudents.push(...pageData);
+
+        hasMore = pageData.length === limit;
+        page += 1;
+      }
+
+      setStudents(allStudents);
     } catch (err) {
       console.error('Error fetching students:', err);
     }
@@ -426,26 +467,46 @@ const initializePackageMerchSelections = useCallback(
     }
   };
 
-  const fetchAckReceiptsForEnrollment = async (branchId, search = '') => {
+  const fetchAckReceiptsForEnrollment = useCallback(async (branchId, search = '') => {
     try {
       setAckReceiptsLoading(true);
       setAckReceiptsError('');
       const params = new URLSearchParams();
-      params.set('status', 'Pending,Paid');
+      params.set('status', 'Submitted,Pending,Paid,Verified');
       if (branchId) params.set('branch_id', String(branchId));
       if (search && search.trim()) params.set('search', search.trim());
       params.set('limit', '50');
+      params.set('only_unused', '1');
 
       const response = await apiRequest(`/acknowledgement-receipts?${params.toString()}`);
       const all = response.data || [];
-      setAckReceipts(all.filter((ar) => ar.ar_type === 'Package'));
+      setAckReceipts(
+        all.filter(
+          (ar) =>
+            ar.ar_type === 'Package' &&
+            !ar.invoice_id &&
+            !ar.payment_id &&
+            String(ar.status || '').trim().toLowerCase() !== 'applied'
+        )
+      );
     } catch (err) {
       console.error('Error fetching acknowledgement receipts for enrollment:', err);
       setAckReceiptsError('Failed to load acknowledgement receipts. Please try again.');
     } finally {
       setAckReceiptsLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedAckSearch(ackSearchTerm.trim()), 350);
+    return () => clearTimeout(t);
+  }, [ackSearchTerm]);
+
+  useEffect(() => {
+    if (enrollStep !== 'ack-receipt-selection' || !selectedClassForEnrollment) return;
+    const branchId = selectedClassForEnrollment?.branch_id || selectedClassForEnrollment?.branchId || null;
+    fetchAckReceiptsForEnrollment(branchId, debouncedAckSearch);
+  }, [debouncedAckSearch, enrollStep, selectedClassForEnrollment, fetchAckReceiptsForEnrollment]);
 
   const fetchMerchandise = async (branchId) => {
     try {
@@ -610,6 +671,14 @@ const initializePackageMerchSelections = useCallback(
       if (openMenuId && !event.target.closest('.action-menu-container') && !event.target.closest('.action-menu-overlay')) {
         setOpenMenuId(null);
       }
+      if (
+        openViewStudentMenuKey &&
+        !event.target.closest('.view-student-action-menu-container') &&
+        !event.target.closest('.view-student-action-menu-overlay')
+      ) {
+        setOpenViewStudentMenuKey(null);
+        setViewStudentMenuTarget(null);
+      }
       if (openSessionMenuId && !event.target.closest('.session-action-menu-container') && !event.target.closest('.session-action-menu-overlay')) {
         setOpenSessionMenuId(null);
       }
@@ -630,7 +699,7 @@ const initializePackageMerchSelections = useCallback(
       return () => {
         document.removeEventListener('mousedown', handleClickOutside);
       };
-  }, [openMenuId, openSessionMenuId, openProgramDropdown, showStudentDropdown, showTeacherDropdown]);
+  }, [openMenuId, openViewStudentMenuKey, openSessionMenuId, openProgramDropdown, showStudentDropdown, showTeacherDropdown]);
 
   const handleMenuClick = (classId, event) => {
     const button = event.currentTarget;
@@ -680,6 +749,33 @@ const initializePackageMerchSelections = useCallback(
       });
       setOpenMenuId(classId);
     }
+  };
+
+  const closeViewStudentActionMenu = () => {
+    setOpenViewStudentMenuKey(null);
+    setViewStudentMenuTarget(null);
+  };
+
+  const handleViewStudentActionMenuClick = (student, menuKey, event) => {
+    const button = event.currentTarget;
+    const rect = button.getBoundingClientRect();
+    const viewportHeight = window.innerHeight;
+    const viewportWidth = window.innerWidth;
+    const estimatedDropdownHeight = 96;
+    const spaceBelow = viewportHeight - rect.bottom;
+    const top = spaceBelow >= estimatedDropdownHeight
+      ? rect.bottom + 4
+      : Math.max(8, rect.top - estimatedDropdownHeight - 4);
+    const right = Math.max(8, viewportWidth - rect.right);
+
+    if (openViewStudentMenuKey === menuKey) {
+      closeViewStudentActionMenu();
+      return;
+    }
+
+    setViewStudentMenuPosition({ top, right });
+    setViewStudentMenuTarget(student);
+    setOpenViewStudentMenuKey(menuKey);
   };
 
   const handleSessionMenuClick = (sessionKey, event) => {
@@ -881,7 +977,7 @@ const initializePackageMerchSelections = useCallback(
       setSavingAttendance(true);
 
       if (!attendanceData || !attendanceData.students) {
-        alert('No attendance data available');
+        appAlert('No attendance data available');
         return;
       }
 
@@ -924,12 +1020,12 @@ const initializePackageMerchSelections = useCallback(
           }
         }
       } else {
-        alert('Please generate class sessions first before marking attendance.');
+        appAlert('Please generate class sessions first before marking attendance.');
         return;
       }
     } catch (err) {
       console.error('Error saving attendance:', err);
-      alert(err.message || 'Failed to save attendance');
+      appAlert(err.message || 'Failed to save attendance');
     } finally {
       setSavingAttendance(false);
     }
@@ -994,11 +1090,18 @@ const initializePackageMerchSelections = useCallback(
     // Verify class belongs to admin's branch
     const classItem = classes.find(c => c.class_id === classId);
     if (classItem && classItem.branch_id !== adminBranchId) {
-      alert('You can only delete classes from your branch.');
+      appAlert('You can only delete classes from your branch.');
       return;
     }
     
-    if (!window.confirm('Are you sure you want to delete this class?')) {
+    if (
+      !(await appConfirm({
+        title: 'Delete class',
+        message: 'Are you sure you want to delete this class?',
+        destructive: true,
+        confirmLabel: 'Delete',
+      }))
+    ) {
       return;
     }
 
@@ -1008,104 +1111,8 @@ const initializePackageMerchSelections = useCallback(
       });
       fetchClasses();
     } catch (err) {
-      alert(err.message || 'Failed to delete class');
+      appAlert(err.message || 'Failed to delete class');
     }
-  };
-
-  // Helper function to calculate session date
-  const calculateSessionDate = (startDate, daysOfWeek, phaseNumber, sessionNumber, sessionsPerPhase) => {
-    if (!startDate || !daysOfWeek || daysOfWeek.length === 0 || !phaseNumber || !sessionNumber) {
-      return null;
-    }
-
-    const dayMap = {
-      'Sunday': 0, 'Monday': 1, 'Tuesday': 2, 'Wednesday': 3,
-      'Thursday': 4, 'Friday': 5, 'Saturday': 6
-    };
-
-    const sortedDays = [...daysOfWeek].sort((a, b) => {
-      const dayA = typeof a === 'string' ? dayMap[a] : dayMap[a.day_of_week];
-      const dayB = typeof b === 'string' ? dayMap[b] : dayMap[b.day_of_week];
-      return dayA - dayB;
-    });
-
-    const dayNames = sortedDays.map(day => typeof day === 'string' ? day : day.day_of_week);
-    const dayNumbers = dayNames.map(day => dayMap[day]);
-
-    // Parse start date as local date (YYYY-MM-DD format from database)
-    // Treat as Asia/Manila UTC+8 - parse as local date components
-    const [year, month, day] = startDate.split('-').map(Number);
-    
-    // Create date object in local timezone (UTC+8) - use noon to avoid DST/timezone edge cases
-    const start = new Date(year, month - 1, day, 12, 0, 0);
-    const startDayOfWeek = start.getDay(); // 0 = Sunday, 1 = Monday, etc.
-
-    // Calculate which session number this is (1-indexed across all phases)
-    const overallSessionNumber = sessionsPerPhase 
-      ? (phaseNumber - 1) * sessionsPerPhase + sessionNumber
-      : sessionNumber;
-
-    // Session index (0-indexed)
-    const sessionIndex = overallSessionNumber - 1;
-    
-    // Which day in the cycle (0 = first enabled day, 1 = second enabled day, etc.)
-    const dayIndexInCycle = sessionIndex % dayNames.length;
-    
-    // Which week (0 = first week, 1 = second week, etc.)
-    const weekOffset = Math.floor(sessionIndex / dayNames.length);
-
-    // Get the target day name and number for this session
-    const targetDayName = dayNames[dayIndexInCycle];
-    const targetDayNumber = dayMap[targetDayName];
-
-    // Find the first enabled day in the cycle
-    const firstDayNumber = dayNumbers[0];
-    
-    // Check if start date is already on an enabled day
-    let baseDate;
-    let baseDayOfWeek;
-    
-    if (dayNumbers.includes(startDayOfWeek)) {
-      // Start date is on an enabled day, use it as the base
-      baseDate = new Date(year, month - 1, day, 12, 0, 0);
-      baseDayOfWeek = startDayOfWeek;
-    } else {
-      // Start date is not on an enabled day, find the next enabled day
-      let daysUntilFirstDay = firstDayNumber - startDayOfWeek;
-      if (daysUntilFirstDay < 0) {
-        daysUntilFirstDay += 7; // Next week
-      }
-      baseDate = new Date(year, month - 1, day + daysUntilFirstDay, 12, 0, 0);
-      baseDayOfWeek = firstDayNumber;
-    }
-    
-    // Find which position the base day is in the enabled days cycle
-    const baseDayIndex = dayNumbers.indexOf(baseDayOfWeek);
-    
-    // Calculate which day in the cycle this session should be on
-    const targetDayIndex = dayIndexInCycle;
-    
-    // Calculate how many days to add from base date
-    let daysToAdd = 0;
-    
-    if (targetDayIndex >= baseDayIndex) {
-      // Target day is same week or later in the cycle
-      daysToAdd = (targetDayIndex - baseDayIndex) + (weekOffset * 7);
-    } else {
-      // Target day is earlier in the cycle, need to go to next week
-      daysToAdd = (dayNames.length - baseDayIndex) + targetDayIndex + (weekOffset * 7);
-    }
-    
-    // Calculate the final session date
-    const sessionDate = new Date(baseDate);
-    sessionDate.setDate(baseDate.getDate() + daysToAdd);
-
-    // Format as YYYY-MM-DD (using local date components to avoid timezone conversion)
-    // This ensures we get the correct date in UTC+8 timezone
-    const resultYear = sessionDate.getFullYear();
-    const resultMonth = String(sessionDate.getMonth() + 1).padStart(2, '0');
-    const resultDay = String(sessionDate.getDate()).padStart(2, '0');
-    return `${resultYear}-${resultMonth}-${resultDay}`;
   };
 
   // Calculate which phase is currently active based on today's date
@@ -1158,7 +1165,8 @@ const initializePackageMerchSelections = useCallback(
           daysOfWeek,
           firstSession.phase_number,
           firstSession.phase_session_number,
-          sessionsPerPhase
+          sessionsPerPhase,
+          classDetails.number_of_phase
         );
       }
 
@@ -1168,7 +1176,8 @@ const initializePackageMerchSelections = useCallback(
           daysOfWeek,
           lastSession.phase_number,
           lastSession.phase_session_number,
-          sessionsPerPhase
+          sessionsPerPhase,
+          classDetails.number_of_phase
         );
       }
 
@@ -1197,7 +1206,8 @@ const initializePackageMerchSelections = useCallback(
             daysOfWeek,
             firstSession.phase_number,
             firstSession.phase_session_number,
-            sessionsPerPhase
+            sessionsPerPhase,
+            classDetails.number_of_phase
           )
         : null);
 
@@ -1227,7 +1237,8 @@ const initializePackageMerchSelections = useCallback(
           daysOfWeek,
           lastSession.phase_number,
           lastSession.phase_session_number,
-          sessionsPerPhase
+          sessionsPerPhase,
+          classDetails.number_of_phase
         );
       }
 
@@ -1357,17 +1368,19 @@ const initializePackageMerchSelections = useCallback(
     const studentName = student.full_name || `Student ID: ${student.user_id}`;
     const isPending = student.student_type === 'pending';
 
-    const reason = window.prompt(
-      `Are you sure you want to ${isPending ? 'remove' : 'unenroll'} ${studentName} from this class?\n\n` +
-      `Please provide a reason (e.g., "Client informed student will not continue"):`
-    );
+    const reason = await appPrompt({
+      title: isPending ? 'Remove student' : 'Unenroll student',
+      message:
+        `Are you sure you want to ${isPending ? 'remove' : 'unenroll'} ${studentName} from this class?\n\n` +
+        `Please provide a reason (e.g., "Client informed student will not continue").`,
+      placeholder: 'Reason (required)',
+      confirmLabel: isPending ? 'Remove' : 'Unenroll',
+      cancelLabel: 'Cancel',
+      required: true,
+      destructive: true,
+    });
 
-    if (!reason || reason.trim() === '') {
-      alert(isPending ? 'Removal cancelled. Reason is required.' : 'Unenrollment cancelled. Reason is required.');
-      return;
-    }
-
-    if (!window.confirm(`Confirm ${isPending ? 'removal' : 'unenrollment'} of ${studentName}?\n\nReason: ${reason.trim()}`)) {
+    if (reason === null) {
       return;
     }
 
@@ -1395,10 +1408,10 @@ const initializePackageMerchSelections = useCallback(
         const successCount = results.filter(r => r.success === true).length;
         const failCount = results.filter(r => r.success === false).length;
         if (successCount > 0) {
-          alert(`Student ${studentName} has been unenrolled and removed from the class.${failCount > 0 ? `\n\nNote: ${failCount} enrollment(s) could not be removed.` : ''}`);
+          appAlert(`Student ${studentName} has been unenrolled and removed from the class.${failCount > 0 ? `\n\nNote: ${failCount} enrollment(s) could not be removed.` : ''}`);
           await fetchEnrolledStudents(classId);
         } else {
-          alert('Failed to unenroll student. Please try again.');
+          appAlert('Failed to unenroll student. Please try again.');
         }
         return;
       }
@@ -1407,19 +1420,19 @@ const initializePackageMerchSelections = useCallback(
         // Pending (installment, downpayment paid, not yet in classstudentstbl): remove via deactivating installment profile
         const res = await apiRequest(`/students/class/${classId}/pending/${student.user_id}`, { method: 'DELETE' });
         if (res?.success) {
-          alert(`${studentName} has been removed from the class.`);
+          appAlert(`${studentName} has been removed from the class.`);
           await fetchEnrolledStudents(classId);
         } else {
-          alert(res?.message || 'Failed to remove student from class. Please try again.');
+          appAlert(res?.message || 'Failed to remove student from class. Please try again.');
         }
         return;
       }
 
-      alert('No active enrollment or pending record found for this student.');
+      appAlert('No active enrollment or pending record found for this student.');
     } catch (err) {
       console.error('Error unenrolling/removing student:', err);
       const msg = err.response?.data?.message || err.message || 'Failed to unenroll student. Please try again.';
-      alert(msg);
+      appAlert(msg);
     } finally {
       setLoadingEnrolledStudents(false);
     }
@@ -1443,9 +1456,16 @@ const initializePackageMerchSelections = useCallback(
         enrolledStudents = enrolledStudents.filter(s => s.phase_number === phaseNumber);
       }
       
+      // Hide unenrolled/removed rows in the Manage Enrolled Students modal.
+      const visibleEnrolledStudents = enrolledStudents.filter((student) => {
+        const status = String(student.enrollment_status || '').trim().toLowerCase();
+        const studentType = String(student.student_type || '').trim().toLowerCase();
+        return status !== 'removed' && studentType !== 'unenrolled';
+      });
+
       // Group enrolled students by student_id to show only unique students
       // Collect all phases for each student and keep the earliest enrollment info
-      const uniqueEnrolledStudents = enrolledStudents.reduce((acc, student) => {
+      const uniqueEnrolledStudents = visibleEnrolledStudents.reduce((acc, student) => {
         const existing = acc.find(s => s.user_id === student.user_id);
         if (!existing) {
           // First time seeing this student - initialize with phases array
@@ -1678,9 +1698,16 @@ const initializePackageMerchSelections = useCallback(
         enrolledStudents = enrolledStudents.filter(s => s.phase_number === phaseNumber);
       }
       
+      // Hide unenrolled/removed rows in View Students as well for consistency.
+      const visibleEnrolledStudents = enrolledStudents.filter((student) => {
+        const status = String(student.enrollment_status || '').trim().toLowerCase();
+        const studentType = String(student.student_type || '').trim().toLowerCase();
+        return status !== 'removed' && studentType !== 'unenrolled';
+      });
+
       // Group enrolled students by student_id to show only unique students
       // Collect all phases for each student and keep the earliest enrollment info
-      const uniqueEnrolledStudents = enrolledStudents.reduce((acc, student) => {
+      const uniqueEnrolledStudents = visibleEnrolledStudents.reduce((acc, student) => {
         const existing = acc.find(s => s.user_id === student.user_id);
         if (!existing) {
           // First time seeing this student - initialize with phases array
@@ -1929,7 +1956,7 @@ const initializePackageMerchSelections = useCallback(
 
   const handleContinueToSchedule = () => {
     if (selectedMergeTargetClasses.length === 0) {
-      alert('Please select at least one class to merge with');
+      appAlert('Please select at least one class to merge with');
       return;
     }
     setMergeStep('choose-schedule');
@@ -2028,22 +2055,22 @@ const initializePackageMerchSelections = useCallback(
 
   const handleMergeReview = () => {
     if (!selectedClassForMerge || selectedMergeTargetClasses.length === 0) {
-      alert('Please select at least one class to merge with');
+      appAlert('Please select at least one class to merge with');
       return;
     }
     if (!mergeFormData.room_id || mergeFormData.room_id === '') {
-      alert('Please select a room for the merged class');
+      appAlert('Please select a room for the merged class');
       return;
     }
     // Validate schedule based on selected mode
     if (useSourceSchedule) {
       if (!sourceClassSchedule || sourceClassSchedule.length === 0 || sourceClassSchedule.filter(s => s.start_time && s.end_time).length === 0) {
-        alert('Source class does not have a schedule configured. Please use manual schedule setup.');
+        appAlert('Source class does not have a schedule configured. Please use manual schedule setup.');
         return;
       }
     } else {
       if (!manualSchedule || manualSchedule.length === 0 || manualSchedule.filter(s => s.start_time && s.end_time).length === 0) {
-        alert('Please configure the schedule for the merged class');
+        appAlert('Please configure the schedule for the merged class');
         return;
       }
       // Check for conflicts before proceeding
@@ -2051,7 +2078,7 @@ const initializePackageMerchSelections = useCallback(
         const conflictMessages = mergeScheduleConflicts.map(c => 
           `${c.day} ${c.start_time}-${c.end_time}: ${c.message}`
         ).join('\n');
-        alert(`Cannot proceed: Schedule conflicts detected.\n\n${conflictMessages}\n\nPlease resolve these conflicts before continuing.`);
+        appAlert(`Cannot proceed: Schedule conflicts detected.\n\n${conflictMessages}\n\nPlease resolve these conflicts before continuing.`);
         return;
       }
     }
@@ -2060,7 +2087,7 @@ const initializePackageMerchSelections = useCallback(
 
   const handleMergeSubmit = async () => {
     if (!selectedClassForMerge || selectedMergeTargetClasses.length === 0) {
-      alert('Please select at least one class to merge with');
+      appAlert('Please select at least one class to merge with');
       return;
     }
 
@@ -2069,11 +2096,17 @@ const initializePackageMerchSelections = useCallback(
       ...selectedMergeTargetClasses.map(c => `${c.program_name} - ${c.class_name || c.level_tag}`)
     ].join('\n');
 
-    if (!window.confirm(
-      `Are you sure you want to merge these ${selectedMergeTargetClasses.length + 1} classes?\n\n` +
-      `Classes to merge:\n${allClassNames}\n\n` +
-      `This action cannot be undone. All original classes will be deleted and all students will be moved to a new merged class with the configured schedule.`
-    )) {
+    if (
+      !(await appConfirm({
+        title: 'Merge classes',
+        message:
+          `Are you sure you want to merge these ${selectedMergeTargetClasses.length + 1} classes?\n\n` +
+          `Classes to merge:\n${allClassNames}\n\n` +
+          `This action cannot be undone. All original classes will be deleted and all students will be moved to a new merged class with the configured schedule.`,
+        destructive: true,
+        confirmLabel: 'Merge',
+      }))
+    ) {
       return;
     }
 
@@ -2102,7 +2135,7 @@ const initializePackageMerchSelections = useCallback(
         }),
       });
 
-      alert(`Classes merged successfully! ${response.data.enrollment_stats?.unique_students || response.data.students_moved || 0} students moved to the new merged class.`);
+      appAlert(`Classes merged successfully! ${response.data.enrollment_stats?.unique_students || response.data.students_moved || 0} students moved to the new merged class.`);
       closeMergeModal();
       fetchClasses(); // Refresh classes list
     } catch (err) {
@@ -2111,9 +2144,9 @@ const initializePackageMerchSelections = useCallback(
         const conflictMessages = err.response.data.conflicts.map(c => 
           `${c.day} ${c.start_time}-${c.end_time}: ${c.message || 'Schedule conflict'}`
         ).join('\n');
-        alert(`Cannot merge classes: Schedule conflicts detected.\n\n${conflictMessages}\n\nPlease resolve these conflicts and try again.`);
+        appAlert(`Cannot merge classes: Schedule conflicts detected.\n\n${conflictMessages}\n\nPlease resolve these conflicts and try again.`);
       } else {
-        alert(err.response?.data?.message || err.message || 'Failed to merge classes');
+        appAlert(err.response?.data?.message || err.message || 'Failed to merge classes');
       }
       console.error('Error merging classes:', err);
     } finally {
@@ -2146,7 +2179,7 @@ const initializePackageMerchSelections = useCallback(
       setMergeHistory(response.data || []);
     } catch (err) {
       console.error('Error fetching merge history:', err);
-      alert(err.message || 'Failed to fetch merge history');
+      appAlert(err.message || 'Failed to fetch merge history');
       setMergeHistory([]);
     } finally {
       setLoadingMergeHistory(false);
@@ -2170,12 +2203,12 @@ const initializePackageMerchSelections = useCallback(
   const handleUndoMerge = async (mergeHistoryId, mergedClassId) => {
     const latestHistory = mergeHistory.find(h => h.merge_history_id === mergeHistoryId);
     if (!latestHistory) {
-      alert('Merge history not found');
+      appAlert('Merge history not found');
       return;
     }
 
     if (latestHistory.is_undone) {
-      alert('This merge has already been undone');
+      appAlert('This merge has already been undone');
       return;
     }
 
@@ -2191,7 +2224,14 @@ const initializePackageMerchSelections = useCallback(
         : '') +
       `This action cannot be undone.`;
 
-    if (!window.confirm(confirmMessage)) {
+    if (
+      !(await appConfirm({
+        title: 'Undo merge',
+        message: confirmMessage,
+        destructive: true,
+        confirmLabel: 'Undo merge',
+      }))
+    ) {
       return;
     }
 
@@ -2201,7 +2241,7 @@ const initializePackageMerchSelections = useCallback(
         method: 'POST',
       });
 
-      alert(`Merge undone successfully! ${response.data.restored_classes.length} class(es) restored.`);
+      appAlert(`Merge undone successfully! ${response.data.restored_classes.length} class(es) restored.`);
       closeMergeHistoryModal();
       // If we're in detail view, go back to list view since the merged class is now deleted
       if (viewMode === 'detail' && selectedClassForDetails?.class_id === mergedClassId) {
@@ -2253,7 +2293,7 @@ const initializePackageMerchSelections = useCallback(
         }
       } else {
         // Regular error - show alert
-        alert(err.message || 'Failed to undo merge');
+        appAlert(err.message || 'Failed to undo merge');
       }
       console.error('Error undoing merge:', err);
     } finally {
@@ -2291,9 +2331,9 @@ const initializePackageMerchSelections = useCallback(
     // Allow upgrade for Fee Paid and Expired reservations
     if (reservation.status !== 'Fee Paid' && reservation.status !== 'Expired') {
       if (reservation.status === 'Reserved') {
-        alert(`Cannot upgrade reservation. The reservation fee must be paid first. Current status: ${reservation.status}`);
+        appAlert(`Cannot upgrade reservation. The reservation fee must be paid first. Current status: ${reservation.status}`);
       } else {
-        alert(`Cannot upgrade reservation. Current status: ${reservation.status}`);
+        appAlert(`Cannot upgrade reservation. Current status: ${reservation.status}`);
       }
       return;
     }
@@ -2365,7 +2405,7 @@ const initializePackageMerchSelections = useCallback(
       // - When upgradeEnrollmentOption === 'per-phase': use Phase-type package for per-phase enrollment
       if (upgradeStep === 'review') {
         if (!upgradeSelectedPackage) {
-          alert('Please select a package');
+          appAlert('Please select a package');
           return;
         }
 
@@ -2417,7 +2457,7 @@ const initializePackageMerchSelections = useCallback(
         body: JSON.stringify(payload),
       });
 
-      alert('Reservation upgraded to enrollment successfully!');
+      appAlert('Reservation upgraded to enrollment successfully!');
       setIsUpgradeModalOpen(false);
       setSelectedReservationForUpgrade(null);
       setReservationFeePaid(0);
@@ -2459,9 +2499,9 @@ const initializePackageMerchSelections = useCallback(
         setAlternativeClasses(err.response.data.alternative_classes);
         setIsAlternativeClassesModalOpen(true);
       } else if (err.response?.data?.class_inactive) {
-        alert('Cannot re-upgrade expired reservation. The class is no longer active.');
+        appAlert('Cannot re-upgrade expired reservation. The class is no longer active.');
       } else {
-        alert(err.response?.data?.message || err.message || 'Failed to upgrade reservation');
+        appAlert(err.response?.data?.message || err.message || 'Failed to upgrade reservation');
       }
     } finally {
       setEnrollSubmitting(false);
@@ -2469,6 +2509,7 @@ const initializePackageMerchSelections = useCallback(
   };
 
   const closeViewStudentsModal = () => {
+    closeViewStudentActionMenu();
     setIsViewStudentsModalOpen(false);
     setSelectedClassForView(null);
     setViewStudentsStep('phase-selection');
@@ -2479,6 +2520,7 @@ const initializePackageMerchSelections = useCallback(
   const openMoveStudentModal = async (student, sourceClassOverride = null) => {
     const sourceClass = sourceClassOverride ?? selectedClassForEnrollment;
     if (!sourceClass) return;
+    closeViewStudentActionMenu();
     setMoveSourceClass(sourceClass);
     setStudentToMove(student);
     setSelectedTargetClassForMove(null);
@@ -2531,12 +2573,129 @@ const initializePackageMerchSelections = useCallback(
       if (selectedClassForEnrollment?.class_id === moveSourceClass.class_id) {
         await fetchEnrolledStudents(moveSourceClass.class_id);
       }
-      alert(`Student has been moved to "${targetName}" successfully.`);
+      appAlert(`Student has been moved to "${targetName}" successfully.`);
     } catch (err) {
       const msg = err.response?.data?.message || err.message || 'Failed to move student.';
-      alert(msg);
+      appAlert(msg);
     } finally {
       setMoveStudentSubmitting(false);
+    }
+  };
+
+  const isInstallmentLikePackage = (pkg) => (
+    pkg && (pkg.package_type === 'Installment' || (pkg.package_type === 'Phase' && pkg.payment_option === 'Installment'))
+  );
+
+  const formatMoney = (value) => `₱${Number(value || 0).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+
+  const openChangePackageModal = async (student, sourceClassOverride = null) => {
+    const sourceClass = sourceClassOverride ?? selectedClassForView;
+    if (!sourceClass) return;
+    closeViewStudentActionMenu();
+    const currentPackageId = Number(student?.current_package_id || 0);
+
+    setStudentToChangePackage(student);
+    setChangePackageSourceClass(sourceClass);
+    setSelectedTargetPackageForChange(null);
+    setChangePackagePreview(null);
+    setChangePackageOptions([]);
+    setIsChangePackageModalOpen(true);
+    setLoadingChangePackageOptions(true);
+
+    try {
+      const response = await apiRequest(`/packages?branch_id=${sourceClass.branch_id}&limit=100`);
+      const options = (response.data || []).filter(
+        (pkg) => pkg.status === 'Active'
+          && isInstallmentLikePackage(pkg)
+          && (!currentPackageId || Number(pkg.package_id) !== currentPackageId)
+      );
+      setChangePackageOptions(options);
+    } catch (err) {
+      console.error('Error fetching package change options:', err);
+      setChangePackageOptions([]);
+      appAlert(err.message || 'Failed to load package options.');
+    } finally {
+      setLoadingChangePackageOptions(false);
+    }
+  };
+
+  const closeChangePackageModal = () => {
+    setIsChangePackageModalOpen(false);
+    setStudentToChangePackage(null);
+    setChangePackageSourceClass(null);
+    setChangePackageOptions([]);
+    setSelectedTargetPackageForChange(null);
+    setChangePackagePreview(null);
+    setLoadingChangePackageOptions(false);
+    setLoadingChangePackagePreview(false);
+    setChangePackageSubmitting(false);
+  };
+
+  const fetchPackageChangePreview = async (targetPackage) => {
+    if (!targetPackage || !changePackageSourceClass || !studentToChangePackage) return;
+
+    setLoadingChangePackagePreview(true);
+    setChangePackagePreview(null);
+    try {
+      const response = await apiRequest(
+        `/classes/${changePackageSourceClass.class_id}/students/${studentToChangePackage.user_id}/package-change-preview`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            target_package_id: targetPackage.package_id,
+          }),
+        }
+      );
+      setChangePackagePreview(response.data || null);
+    } catch (err) {
+      console.error('Error fetching package change preview:', err);
+      setChangePackagePreview({
+        allowed: false,
+        code: 'preview_failed',
+        message: err.response?.data?.message || err.message || 'Failed to evaluate the package change.',
+      });
+    } finally {
+      setLoadingChangePackagePreview(false);
+    }
+  };
+
+  const handleChangePackageSelection = async (packageId) => {
+    const targetPackage = changePackageOptions.find((pkg) => pkg.package_id === Number(packageId)) || null;
+    setSelectedTargetPackageForChange(targetPackage);
+    setChangePackagePreview(null);
+
+    if (targetPackage) {
+      await fetchPackageChangePreview(targetPackage);
+    }
+  };
+
+  const handleCreatePackageChangeInvoice = async () => {
+    if (!selectedTargetPackageForChange || !changePackageSourceClass || !studentToChangePackage || !changePackagePreview?.allowed) {
+      return;
+    }
+
+    setChangePackageSubmitting(true);
+    try {
+      const response = await apiRequest(
+        `/classes/${changePackageSourceClass.class_id}/students/${studentToChangePackage.user_id}/package-change-invoice`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            target_package_id: selectedTargetPackageForChange.package_id,
+          }),
+        }
+      );
+
+      closeChangePackageModal();
+      appAlert(response.message || 'Package change adjustment invoice created successfully.');
+    } catch (err) {
+      console.error('Error creating package change invoice:', err);
+      appAlert(err.response?.data?.message || err.message || 'Failed to create package change invoice.');
+    } finally {
+      setChangePackageSubmitting(false);
     }
   };
 
@@ -2551,9 +2710,11 @@ const initializePackageMerchSelections = useCallback(
   const openEnrollModal = (classItem) => {
     setOpenMenuId(null);
     setSelectedClassForEnrollment(classItem);
-    setEnrollStep('view'); // Start with view mode
+    setEnrollStep('enrollment-option');
     setSelectedPackage(null);
-    setSelectedStudents([]);
+    if (selectedEnrollmentOption !== 'per-phase') {
+      setSelectedStudents([]);
+    }
     setSelectedPricingLists([]);
     setSelectedMerchandise([]);
     setGeneratedInvoices([]);
@@ -2566,6 +2727,67 @@ const initializePackageMerchSelections = useCallback(
     fetchEnrollReservedStudents(classItem.class_id);
     
     // Fetch packages, students, pricing lists, and merchandise for this branch
+    if (classItem.branch_id) {
+      fetchPackages(classItem.branch_id);
+      fetchStudents(classItem.branch_id);
+      fetchPricingLists(classItem.branch_id);
+      fetchMerchandise(classItem.branch_id);
+    }
+  };
+
+  const openContinuePerPhaseModal = (student, classItem) => {
+    if (!student || !classItem) return;
+    setOpenMenuId(null);
+    setOpenViewStudentMenuKey(null);
+    setViewStudentMenuTarget(null);
+    setIsViewStudentsModalOpen(false);
+    setSelectedClassForView(null);
+    setViewStudentsStep('phase-selection');
+    setSelectedPhaseForView(null);
+    setViewEnrolledStudents([]);
+
+    setSelectedClassForEnrollment(classItem);
+    setEnrollStep('package-selection');
+    setSelectedPackage(null);
+    setSelectedStudents([student]);
+    setSelectedPricingLists([]);
+    setSelectedMerchandise([]);
+    setGeneratedInvoices([]);
+    setShowPackageDetails(false);
+    setSelectedEnrollmentOption('per-phase');
+    setSelectedPhaseNumber(null);
+    setPerPhaseAmount('');
+    setStudentSearchTerm('');
+    setShowStudentDropdown(false);
+    setIsEnrollModalOpen(true);
+
+    fetchEnrolledStudents(classItem.class_id);
+    fetchEnrollReservedStudents(classItem.class_id);
+
+    if (classItem.branch_id) {
+      fetchPackages(classItem.branch_id);
+      fetchStudents(classItem.branch_id);
+      fetchPricingLists(classItem.branch_id);
+      fetchMerchandise(classItem.branch_id);
+    }
+  };
+
+  const openManageEnrolledStudentsModal = (classItem) => {
+    setOpenMenuId(null);
+    setSelectedClassForEnrollment(classItem);
+    setEnrollStep('view');
+    setSelectedPackage(null);
+    setSelectedStudents([]);
+    setSelectedPricingLists([]);
+    setSelectedMerchandise([]);
+    setGeneratedInvoices([]);
+    setShowPackageDetails(false);
+    setSelectedEnrollmentOption(null);
+    setIsEnrollModalOpen(true);
+
+    fetchEnrolledStudents(classItem.class_id);
+    fetchEnrollReservedStudents(classItem.class_id);
+
     if (classItem.branch_id) {
       fetchPackages(classItem.branch_id);
       fetchStudents(classItem.branch_id);
@@ -2614,12 +2836,8 @@ const initializePackageMerchSelections = useCallback(
       setEnrollStep('package-selection');
     } else if (selectedEnrollmentOption === 'ack-receipt') {
       setSelectedAckReceipt(null);
-      const branchId = selectedClassForEnrollment?.branch_id || selectedClassForEnrollment?.branchId || null;
-      if (branchId) {
-        fetchAckReceiptsForEnrollment(branchId, ackSearchTerm);
-      } else {
-        fetchAckReceiptsForEnrollment(null, ackSearchTerm);
-      }
+      setAckSearchTerm('');
+      setDebouncedAckSearch('');
       setEnrollStep('ack-receipt-selection');
     }
   };
@@ -2644,12 +2862,52 @@ const initializePackageMerchSelections = useCallback(
     setSelectedPhaseNumber(null); // Reset phase selection
     setSelectedEnrollmentOption(null);
     setPerPhaseAmount(''); // Reset per-phase amount
+    setAckReceipts([]);
+    setAckReceiptsLoading(false);
+    setAckReceiptsError('');
+    setAckSearchTerm('');
+    setDebouncedAckSearch('');
+    setSelectedAckReceipt(null);
+    setInstallmentScopeSettings({
+      phase_start: '',
+      phase_end: '',
+      include_downpayment: true,
+    });
     updateInstallmentSettings({
       invoice_issue_date: '',
       billing_month: '',
       invoice_due_date: '',
       invoice_generation_date: '',
     });
+  };
+
+  const isInstallmentPackageSelection = (packageItem) =>
+    !!packageItem &&
+    (packageItem.package_type === 'Installment' ||
+      (packageItem.package_type === 'Phase' && packageItem.payment_option === 'Installment'));
+
+  const getInstallmentPhaseBounds = (packageItem) => {
+    const classMaxPhase = Number(selectedClassForEnrollment?.number_of_phase) || null;
+    let minPhase = 1;
+    let maxPhase = classMaxPhase || 1;
+
+    if (packageItem?.package_type === 'Phase' && packageItem?.payment_option === 'Installment') {
+      const pkgStart = Number(packageItem.phase_start) || 1;
+      const pkgEnd = Number(packageItem.phase_end) || pkgStart;
+      minPhase = pkgStart;
+      maxPhase = pkgEnd;
+    }
+
+    if (classMaxPhase) {
+      minPhase = Math.min(minPhase, classMaxPhase);
+      maxPhase = Math.min(maxPhase, classMaxPhase);
+    }
+
+    if (maxPhase < minPhase) {
+      maxPhase = minPhase;
+    }
+
+    return { minPhase, maxPhase };
   };
 
   const handlePackageSelect = (packageItem) => {
@@ -2675,10 +2933,34 @@ const initializePackageMerchSelections = useCallback(
     setSelectedPromo(null); // Clear selected promo when package changes
     setAvailablePromos([]); // Clear available promos
     setShowPackageDetails(true); // Show package details by default when package is selected
-    setEnrollStep('student-selection');
+    const shouldShowInstallmentSetup =
+      (selectedEnrollmentOption === 'package' || selectedEnrollmentOption === 'per-phase') &&
+      isInstallmentPackageSelection(packageItem);
+    if (shouldShowInstallmentSetup) {
+      const { minPhase, maxPhase } = getInstallmentPhaseBounds(packageItem);
+      const selectedStudentHighestPhase =
+        selectedEnrollmentOption === 'per-phase' && selectedStudents.length > 0
+          ? Number(selectedStudents[0]?.highestPhase ?? selectedStudents[0]?.phase_number)
+          : null;
+      const effectiveMinPhase =
+        Number.isInteger(selectedStudentHighestPhase) && selectedStudentHighestPhase >= 1
+          ? Math.min(maxPhase, Math.max(minPhase, selectedStudentHighestPhase + 1))
+          : minPhase;
+      const hasConfiguredDownpayment = parseFloat(packageItem?.downpayment_amount || 0) > 0;
+      setInstallmentScopeSettings({
+        phase_start: String(effectiveMinPhase),
+        phase_end: String(maxPhase),
+        include_downpayment: hasConfiguredDownpayment,
+      });
+      setEnrollStep('installment-setup');
+    } else {
+      setEnrollStep('student-selection');
+    }
     setStudentSearchTerm('');
     setShowStudentDropdown(false);
-    setSelectedStudents([]);
+    if (selectedEnrollmentOption !== 'per-phase') {
+      setSelectedStudents([]);
+    }
     
     // Fetch available promos for this package (will fetch student-specific when student is selected)
     if (packageItem.package_id) {
@@ -2762,7 +3044,7 @@ const initializePackageMerchSelections = useCallback(
           const currentReserved = getCountableReservedStudents(); // Only count valid reservations
           const totalAfterAdd = currentEnrolled + currentReserved + 1;
           if (totalAfterAdd > selectedClassForEnrollment.max_students) {
-            alert(`Cannot add student. Class has a maximum of ${selectedClassForEnrollment.max_students} students. Currently enrolled: ${currentEnrolled}, Reserved: ${currentReserved}`);
+            appAlert(`Cannot add student. Class has a maximum of ${selectedClassForEnrollment.max_students} students. Currently enrolled: ${currentEnrolled}, Reserved: ${currentReserved}`);
             return prev;
           }
         }
@@ -2921,87 +3203,6 @@ const initializePackageMerchSelections = useCallback(
     const currentlySelected = selectedStudents.length;
     return selectedClassForEnrollment.max_students - currentEnrolled - currentReserved - currentlySelected;
   };
-
-  // Calculate total amount for per-phase enrollment
-  const calculatePerPhaseTotal = () => {
-    if (selectedEnrollmentOption !== 'per-phase') return 0;
-    
-    let total = 0;
-    
-    // Add per-phase amount
-    if (perPhaseAmount && parseFloat(perPhaseAmount) > 0) {
-      total += parseFloat(perPhaseAmount);
-    }
-    
-    // Add selected pricing lists
-    selectedPricingLists.forEach(pricingId => {
-      const pricing = pricingLists.find(p => p.pricinglist_id === pricingId);
-      if (pricing && pricing.price) {
-        total += parseFloat(pricing.price) || 0;
-      }
-    });
-    
-    // Add selected merchandise
-    // Strategy: Count per-student selections first, then count any remaining items from global selections
-    const countedMerchandiseNames = new Set(); // Track which merchandise names we've already counted
-    
-    // First, count per-student merchandise selections (for uniforms with sizes and other items)
-    if (selectedStudents.length > 0 && Object.keys(studentMerchandiseSelections).length > 0) {
-      selectedStudents.forEach(student => {
-        const studentMerchSelections = studentMerchandiseSelections[student.user_id] || [];
-        studentMerchSelections.forEach(merchSelection => {
-          if (merchSelection.merchandise_id) {
-            const merchItem = merchandise.find(m => m.merchandise_id === merchSelection.merchandise_id);
-            if (merchItem && merchItem.price) {
-              total += parseFloat(merchItem.price) || 0;
-            }
-          }
-        });
-        // Mark all merchandise in this student's selections as counted
-        studentMerchSelections.forEach(merchSelection => {
-          if (merchSelection.merchandise_name) {
-            countedMerchandiseNames.add(merchSelection.merchandise_name);
-          }
-        });
-      });
-    }
-    
-    // Then, count any merchandise from global selections that wasn't counted yet
-    // This handles cases where merchandise was selected but not yet initialized to students
-    selectedMerchandise.forEach(merch => {
-      // Skip if this merchandise was already counted in per-student selections
-      if (countedMerchandiseNames.has(merch.merchandise_name)) {
-        return;
-      }
-      
-      // Find the actual merchandise item to get the price
-      let merchItem = null;
-      const itemsForType = getMerchandiseItemsByType(merch.merchandise_name);
-      const hasSizes = itemsForType.some(item => item.size);
-      
-      if (merch.merchandise_name === 'LCA Uniform' && merch.size) {
-        // For uniforms with size in global selection (shouldn't happen, but handle it)
-        merchItem = merchandise.find(
-          item => item.merchandise_name === merch.merchandise_name && item.size === merch.size
-        );
-      } else {
-        // For other merchandise, find the first item with this name
-        merchItem = merchandise.find(
-          item => item.merchandise_name === merch.merchandise_name
-        );
-      }
-      
-      if (merchItem && merchItem.price) {
-        // For merchandise without sizes or uniforms, multiply by number of students
-        // For uniforms, they should be in per-student selections, but if not, count once per student
-        const studentCount = selectedStudents.length > 0 ? selectedStudents.length : 1;
-        total += parseFloat(merchItem.price) * studentCount;
-      }
-    });
-    
-    return total;
-  };
-
 
   const groupPackageDetails = (details = []) => {
     const pricingDetails = [];
@@ -3188,7 +3389,7 @@ const initializePackageMerchSelections = useCallback(
     });
 
     if (missingTypes.length > 0) {
-      alert(`Please select merchandise for: ${missingTypes.join(', ')}`);
+      appAlert(`Please select merchandise for: ${missingTypes.join(', ')}`);
       return false;
     }
 
@@ -3355,38 +3556,41 @@ const initializePackageMerchSelections = useCallback(
 
   const handleEnrollSubmit = async () => {
     if (selectedStudents.length === 0) {
-      alert('Please select a student');
+      appAlert('Please select a student');
       return;
     }
 
     if (selectedEnrollmentOption === 'ack-receipt') {
       if (!selectedAckReceipt) {
-        alert('Please select an acknowledgement receipt.');
+        appAlert('Please select an acknowledgement receipt.');
         return;
       }
       if (selectedStudents.length !== 1) {
-        alert('With Acknowledgement Receipt currently supports enrolling one student at a time. Please select exactly one student.');
+        appAlert('With Acknowledgement Receipt currently supports enrolling one student at a time. Please select exactly one student.');
         return;
       }
     }
 
     // Validate per-phase enrollment
     if (selectedEnrollmentOption === 'per-phase') {
-      const isPhasePackage = selectedPackage && selectedPackage.package_type === 'Phase';
+      const isPackageDrivenPerPhase = Boolean(
+        selectedPackage &&
+        (selectedPackage.package_type === 'Phase' || selectedPackage.package_type === 'Installment')
+      );
       
       // When using Phase packages, phase and amount come from the package,
       // and included pricing/merchandise are defined by the package ? no extra selections needed.
-      if (!isPhasePackage) {
+      if (!isPackageDrivenPerPhase) {
         if (selectedPhaseNumber === null || selectedPhaseNumber === undefined) {
-          alert('Please select a phase for per-phase enrollment');
+          appAlert('Please select a phase for per-phase enrollment');
           return;
         }
         if (!perPhaseAmount || parseFloat(perPhaseAmount) <= 0) {
-          alert('Please enter a valid amount for per-phase enrollment');
+          appAlert('Please enter a valid amount for per-phase enrollment');
           return;
         }
         if (selectedPricingLists.length === 0 && selectedMerchandise.length === 0) {
-          alert('Please select at least one pricing list or merchandise for per-phase enrollment');
+          appAlert('Please select at least one pricing list or merchandise for per-phase enrollment');
           return;
         }
       }
@@ -3395,18 +3599,18 @@ const initializePackageMerchSelections = useCallback(
     // Validate reservation invoice settings for Reserved packages
     if (selectedPackage && selectedPackage.package_type === 'Reserved') {
       if (!reservationInvoiceSettings.issue_date) {
-        alert('Please enter an issue date for the reservation invoice');
+        appAlert('Please enter an issue date for the reservation invoice');
         return;
       }
       if (!reservationInvoiceSettings.due_date) {
-        alert('Please enter a due date for the reservation invoice');
+        appAlert('Please enter a due date for the reservation invoice');
         return;
       }
       // Validate that due date is after issue date
       const issueDate = new Date(reservationInvoiceSettings.issue_date);
       const dueDate = new Date(reservationInvoiceSettings.due_date);
       if (dueDate <= issueDate) {
-        alert('Due date must be after the issue date');
+        appAlert('Due date must be after the issue date');
         return;
       }
     }
@@ -3450,7 +3654,7 @@ const initializePackageMerchSelections = useCallback(
                 );
           
                 if (!categorySelection || !categorySelection.size || categorySelection.size.trim() === '') {
-                  alert(`Please select a size for ${merchName} - ${category} for student: ${student.full_name}`);
+                  appAlert(`Please select a size for ${merchName} - ${category} for student: ${student.full_name}`);
                   return;
                 }
               }
@@ -3461,7 +3665,7 @@ const initializePackageMerchSelections = useCallback(
               );
               
               if (!studentSelection || !studentSelection.size || studentSelection.size.trim() === '') {
-                alert(`Please select a size for ${merchName} for student: ${student.full_name}`);
+                appAlert(`Please select a size for ${merchName} for student: ${student.full_name}`);
                 return;
               }
             }
@@ -3473,7 +3677,7 @@ const initializePackageMerchSelections = useCallback(
             );
             
             if (!studentSelection || !studentSelection.size || studentSelection.size.trim() === '') {
-              alert(`Please select a size for ${merchName} for student: ${student.full_name}`);
+              appAlert(`Please select a size for ${merchName} for student: ${student.full_name}`);
               return;
             }
           }
@@ -3487,7 +3691,7 @@ const initializePackageMerchSelections = useCallback(
       const itemsRequiringSizing = selectedMerchandise.filter(m => requiresSizingForMerchandise(m.merchandise_name));
       for (const item of itemsRequiringSizing) {
         if (!item.size || item.size.trim() === '') {
-          alert(`Please select a size for ${item.merchandise_name}`);
+          appAlert(`Please select a size for ${item.merchandise_name}`);
           return;
         }
       }
@@ -3501,7 +3705,7 @@ const initializePackageMerchSelections = useCallback(
       const totalAfterEnroll = currentEnrolled + currentReserved + selectedStudents.length;
       if (totalAfterEnroll > selectedClassForEnrollment.max_students) {
         const availableSlots = selectedClassForEnrollment.max_students - currentEnrolled - currentReserved;
-        alert(`Cannot ${selectedPackage?.package_type === 'Reserved' ? 'reserve' : 'enroll'} student. Class has a maximum of ${selectedClassForEnrollment.max_students} students. Currently enrolled: ${currentEnrolled}, Reserved: ${currentReserved}. You can only ${selectedPackage?.package_type === 'Reserved' ? 'reserve' : 'enroll'} ${availableSlots} more student${availableSlots !== 1 ? 's' : ''}.`);
+        appAlert(`Cannot ${selectedPackage?.package_type === 'Reserved' ? 'reserve' : 'enroll'} student. Class has a maximum of ${selectedClassForEnrollment.max_students} students. Currently enrolled: ${currentEnrolled}, Reserved: ${currentReserved}. You can only ${selectedPackage?.package_type === 'Reserved' ? 'reserve' : 'enroll'} ${availableSlots} more student${availableSlots !== 1 ? 's' : ''}.`);
         return;
       }
     }
@@ -3774,6 +3978,19 @@ const initializePackageMerchSelections = useCallback(
                 frequency_months: installmentSettings.frequency_months,
               }
             } : {}),
+            ...((selectedEnrollmentOption === 'package' || selectedEnrollmentOption === 'per-phase') &&
+            selectedPackage &&
+            isInstallmentPackageSelection(selectedPackage) &&
+            installmentScopeSettings.phase_start &&
+            installmentScopeSettings.phase_end
+              ? {
+                  installment_scope: {
+                    phase_start: parseInt(installmentScopeSettings.phase_start, 10),
+                    phase_end: parseInt(installmentScopeSettings.phase_end, 10),
+                    include_downpayment: Boolean(installmentScopeSettings.include_downpayment),
+                  },
+                }
+              : {}),
           };
 
           const response = await apiRequest(`/classes/${selectedClassForEnrollment.class_id}/enroll`, {
@@ -3865,13 +4082,13 @@ const initializePackageMerchSelections = useCallback(
         });
         // Use a more detailed alert
         console.error('Enrollment Errors:', errors);
-        alert(errorMessage);
+        appAlert(errorMessage);
       } else if (invoices.length > 0) {
-        alert(`Successfully enrolled ${invoices.length} student(s)!`);
+        appAlert(`Successfully enrolled ${invoices.length} student(s)!`);
       }
     } catch (err) {
       console.error('Error enrolling students:', err);
-      alert(err.message || 'Failed to enroll students');
+      appAlert(err.message || 'Failed to enroll students');
     } finally {
       setEnrollSubmitting(false);
     }
@@ -3915,7 +4132,7 @@ const initializePackageMerchSelections = useCallback(
     
     // Verify class belongs to admin's branch
     if (classItem.branch_id !== adminBranchId) {
-      alert('You can only edit classes from your branch.');
+      appAlert('You can only edit classes from your branch.');
       return;
     }
     
@@ -4998,7 +5215,7 @@ setFormData({
       }
     } catch (error) {
       console.error('Error fetching class sessions:', error);
-      alert('Failed to load class sessions');
+      appAlert('Failed to load class sessions');
       setAvailableClassSessions({});
     } finally {
       setLoadingClassSessions(false);
@@ -5052,15 +5269,15 @@ setFormData({
 
   const handleNextToMakeupScheduling = () => {
     if (selectedSessionsToSuspend.length === 0) {
-      alert('Please select at least one session to suspend');
+      appAlert('Please select at least one session to suspend');
       return;
     }
     if (!suspensionFormData.suspension_name || !suspensionFormData.reason) {
-      alert('Please fill in suspension name and reason');
+      appAlert('Please fill in suspension name and reason');
       return;
     }
     if (!validateSamePhase()) {
-      alert('All selected sessions must be from the same phase');
+      appAlert('All selected sessions must be from the same phase');
       return;
     }
     setSuspensionStep('choose-strategy');
@@ -5140,7 +5357,7 @@ setFormData({
       s => s.makeup_date && s.makeup_start_time && s.makeup_end_time
     );
     if (!allFilled) {
-      alert('Please fill in all makeup schedules');
+      appAlert('Please fill in all makeup schedules');
       return false;
     }
     const phaseNumber = selectedSessionsToSuspend[0].phase_number;
@@ -5152,7 +5369,7 @@ setFormData({
     for (const schedule of makeupSchedules) {
       const makeupDate = new Date(schedule.makeup_date);
       if (makeupDate < phaseStartDate || makeupDate > phaseEndDate) {
-        alert(`Makeup dates must be within the phase date range (${formatDateManila(phaseStartDate)} - ${formatDateManila(phaseEndDate)})`);
+        appAlert(`Makeup dates must be within the phase date range (${formatDateManila(phaseStartDate)} - ${formatDateManila(phaseEndDate)})`);
         return false;
       }
     }
@@ -5161,7 +5378,7 @@ setFormData({
 
   const handleCreateSuspension = async () => {
     if (!selectedClassForSuspension) {
-      alert('No class selected');
+      appAlert('No class selected');
       return;
     }
     if (makeupStrategy === 'manual' && !validateMakeupSchedules()) return;
@@ -5169,13 +5386,17 @@ setFormData({
       'add-last-phase': 'Makeup sessions will be auto-generated and added to the last phase; the class end date will be extended.',
       'manual': 'Makeup sessions will be created at your specified dates and times.',
     };
-    const confirmed = window.confirm(
-      `Are you sure you want to suspend ${selectedSessionsToSuspend.length} session(s) using ${
-        makeupStrategy === 'add-last-phase' ? 'Add New Sessions to Last Phase' : 'Manual Scheduling'
-      } strategy?\n\n` +
-      `${strategyDescriptions[makeupStrategy]}\n\n` +
-      `Suspended sessions will be cancelled and marked with reason: ${suspensionFormData.reason}`
-    );
+    const confirmed = await appConfirm({
+      title: 'Create suspension',
+      message:
+        `Are you sure you want to suspend ${selectedSessionsToSuspend.length} session(s) using ${
+          makeupStrategy === 'add-last-phase' ? 'Add New Sessions to Last Phase' : 'Manual Scheduling'
+        } strategy?\n\n` +
+        `${strategyDescriptions[makeupStrategy]}\n\n` +
+        `Suspended sessions will be cancelled and marked with reason: ${suspensionFormData.reason}`,
+      destructive: true,
+      confirmLabel: 'Continue',
+    });
     if (!confirmed) return;
     setCreatingSuspension(true);
     try {
@@ -5197,7 +5418,7 @@ setFormData({
         } : {}),
       };
       await apiRequest('/suspensions', { method: 'POST', body: payload });
-      alert('Suspension created successfully with makeup schedules!');
+      appAlert('Suspension created successfully with makeup schedules!');
       setIsSuspensionModalOpen(false);
       setSelectedClassForSuspension(null);
       setSuspensionStep('select-sessions');
@@ -5213,7 +5434,7 @@ setFormData({
       }
     } catch (error) {
       console.error('Error creating suspension:', error);
-      alert(error.message || 'Failed to create suspension. Please try again.');
+      appAlert(error.message || 'Failed to create suspension. Please try again.');
     } finally {
       setCreatingSuspension(false);
     }
@@ -5532,7 +5753,8 @@ setFormData({
                           daysOfWeek,
                           session.phase_number,
                           session.phase_session_number,
-                          sessionsPerPhase
+                          sessionsPerPhase,
+                          selectedClassForDetails.number_of_phase
                         )
                       : null);
 
@@ -5710,7 +5932,8 @@ setFormData({
                               daysOfWeek,
                               session.phase_number,
                               session.phase_session_number,
-                              sessionsPerPhase
+                              sessionsPerPhase,
+                              selectedClassForDetails.number_of_phase
                             )
                           : null);
 
@@ -5950,7 +6173,8 @@ setFormData({
                 daysOfWeek,
                 parseInt(phaseNum),
                 parseInt(sessionNum),
-                sessionsPerPhase
+                sessionsPerPhase,
+                selectedClassForDetails.number_of_phase
               );
             }
           }
@@ -7420,8 +7644,8 @@ setFormData({
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                     TEACHER
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    MAX STUDENTS
+                  <th className="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    ENROLLED / MAX
                   </th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                     START DATE & END DATE
@@ -7564,11 +7788,15 @@ setFormData({
                         </div>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap">
-                        <div className="text-sm text-gray-900">
-                          {classItem.max_students !== null && classItem.max_students !== undefined
-                            ? classItem.max_students
-                            : '-'}
-                                        </div>
+                        <div className="flex justify-center text-sm text-gray-900">
+                          {(() => {
+                            const enrolled = Number(classItem.enrolled_students ?? 0);
+                            if (classItem.max_students != null && classItem.max_students !== undefined) {
+                              return `${enrolled}/${classItem.max_students}`;
+                            }
+                            return enrolled > 0 ? String(enrolled) : '-';
+                          })()}
+                        </div>
                       </td>
                       <td className="px-6 py-4">
                         <div className="text-sm text-gray-900">
@@ -7669,6 +7897,21 @@ setFormData({
                 className="block w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 transition-colors"
               >
                 Enroll Student
+              </button>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const selectedClass = filteredClasses.find(c => c.class_id === openMenuId);
+                  if (selectedClass) {
+                    setOpenMenuId(null);
+                    setMenuPosition({ top: undefined, bottom: undefined, right: undefined, left: undefined });
+                    openManageEnrolledStudentsModal(selectedClass);
+                  }
+                }}
+                className="block w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 transition-colors"
+              >
+                Manage Enrolled Student
               </button>
               <button
                 type="button"
@@ -7889,7 +8132,10 @@ setFormData({
 
                       {/* Skip holidays & VIP checkboxes - Step 1 */}
                       <div className="flex flex-wrap gap-6">
-                        <label className="inline-flex items-center gap-2 cursor-pointer">
+                        <label
+                          className="inline-flex items-center gap-2 cursor-help"
+                          title="When enabled, sessions that fall on holidays are skipped when generating the class schedule."
+                        >
                           <input
                             type="checkbox"
                             name="skip_holidays"
@@ -7899,7 +8145,10 @@ setFormData({
                           />
                           <span className="text-sm font-medium text-gray-700">Skip classes on holidays</span>
                         </label>
-                        <label className="inline-flex items-center gap-2 cursor-pointer">
+                        <label
+                          className="inline-flex items-center gap-2 cursor-help"
+                          title="VIP classes are treated as premium classes for special handling and display."
+                        >
                           <input
                             type="checkbox"
                             name="is_vip"
@@ -8870,6 +9119,7 @@ setFormData({
                   {enrollStep === 'enrollment-option' && 'Select Enrollment Option'}
                   {enrollStep === 'ack-receipt-selection' && 'Select Acknowledgement Receipt'}
                   {enrollStep === 'package-selection' && 'Select Package'}
+                  {enrollStep === 'installment-setup' && 'Installment Enrollment Setup'}
                   {enrollStep === 'student-selection' && 'Select Student'}
                   {enrollStep === 'review' && 'Review & Enroll'}
                 </h2>
@@ -9245,57 +9495,30 @@ setFormData({
                   <div className="text-center mb-4">
                     <h3 className="text-xl font-bold text-gray-900 mb-1">Select Acknowledgement Receipt</h3>
                     <p className="text-sm text-gray-500">
-                      Choose a pending or paid acknowledgement receipt (not yet attached to an invoice). The package from the receipt will be applied automatically.
+                      Each acknowledgement receipt can be used only once. Only unused receipts are listed. Use Verified receipts, or Cash receipts which can be used immediately after creation.
                     </p>
                   </div>
                   <div className="bg-white rounded-lg border border-gray-200 p-4 space-y-3">
-                    <form
-                      onSubmit={(e) => {
-                        e.preventDefault();
-                        const branchId = selectedClassForEnrollment?.branch_id || selectedClassForEnrollment?.branchId || null;
-                        fetchAckReceiptsForEnrollment(branchId, ackSearchTerm);
-                      }}
-                      className="flex flex-col md:flex-row gap-3 md:items-end"
-                    >
-                      <div className="flex-1">
-                        <label className="block text-xs font-medium text-gray-700 mb-1">Search</label>
-                        <input
-                          type="text"
-                          value={ackSearchTerm}
-                          onChange={(e) => setAckSearchTerm(e.target.value)}
-                          className="input-field text-sm"
-                          placeholder="Search by AR number, name, reference no."
-                        />
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          type="submit"
-                          className="px-4 py-2 text-sm font-medium rounded-md border border-gray-300 bg-white text-gray-700 hover:bg-gray-50"
-                        >
-                          Search
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setAckSearchTerm('');
-                            const branchId = selectedClassForEnrollment?.branch_id || selectedClassForEnrollment?.branchId || null;
-                            fetchAckReceiptsForEnrollment(branchId, '');
-                          }}
-                          className="px-4 py-2 text-sm font-medium rounded-md border border-gray-300 bg-white text-gray-700 hover:bg-gray-50"
-                        >
-                          Reset
-                        </button>
-                      </div>
-                    </form>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">Search</label>
+                      <input
+                        type="text"
+                        value={ackSearchTerm}
+                        onChange={(e) => setAckSearchTerm(e.target.value)}
+                        className="input-field text-sm w-full"
+                        placeholder="Search by name, contact, or reference no. (updates automatically)"
+                        autoComplete="off"
+                      />
+                    </div>
 
                     <div className="mt-2">
                       {ackReceiptsLoading ? (
-                        <p className="text-sm text-gray-600">Loading acknowledgement receipts?</p>
+                        <p className="text-sm text-gray-600">Loading acknowledgement receipts…</p>
                       ) : ackReceiptsError ? (
                         <p className="text-sm text-red-600">{ackReceiptsError}</p>
                       ) : ackReceipts.length === 0 ? (
                         <p className="text-sm text-gray-600">
-                          No attachable acknowledgement receipts found (pending or paid). Create one first from the Manage Invoice section.
+                          No acknowledgement receipts found for this branch/search yet.
                         </p>
                       ) : (
                         <div
@@ -9308,11 +9531,10 @@ setFormData({
                         >
                           <table
                             className="min-w-full divide-y divide-gray-200 text-sm"
-                            style={{ width: '100%', minWidth: '900px' }}
+                            style={{ width: '100%', minWidth: '780px' }}
                           >
                             <thead className="bg-gray-50">
                               <tr>
-                                <th className="px-4 py-3 text-left font-semibold text-gray-700">AR Number</th>
                                 <th className="px-4 py-3 text-left font-semibold text-gray-700">Payer</th>
                                 <th className="px-4 py-3 text-left font-semibold text-gray-700">Package</th>
                                 <th className="px-4 py-3 text-left font-semibold text-gray-700">Amount</th>
@@ -9322,11 +9544,15 @@ setFormData({
                               </tr>
                             </thead>
                             <tbody className="bg-white divide-y divide-gray-200">
-                              {ackReceipts.map((ar) => (
+                              {ackReceipts.map((ar) => {
+                                const isCashMethod = String(ar.payment_method || '').trim().toLowerCase() === 'cash';
+                                const isVerified = String(ar.status || '').trim() === 'Verified';
+                                const canUseReceipt = isVerified || isCashMethod;
+                                const disabledReason = isCashMethod
+                                  ? ''
+                                  : 'This receipt is not verified yet. Finance/Superfinance must verify it first.';
+                                return (
                                 <tr key={ar.ack_receipt_id}>
-                                  <td className="px-4 py-3 whitespace-nowrap text-gray-900 font-medium">
-                                    {ar.ack_receipt_number}
-                                  </td>
                                   <td className="px-4 py-3">
                                     <div className="text-gray-900">{ar.prospect_student_name}</div>
                                     {ar.prospect_student_contact && (
@@ -9361,13 +9587,16 @@ setFormData({
                                   <td className="px-4 py-3">
                                     <button
                                       type="button"
+                                      disabled={!canUseReceipt}
+                                      title={!canUseReceipt ? disabledReason : 'Use this acknowledgement receipt'}
                                       onClick={() => {
+                                        if (!canUseReceipt) return;
                                         setSelectedAckReceipt(ar);
                                         const pkg = packages.find(
                                           (p) => p.package_id === ar.package_id
                                         );
                                         if (!pkg) {
-                                          alert(
+                                          appAlert(
                                             'Package from this acknowledgement receipt is not available in this branch. Please check package configuration.'
                                           );
                                           return;
@@ -9375,13 +9604,17 @@ setFormData({
                                         handlePackageSelect(pkg);
                                         setEnrollStep('student-selection');
                                       }}
-                                      className="px-3 py-1.5 text-xs font-medium text-gray-900 bg-[#F7C844] hover:bg-[#F5B82E] rounded-lg transition-colors"
+                                      className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors ${
+                                        canUseReceipt
+                                          ? 'text-gray-900 bg-[#F7C844] hover:bg-[#F5B82E]'
+                                          : 'text-gray-400 bg-gray-100 cursor-not-allowed border border-gray-200'
+                                      }`}
                                     >
                                       Use This Receipt
                                     </button>
                                   </td>
                                 </tr>
-                              ))}
+                              )})}
                             </tbody>
                           </table>
                         </div>
@@ -9417,7 +9650,11 @@ setFormData({
                       selectedEnrollmentOption === 'reservation'
                         ? packages.filter(pkg => pkg.package_type === 'Reserved')
                         : selectedEnrollmentOption === 'per-phase'
-                        ? packages.filter(pkg => pkg.package_type === 'Phase')
+                        ? packages.filter(
+                            (pkg) =>
+                              pkg.package_type === 'Phase' ||
+                              pkg.package_type === 'Installment'
+                          )
                         : packages.filter(pkg =>
                             pkg.package_type === 'Fullpayment' ||
                             pkg.package_type === 'Installment' ||
@@ -9571,6 +9808,131 @@ setFormData({
                           </p>
                       </div>
                     </div>
+                    );
+                  })()}
+                </div>
+              )}
+
+              {enrollStep === 'installment-setup' && selectedPackage && (
+                <div className="space-y-4 w-full">
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+                    <h4 className="text-sm font-semibold text-amber-900">Selected installment package</h4>
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <span className="inline-flex items-center rounded-md bg-amber-100 px-2.5 py-1 text-xs font-semibold text-amber-900">
+                        {selectedPackage.package_name}
+                      </span>
+                      {selectedPackage.package_price && (
+                        <span className="inline-flex items-center rounded-md bg-white/80 px-2.5 py-1 text-xs font-medium text-amber-900 border border-amber-200">
+                          Monthly: ₱{parseFloat(selectedPackage.package_price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-amber-700 mt-2">
+                      Configure phase coverage and whether downpayment is included.
+                    </p>
+                  </div>
+
+                  {(() => {
+                    const { minPhase, maxPhase } = getInstallmentPhaseBounds(selectedPackage);
+                    const selectedStudentHighestPhase =
+                      selectedEnrollmentOption === 'per-phase' && selectedStudents.length > 0
+                        ? Number(selectedStudents[0]?.highestPhase ?? selectedStudents[0]?.phase_number)
+                        : null;
+                    const effectiveMinPhase =
+                      Number.isInteger(selectedStudentHighestPhase) && selectedStudentHighestPhase >= 1
+                        ? Math.min(maxPhase, Math.max(minPhase, selectedStudentHighestPhase + 1))
+                        : minPhase;
+                    const phaseOptions = Array.from(
+                      { length: Math.max(0, maxPhase - effectiveMinPhase + 1) },
+                      (_, idx) => effectiveMinPhase + idx
+                    );
+                    const hasDownpayment = parseFloat(selectedPackage.downpayment_amount || 0) > 0;
+
+                    return (
+                      <div className="rounded-lg border border-gray-200 bg-white p-4 space-y-4">
+                        {phaseOptions.length === 0 ? (
+                          <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                            No remaining phases are available for this student in the selected package range.
+                          </div>
+                        ) : null}
+                        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-end">
+                          <div>
+                            <label className="label-field text-xs">
+                              Start Phase <span className="text-red-500">*</span>
+                            </label>
+                            <select
+                              value={installmentScopeSettings.phase_start}
+                              onChange={(e) => {
+                                const startVal = parseInt(e.target.value, 10);
+                                const currentEnd = parseInt(installmentScopeSettings.phase_end, 10);
+                                setInstallmentScopeSettings((prev) => ({
+                                  ...prev,
+                                  phase_start: e.target.value,
+                                  phase_end: Number.isFinite(currentEnd) && currentEnd >= startVal
+                                    ? prev.phase_end
+                                    : e.target.value,
+                                }));
+                              }}
+                              className="input-field text-sm"
+                            >
+                              {phaseOptions.map((phase) => (
+                                <option key={`installment-start-${phase}`} value={phase}>
+                                  Phase {phase}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <div>
+                            <label className="label-field text-xs">
+                              End Phase <span className="text-red-500">*</span>
+                            </label>
+                            <select
+                              value={installmentScopeSettings.phase_end}
+                              onChange={(e) =>
+                                setInstallmentScopeSettings((prev) => ({
+                                  ...prev,
+                                  phase_end: e.target.value,
+                                }))
+                              }
+                              className="input-field text-sm"
+                            >
+                              {phaseOptions
+                                .filter((phase) => phase >= parseInt(installmentScopeSettings.phase_start || String(minPhase), 10))
+                                .map((phase) => (
+                                  <option key={`installment-end-${phase}`} value={phase}>
+                                    Phase {phase}
+                                  </option>
+                                ))}
+                            </select>
+                          </div>
+                          <div className="rounded-md border border-gray-200 p-3 bg-gray-50">
+                            <label className="flex items-start gap-3">
+                              <input
+                                type="checkbox"
+                                checked={Boolean(installmentScopeSettings.include_downpayment)}
+                                disabled={!hasDownpayment}
+                                onChange={(e) =>
+                                  setInstallmentScopeSettings((prev) => ({
+                                    ...prev,
+                                    include_downpayment: e.target.checked,
+                                  }))
+                                }
+                                className="mt-1 h-4 w-4 rounded border-gray-300 text-[#F7C844] focus:ring-[#F7C844]"
+                              />
+                              <span>
+                                <span className="block text-sm font-medium text-gray-900">
+                                  Include downpayment invoice
+                                </span>
+                                <span className="block text-xs text-gray-600 mt-1">
+                                  {hasDownpayment
+                                    ? `Downpayment amount: ₱${Number(selectedPackage.downpayment_amount || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                                    : 'This package has no configured downpayment amount.'}
+                                </span>
+                              </span>
+                            </label>
+                          </div>
+                        </div>
+                      </div>
                     );
                   })()}
                 </div>
@@ -10762,53 +11124,23 @@ setFormData({
                     
                     return (
                     <div className="space-y-3">
-                      {/* Installment Settings Toggle */}
+                      {/* Installment Settings */}
                       <div className="p-4 bg-white border border-gray-200 rounded-lg">
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center space-x-3">
-                            <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
-                              <svg className="w-5 h-5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                              </svg>
-                            </div>
-                            <div>
-                              <h4 className="text-sm font-medium text-gray-900">Installment Payment</h4>
-                              <p className="text-xs text-gray-600 mt-0.5">Enable to set up installment invoice settings</p>
-                            </div>
+                        <div className="flex items-center space-x-3">
+                          <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
+                            <svg className="w-5 h-5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                            </svg>
                           </div>
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              const newState = !showInstallmentSettings;
-                              setShowInstallmentSettings(newState);
-                              if (newState) {
-                                const branchId = selectedClassForEnrollment?.branch_id ?? selectedClassForEnrollment?.branchId ?? null;
-                                const systemSettings = await fetchInstallmentScheduleSettings(branchId);
-                                setInstallmentSettings(systemSettings);
-                              } else {
-                                updateInstallmentSettings({
-                                  invoice_issue_date: '',
-                                  billing_month: '',
-                                  invoice_due_date: '',
-                                  invoice_generation_date: '',
-                                });
-                              }
-                            }}
-                            className={`relative inline-flex h-5 w-10 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-[#F7C844] focus:ring-offset-1 shadow-inner ${
-                              showInstallmentSettings ? 'bg-[#F7C844]' : 'bg-gray-300'
-                            }`}
-                          >
-                            <span
-                              className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-md ring-0 transition duration-200 ease-in-out ${
-                                showInstallmentSettings ? 'translate-x-5' : 'translate-x-0'
-                              }`}
-                            />
-                          </button>
+                          <div>
+                            <h4 className="text-sm font-medium text-gray-900">Installment Payment</h4>
+                            <p className="text-xs text-gray-600 mt-0.5">Installment invoice settings are applied automatically for this package.</p>
+                          </div>
                         </div>
                       </div>
 
                       {/* Installment Settings ? loaded from system Settings > Invoice Schedule */}
-                      {showInstallmentSettings && (
+                      {selectedPackage && (
                         <div className="p-3 bg-gradient-to-br from-blue-50 to-indigo-50 border border-blue-200 rounded-lg">
                           <div className="mb-2">
                             <h3 className="text-xs font-bold text-blue-900">Installment Invoice Settings</h3>
@@ -11198,6 +11530,16 @@ setFormData({
                                   <strong>Monthly:</strong> ₱{parseFloat(selectedPackage.package_price).toFixed(2)}
                                 </p>
                               )}
+                              {(selectedEnrollmentOption === 'package' || selectedEnrollmentOption === 'per-phase') && installmentScopeSettings.phase_start && installmentScopeSettings.phase_end && (
+                                <>
+                                  <p className="text-sm text-gray-700">
+                                    <strong>Phase Scope:</strong> Phase {installmentScopeSettings.phase_start} to Phase {installmentScopeSettings.phase_end}
+                                  </p>
+                                  <p className="text-sm text-gray-700">
+                                    <strong>Downpayment:</strong> {installmentScopeSettings.include_downpayment ? 'Included' : 'Excluded'}
+                                  </p>
+                                </>
+                              )}
                             </>
                           ) : (
                             selectedPackage.package_price && (
@@ -11560,18 +11902,6 @@ setFormData({
                           </div>
                         );
                       })()}
-                      
-                      {/* Total Amount for Per-Phase Enrollment (hidden when using Phase packages) */}
-                      {selectedEnrollmentOption === 'per-phase' && !selectedPackage && (
-                        <div className="mt-4 pt-4 border-t-2 border-gray-300">
-                          <div className="flex justify-between items-center">
-                            <p className="text-base font-bold text-gray-900">Total Amount:</p>
-                            <p className="text-lg font-bold text-blue-700">
-                              ${calculatePerPhaseTotal().toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                            </p>
-                          </div>
-                        </div>
-                      )}
                     </div>
                   )}
 
@@ -11639,8 +11969,23 @@ setFormData({
                       invoice_due_date: '',
                       invoice_generation_date: '',
                     });
+                    setInstallmentScopeSettings({
+                      phase_start: '',
+                      phase_end: '',
+                      include_downpayment: true,
+                    });
                     setEnrollStep('enrollment-option');
                   }}
+                  className="px-3 py-1.5 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
+                  disabled={enrollSubmitting}
+                >
+                  Back
+                </button>
+              )}
+              {enrollStep === 'installment-setup' && (
+                <button
+                  type="button"
+                  onClick={() => setEnrollStep('package-selection')}
                   className="px-3 py-1.5 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
                   disabled={enrollSubmitting}
                 >
@@ -11651,27 +11996,23 @@ setFormData({
                 enrollStep !== 'enrollment-option' &&
                 enrollStep !== 'package-selection' &&
                 enrollStep !== 'ack-receipt-selection' &&
+                enrollStep !== 'installment-setup' &&
                 !(enrollStep === 'review' && generatedInvoices.length > 0) && (
-                <div className="flex items-center gap-3">
-                  {/* Total Amount Display - Hidden for per-phase enrollment (pay per phase, no single total) */}
-                  {(enrollStep === 'student-selection' || enrollStep === 'review') &&
-                    selectedEnrollmentOption !== 'per-phase' &&
-                    (selectedEnrollmentOption === 'package' || selectedEnrollmentOption === 'reservation' || selectedEnrollmentOption === 'ack-receipt') &&
-                    selectedPackage && (
-                    <div className="flex items-center gap-2 px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg">
-                      <span className="text-xs font-medium text-blue-900">Total Amount:</span>
-                      <span className="text-sm font-bold text-blue-700">
-                        ₱{(Number(selectedPackage.package_price) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                      </span>
-                    </div>
-                  )}
                 <button
                   type="button"
                   onClick={() => {
                     if (enrollStep === 'student-selection') {
-                      if (selectedEnrollmentOption === 'package' || selectedEnrollmentOption === 'reservation') {
-                        // Don't clear package when going back to package-selection
-                        setEnrollStep('package-selection');
+                      if (selectedEnrollmentOption === 'package' || selectedEnrollmentOption === 'reservation' || selectedEnrollmentOption === 'per-phase') {
+                        // For installment package flow, go back to setup step first.
+                        if (
+                          (selectedEnrollmentOption === 'package' || selectedEnrollmentOption === 'per-phase') &&
+                          selectedPackage &&
+                          isInstallmentPackageSelection(selectedPackage)
+                        ) {
+                          setEnrollStep('installment-setup');
+                        } else {
+                          setEnrollStep('package-selection');
+                        }
                       } else {
                         // Clear package-related state when going back to enrollment-option from student-selection
                         setSelectedPackage(null);
@@ -11695,25 +12036,28 @@ setFormData({
                 >
                   Back
                 </button>
-                </div>
               )}
               {enrollStep === 'student-selection' && (
                 <button
                   type="button"
                   onClick={() => {
                     if (selectedStudents.length === 0) {
-                      alert('Please select a student to continue');
+                      appAlert('Please select a student to continue');
                       return;
                     }
                     
                     // Validate per-phase enrollment requirements
                     if (selectedEnrollmentOption === 'per-phase') {
+                      const isPackageDrivenPerPhase = Boolean(
+                        selectedPackage &&
+                        (selectedPackage.package_type === 'Phase' || selectedPackage.package_type === 'Installment')
+                      );
                       if (selectedPhaseNumber === null || selectedPhaseNumber === undefined) {
-                        alert('Please select a phase for per-phase enrollment');
+                        appAlert('Please select a phase for per-phase enrollment');
                         return;
                       }
-                      if (!perPhaseAmount || parseFloat(perPhaseAmount) <= 0) {
-                        alert('Please enter a valid amount for per-phase enrollment');
+                      if (!isPackageDrivenPerPhase && (!perPhaseAmount || parseFloat(perPhaseAmount) <= 0)) {
+                        appAlert('Please enter a valid amount for per-phase enrollment');
                         return;
                       }
                     }
@@ -11754,7 +12098,7 @@ setFormData({
                                   );
                                   
                                   if (!categorySelection || !categorySelection.size || categorySelection.size.trim() === '') {
-                                    alert(`Please select a size for ${typeName} (${category}) for student: ${student.full_name}`);
+                                    appAlert(`Please select a size for ${typeName} (${category}) for student: ${student.full_name}`);
                                     return;
                                   }
                                 }
@@ -11765,7 +12109,7 @@ setFormData({
                                 );
                                 
                                 if (!uniformSelection || !uniformSelection.size || uniformSelection.size.trim() === '') {
-                                  alert(`Please select a size for ${typeName} for student: ${student.full_name}`);
+                                  appAlert(`Please select a size for ${typeName} for student: ${student.full_name}`);
                                   return;
                                 }
                               }
@@ -11781,6 +12125,31 @@ setFormData({
                   disabled={selectedStudents.length === 0}
                 >
                   Continue {selectedStudents.length > 0 ? `(1 selected)` : '(0 selected)'}
+                </button>
+              )}
+              {enrollStep === 'installment-setup' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const startPhase = parseInt(installmentScopeSettings.phase_start, 10);
+                    const endPhase = parseInt(installmentScopeSettings.phase_end, 10);
+                    if (!Number.isInteger(startPhase) || !Number.isInteger(endPhase)) {
+                      appAlert('Please select both start and end phase.');
+                      return;
+                    }
+                    if (endPhase < startPhase) {
+                      appAlert('End phase must be greater than or equal to start phase.');
+                      return;
+                    }
+                    if (selectedEnrollmentOption === 'per-phase') {
+                      setSelectedPhaseNumber(startPhase);
+                    }
+                    setEnrollStep('student-selection');
+                  }}
+                  className="px-3 py-1.5 text-xs font-medium text-gray-900 bg-[#F7C844] hover:bg-[#F5B82E] rounded-lg transition-colors"
+                  disabled={enrollSubmitting}
+                >
+                  Continue
                 </button>
               )}
               {enrollStep !== 'view' && (
@@ -11815,7 +12184,7 @@ setFormData({
                   type="button"
                   onClick={() => {
                     if (selectedStudents.length === 0) {
-                      alert('Please select a student');
+                      appAlert('Please select a student');
                       setEnrollStep('student-selection');
                       return;
                     }
@@ -12981,7 +13350,20 @@ setFormData({
                                   <td className="px-3 py-3 text-sm text-gray-500 max-w-[120px] truncate" title={enrolledByRaw}>{enrolledByShort}</td>
                                   <td className="px-3 py-3 whitespace-nowrap">
                                     {!isReserved && !isPending ? (
-                                      <button type="button" onClick={() => openMoveStudentModal(student, selectedClassForView)} className="text-xs font-medium text-sky-600 hover:text-sky-800 hover:underline" title="Move to another class (same program)">Move</button>
+                                      <div className="relative view-student-action-menu-container">
+                                        <button
+                                          type="button"
+                                          onClick={(event) => handleViewStudentActionMenuClick(student, uniqueKey, event)}
+                                          className="inline-flex items-center justify-center rounded-full p-1.5 text-gray-500 hover:bg-gray-100 hover:text-gray-700 transition-colors"
+                                          title="Open actions"
+                                          aria-haspopup="menu"
+                                          aria-expanded={openViewStudentMenuKey === uniqueKey}
+                                        >
+                                          <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z" />
+                                          </svg>
+                                        </button>
+                                      </div>
                                     ) : (
                                       <span className="text-xs text-gray-400">?</span>
                                     )}
@@ -13003,6 +13385,232 @@ setFormData({
                 <button type="button" onClick={closeViewStudentsModal} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-1.5 rounded-lg hover:bg-gray-100 transition-colors">Close</button>
               </div>
             )}
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {openViewStudentMenuKey && viewStudentMenuTarget && selectedClassForView && createPortal(
+        <>
+          <div
+            className="fixed inset-0 z-[10000] bg-transparent"
+            onClick={closeViewStudentActionMenu}
+          />
+          <div
+            className="fixed view-student-action-menu-overlay z-[10001] w-40 overflow-hidden rounded-md border border-gray-200 bg-white shadow-lg"
+            style={{
+              top: `${viewStudentMenuPosition.top}px`,
+              right: `${viewStudentMenuPosition.right}px`,
+            }}
+            onClick={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="py-1">
+              <button
+                type="button"
+                onClick={() => {
+                  closeViewStudentActionMenu();
+                  openMoveStudentModal(viewStudentMenuTarget, selectedClassForView);
+                }}
+                className="block w-full px-4 py-2 text-left text-sm text-sky-700 hover:bg-sky-50 transition-colors"
+              >
+                Move
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  closeViewStudentActionMenu();
+                  openContinuePerPhaseModal(viewStudentMenuTarget, selectedClassForView);
+                }}
+                className="block w-full px-4 py-2 text-left text-sm text-violet-700 hover:bg-violet-50 transition-colors"
+              >
+                Continue per phase
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  closeViewStudentActionMenu();
+                  openChangePackageModal(viewStudentMenuTarget, selectedClassForView);
+                }}
+                className="block w-full px-4 py-2 text-left text-sm text-amber-700 hover:bg-amber-50 transition-colors"
+              >
+                Update Plan
+              </button>
+            </div>
+          </div>
+        </>,
+        document.body
+      )}
+
+      {isChangePackageModalOpen && studentToChangePackage && changePackageSourceClass && createPortal(
+        <div
+          className="fixed inset-0 backdrop-blur-sm bg-black/5 flex items-center justify-center z-[9999] p-4"
+          onClick={closeChangePackageModal}
+        >
+          <div
+            className="bg-white rounded-lg shadow-xl max-w-2xl w-full max-h-[90vh] flex flex-col overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
+              <div>
+                <h2 className="text-xl font-semibold text-gray-900">Update Plan</h2>
+                <p className="text-sm text-gray-500 mt-1">
+                  Create a one-time invoice for the package difference only.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={closeChangePackageModal}
+                className="text-gray-400 hover:text-gray-500 transition-colors"
+              >
+                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="px-6 py-4 overflow-y-auto flex-1 space-y-4">
+              <div className="rounded-lg border border-gray-200 bg-gray-50 px-4 py-3">
+                <div className="text-sm text-gray-900">
+                  <span className="font-semibold">{studentToChangePackage.full_name}</span>
+                  <span className="text-gray-500"> · {changePackageSourceClass.class_name || changePackageSourceClass.level_tag}</span>
+                </div>
+                <div className="text-xs text-gray-500 mt-1">
+                  This does not replace the student&apos;s future billing profile. It only creates the adjustment invoice.
+                </div>
+              </div>
+
+              <div>
+                <label htmlFor="change-package-select" className="block text-sm font-medium text-gray-700 mb-1">
+                  Target package <span className="text-red-500">*</span>
+                </label>
+                {loadingChangePackageOptions ? (
+                  <div className="py-3 text-sm text-gray-500">Loading package options...</div>
+                ) : changePackageOptions.length === 0 ? (
+                  <div className="py-3 text-sm text-amber-700 bg-amber-50 rounded-lg px-3">
+                    No installment-style packages are available for this branch.
+                  </div>
+                ) : (
+                  <select
+                    id="change-package-select"
+                    value={selectedTargetPackageForChange?.package_id ?? ''}
+                    onChange={(e) => handleChangePackageSelection(e.target.value)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F7C844] focus:border-[#F7C844]"
+                  >
+                    <option value="">— Select package —</option>
+                    {changePackageOptions.map((pkg) => (
+                      <option key={pkg.package_id} value={pkg.package_id}>
+                        {pkg.package_name}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+
+              {loadingChangePackagePreview && (
+                <div className="flex items-center justify-center py-10">
+                  <div className="animate-spin rounded-full h-8 w-8 border-2 border-gray-200 border-t-gray-500"></div>
+                </div>
+              )}
+
+              {!loadingChangePackagePreview && changePackagePreview && (
+                <div className="space-y-4">
+                  <div
+                    className={`rounded-lg border px-4 py-3 ${
+                      changePackagePreview.allowed
+                        ? 'border-emerald-200 bg-emerald-50'
+                        : 'border-amber-200 bg-amber-50'
+                    }`}
+                  >
+                    <p className={`text-sm font-medium ${changePackagePreview.allowed ? 'text-emerald-700' : 'text-amber-700'}`}>
+                      {changePackagePreview.message}
+                    </p>
+                  </div>
+
+                  {changePackagePreview.current_package && changePackagePreview.target_package && (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="rounded-lg border border-gray-200 p-4">
+                        <h3 className="text-sm font-semibold text-gray-900 mb-3">Current package</h3>
+                        <div className="space-y-2 text-sm text-gray-600">
+                          <div className="flex items-center justify-between gap-4">
+                            <span>Package</span>
+                            <span className="font-medium text-gray-900 text-right">{changePackagePreview.current_package.package_name}</span>
+                          </div>
+                          <div className="flex items-center justify-between gap-4">
+                            <span>Downpayment</span>
+                            <span className="font-medium text-gray-900">{formatMoney(changePackagePreview.current_package.downpayment_amount)}</span>
+                          </div>
+                          <div className="flex items-center justify-between gap-4">
+                            <span>Recurring amount</span>
+                            <span className="font-medium text-gray-900">{formatMoney(changePackagePreview.current_package.recurring_amount)}</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="rounded-lg border border-gray-200 p-4">
+                        <h3 className="text-sm font-semibold text-gray-900 mb-3">Target package</h3>
+                        <div className="space-y-2 text-sm text-gray-600">
+                          <div className="flex items-center justify-between gap-4">
+                            <span>Package</span>
+                            <span className="font-medium text-gray-900 text-right">{changePackagePreview.target_package.package_name}</span>
+                          </div>
+                          <div className="flex items-center justify-between gap-4">
+                            <span>Downpayment</span>
+                            <span className="font-medium text-gray-900">{formatMoney(changePackagePreview.target_package.downpayment_amount)}</span>
+                          </div>
+                          <div className="flex items-center justify-between gap-4">
+                            <span>Recurring amount</span>
+                            <span className="font-medium text-gray-900">{formatMoney(changePackagePreview.target_package.recurring_amount)}</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="rounded-lg border border-gray-200 p-4">
+                    <h3 className="text-sm font-semibold text-gray-900 mb-3">Calculation summary</h3>
+                    <div className="space-y-2 text-sm text-gray-600">
+                      <div className="flex items-center justify-between gap-4">
+                        <span>Paid recurring phases</span>
+                        <span className="font-medium text-gray-900">{changePackagePreview.recurring_paid_count ?? 0}</span>
+                      </div>
+                      <div className="flex items-center justify-between gap-4">
+                        <span>Current package paid total</span>
+                        <span className="font-medium text-gray-900">{formatMoney(changePackagePreview.current_paid_total)}</span>
+                      </div>
+                      <div className="flex items-center justify-between gap-4">
+                        <span>Target package equivalent total</span>
+                        <span className="font-medium text-gray-900">{formatMoney(changePackagePreview.target_equivalent_total)}</span>
+                      </div>
+                      <div className="border-t border-gray-200 pt-2 flex items-center justify-between gap-4">
+                        <span className="font-semibold text-gray-900">Additional amount to invoice</span>
+                        <span className={`font-semibold ${changePackagePreview.difference > 0 ? 'text-emerald-700' : 'text-amber-700'}`}>
+                          {formatMoney(changePackagePreview.difference)}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="px-6 py-4 border-t border-gray-200 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={closeChangePackageModal}
+                className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleCreatePackageChangeInvoice}
+                disabled={!changePackagePreview?.allowed || !selectedTargetPackageForChange || changePackageSubmitting}
+                className="px-4 py-2 text-sm font-medium text-gray-900 bg-[#F7C844] hover:bg-[#F5B82E] rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {changePackageSubmitting ? 'Creating...' : 'Create Adjustment Invoice'}
+              </button>
+            </div>
           </div>
         </div>,
         document.body
@@ -13185,14 +13793,14 @@ setFormData({
                   const substituteReason = document.getElementById('substituteReason').value;
                   
                   if (!substituteTeacherId) {
-                    alert('Please select a substitute teacher');
+                    appAlert('Please select a substitute teacher');
                     return;
                   }
                   
                   if (selectedSessionForSubstitute.classsession_id) {
                     handleAssignSubstitute(selectedSessionForSubstitute.classsession_id, substituteTeacherId, substituteReason);
                   } else {
-                    alert('Session not found. Please generate sessions first.');
+                    appAlert('Session not found. Please generate sessions first.');
                   }
                 }}
                 className="px-4 py-2 text-sm font-medium text-white bg-primary-600 rounded-lg hover:bg-primary-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -13971,54 +14579,23 @@ setFormData({
                     
                     return (
                       <div className="space-y-3">
-                        {/* Installment Settings Toggle */}
+                        {/* Installment Settings */}
                         <div className="p-4 bg-white border border-gray-200 rounded-lg">
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center space-x-3">
-                              <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
-                                <svg className="w-5 h-5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                </svg>
-                              </div>
-                              <div>
-                                <h4 className="text-sm font-medium text-gray-900">Installment Payment</h4>
-                                <p className="text-xs text-gray-600 mt-0.5">Enable to set up installment invoice settings</p>
-                              </div>
+                          <div className="flex items-center space-x-3">
+                            <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
+                              <svg className="w-5 h-5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                              </svg>
                             </div>
-                            <button
-                              type="button"
-                              onClick={async () => {
-                                const newState = !upgradeShowInstallmentSettings;
-                                setUpgradeShowInstallmentSettings(newState);
-                                if (newState) {
-                                  const branchId = selectedClassForReservations?.branch_id ?? selectedReservationForUpgrade?.branch_id ?? null;
-                                  const systemSettings = await fetchInstallmentScheduleSettings(branchId);
-                                  setUpgradeInstallmentSettings(systemSettings);
-                                } else {
-                                  setUpgradeInstallmentSettings({
-                                    invoice_issue_date: '',
-                                    billing_month: '',
-                                    invoice_due_date: '',
-                                    invoice_generation_date: '',
-                                    frequency_months: 1,
-                                  });
-                                }
-                              }}
-                              className={`relative inline-flex h-5 w-10 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-[#F7C844] focus:ring-offset-1 shadow-inner ${
-                                upgradeShowInstallmentSettings ? 'bg-[#F7C844]' : 'bg-gray-300'
-                              }`}
-                            >
-                              <span
-                                className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-md ring-0 transition duration-200 ease-in-out ${
-                                  upgradeShowInstallmentSettings ? 'translate-x-5' : 'translate-x-0'
-                                }`}
-                              />
-                            </button>
+                            <div>
+                              <h4 className="text-sm font-medium text-gray-900">Installment Payment</h4>
+                              <p className="text-xs text-gray-600 mt-0.5">Installment invoice settings are applied automatically for this package.</p>
+                            </div>
                           </div>
                         </div>
 
                         {/* Installment Settings ? loaded from system Settings > Invoice Schedule */}
-                        {upgradeShowInstallmentSettings && (
+                        {isInstallmentCapablePackage && (
                           <div className="p-3 bg-gradient-to-br from-blue-50 to-indigo-50 border border-blue-200 rounded-lg">
                             <div className="mb-2">
                               <h3 className="text-xs font-bold text-blue-900">Installment Invoice Settings</h3>
@@ -14493,7 +15070,7 @@ setFormData({
                                   );
                                   
                                   if (!categorySelection || !categorySelection.size || categorySelection.size.trim() === '') {
-                                    alert(`Please select a size for ${typeName} (${category}) for the student`);
+                                    appAlert(`Please select a size for ${typeName} (${category}) for the student`);
                                     return;
                                   }
                                 }
@@ -14504,7 +15081,7 @@ setFormData({
                                 );
                                 
                                 if (!uniformSelection || !uniformSelection.size || uniformSelection.size.trim() === '') {
-                                  alert(`Please select a size for ${typeName} for the student`);
+                                  appAlert(`Please select a size for ${typeName} for the student`);
                                   return;
                                 }
                               }
@@ -14525,15 +15102,15 @@ setFormData({
                   <button
                     onClick={() => {
                       if (!upgradePhaseNumber) {
-                        alert('Please select a phase');
+                        appAlert('Please select a phase');
                         return;
                       }
                       if (!upgradePerPhaseAmount || parseFloat(upgradePerPhaseAmount) <= 0) {
-                        alert('Please enter a valid per-phase amount');
+                        appAlert('Please enter a valid per-phase amount');
                         return;
                       }
                       if (upgradeSelectedPricingLists.length === 0 && upgradeSelectedMerchandise.length === 0) {
-                        alert('Please select at least one pricing list or merchandise');
+                        appAlert('Please select at least one pricing list or merchandise');
                         return;
                       }
                       setUpgradeStep('review');

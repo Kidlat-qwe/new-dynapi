@@ -1,10 +1,15 @@
 import { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
+import { useLocation } from 'react-router-dom';
 import { apiRequest } from '../../config/api';
 import MerchandiseImageUpload from '../../components/MerchandiseImageUploadS3';
 import { formatDateManila } from '../../utils/dateUtils';
+import { appAlert, appConfirm } from '../../utils/appAlert';
+import { useGlobalBranchFilter } from '../../contexts/GlobalBranchFilterContext';
 
 const Merchandise = () => {
+  const { selectedBranchId: globalBranchId, selectedBranchName: globalBranchName } = useGlobalBranchFilter();
+  const location = useLocation();
   const [branches, setBranches] = useState([]);
   const [merchandise, setMerchandise] = useState([]);
   const [requests, setRequests] = useState([]);
@@ -53,6 +58,29 @@ const Merchandise = () => {
       fetchMerchandiseByBranch(selectedBranchId);
     }
   }, [selectedBranchId]);
+
+  useEffect(() => {
+    if (globalBranchId) {
+      const parsedBranchId = parseInt(globalBranchId, 10);
+      if (!Number.isNaN(parsedBranchId)) {
+        setSelectedBranchId(parsedBranchId);
+        setSelectedBranchName(globalBranchName || null);
+        setViewingStocksFor(null);
+      }
+      return;
+    }
+    setSelectedBranchId(null);
+    setSelectedBranchName(null);
+    setViewingStocksFor(null);
+    setMerchandise([]);
+  }, [globalBranchId, globalBranchName]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    if (params.get('notificationTab') === 'requests') {
+      setActiveTab('requests');
+    }
+  }, [location.search]);
 
   const fetchBranches = async () => {
     try {
@@ -111,7 +139,14 @@ const Merchandise = () => {
   };
 
   const handleDelete = async (merchandiseId) => {
-    if (!window.confirm('Are you sure you want to delete this merchandise?')) {
+    if (
+      !(await appConfirm({
+        title: 'Delete merchandise',
+        message: 'Are you sure you want to delete this merchandise?',
+        destructive: true,
+        confirmLabel: 'Delete',
+      }))
+    ) {
       return;
     }
 
@@ -123,12 +158,19 @@ const Merchandise = () => {
         fetchMerchandiseByBranch(selectedBranchId);
       }
     } catch (err) {
-      alert(err.message || 'Failed to delete merchandise');
+      appAlert(err.message || 'Failed to delete merchandise');
     }
   };
 
   const handleDeleteMerchandiseType = async (merchandiseName) => {
-    if (!window.confirm(`Are you sure you want to delete all items of "${merchandiseName}"? This action cannot be undone.`)) {
+    if (
+      !(await appConfirm({
+        title: 'Delete all items',
+        message: `Are you sure you want to delete all items of "${merchandiseName}"? This action cannot be undone.`,
+        destructive: true,
+        confirmLabel: 'Delete all',
+      }))
+    ) {
       return;
     }
 
@@ -152,7 +194,7 @@ const Merchandise = () => {
         await fetchMerchandiseByBranch(selectedBranchId);
       }
     } catch (err) {
-      alert(err.message || 'Failed to delete merchandise type');
+      appAlert(err.message || 'Failed to delete merchandise type');
     }
   };
 
@@ -262,11 +304,11 @@ const Merchandise = () => {
         }),
       });
       
-      alert('Request approved successfully! Admin will be notified.');
+      appAlert('Request approved successfully! Admin will be notified.');
       closeReviewModal();
       await fetchAllRequests();
     } catch (err) {
-      alert(err.message || 'Failed to approve request');
+      appAlert(err.message || 'Failed to approve request');
       console.error('Error approving request:', err);
     } finally {
       setSubmitting(false);
@@ -275,7 +317,7 @@ const Merchandise = () => {
 
   const handleRejectRequest = async (requestId, notes) => {
     if (!notes || notes.trim() === '') {
-      alert('Please provide a reason for rejection');
+      appAlert('Please provide a reason for rejection');
       return;
     }
 
@@ -286,11 +328,11 @@ const Merchandise = () => {
         body: JSON.stringify({ review_notes: notes }),
       });
       
-      alert('Request rejected. Admin will be notified.');
+      appAlert('Request rejected. Admin will be notified.');
       closeReviewModal();
       await fetchAllRequests();
     } catch (err) {
-      alert(err.message || 'Failed to reject request');
+      appAlert(err.message || 'Failed to reject request');
       console.error('Error rejecting request:', err);
     } finally {
       setSubmitting(false);

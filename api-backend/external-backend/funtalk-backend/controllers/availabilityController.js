@@ -1,4 +1,6 @@
 import { query } from '../config/database.js';
+import { computeAvailableSlotsDetailForTeacherDate } from '../utils/teacherSlotAvailability.js';
+import { notifyAvailabilityChanged } from '../services/notificationDispatchService.js';
 
 /**
  * @desc    Get teacher's availability schedule
@@ -51,7 +53,7 @@ export const getTeacherAvailability = async (req, res) => {
 export const getAvailableSlots = async (req, res) => {
   try {
     const { teacherId } = req.params;
-    const { date } = req.query;
+    const { date, excludeAppointmentId, classType } = req.query;
     
     if (!date) {
       return res.status(400).json({
@@ -59,45 +61,28 @@ export const getAvailableSlots = async (req, res) => {
         message: 'Date parameter is required',
       });
     }
-    
-    // Get day of week (0 = Sunday, 6 = Saturday)
-    const dateObj = new Date(date);
-    const dayOfWeek = dateObj.getDay();
-    
-    // Get teacher's availability for this day
-    const availabilityQuery = `
-      SELECT start_time, end_time
-      FROM teacheravailabilitytbl
-      WHERE teacher_id = $1 AND day_of_week = $2 AND is_active = true
-    `;
-    
-    const availabilityResult = await query(availabilityQuery, [teacherId, dayOfWeek]);
-    
-    // Get exceptions (blocked times) for this date
-    const exceptionQuery = `
-      SELECT start_time, end_time
-      FROM teacheravailabilityexceptionstbl
-      WHERE teacher_id = $1 AND exception_date = $2 AND is_blocked = true
-    `;
-    
-    const exceptionResult = await query(exceptionQuery, [teacherId, date]);
-    
-    // Get existing appointments for this date
-    const appointmentQuery = `
-      SELECT appointment_time
-      FROM appointmenttbl
-      WHERE teacher_id = $1 AND appointment_date = $2 
-      AND status NOT IN ('cancelled', 'no_show')
-    `;
-    
-    const appointmentResult = await query(appointmentQuery, [teacherId, date]);
-    
+
+    const excludeId =
+      excludeAppointmentId != null && excludeAppointmentId !== ''
+        ? Number(excludeAppointmentId)
+        : undefined;
+    const detail = await computeAvailableSlotsDetailForTeacherDate(
+      (sql, params) => query(sql, params),
+      teacherId,
+      date,
+      {
+        ...(Number.isFinite(excludeId) ? { excludeAppointmentId: excludeId } : {}),
+        ...(classType ? { targetClassType: classType } : {}),
+      }
+    );
+
     res.status(200).json({
       success: true,
       data: {
-        availability: availabilityResult.rows,
-        exceptions: exceptionResult.rows,
-        bookedSlots: appointmentResult.rows.map(apt => apt.appointment_time),
+        slots: detail.slots,
+        availability: detail.availability,
+        exceptions: detail.exceptions,
+        bookedSlots: detail.bookedSlots,
       },
     });
   } catch (error) {
@@ -135,6 +120,11 @@ export const setAvailability = async (req, res) => {
     ];
     
     const result = await query(sqlQuery, values);
+    await notifyAvailabilityChanged({
+      teacherId,
+      changeType: 'added an availability slot',
+      detail: `Day ${dayOfWeek}, ${startTime}-${endTime}`,
+    });
     
     res.status(201).json({
       success: true,
@@ -218,6 +208,11 @@ export const updateAvailability = async (req, res) => {
     `;
     
     const result = await query(updateQuery, values);
+    await notifyAvailabilityChanged({
+      teacherId,
+      changeType: 'updated availability',
+      detail: `availability_id=${id}`,
+    });
     
     res.status(200).json({
       success: true,
@@ -263,6 +258,11 @@ export const deleteAvailability = async (req, res) => {
       'DELETE FROM teacheravailabilitytbl WHERE availability_id = $1 RETURNING *',
       [id]
     );
+    await notifyAvailabilityChanged({
+      teacherId,
+      changeType: 'removed an availability slot',
+      detail: `availability_id=${id}`,
+    });
     
     res.status(200).json({
       success: true,
@@ -306,6 +306,11 @@ export const addException = async (req, res) => {
     ];
     
     const result = await query(sqlQuery, values);
+    await notifyAvailabilityChanged({
+      teacherId,
+      changeType: 'added an availability exception',
+      detail: `Date ${exceptionDate}`,
+    });
     
     res.status(201).json({
       success: true,
@@ -403,6 +408,11 @@ export const deleteException = async (req, res) => {
       'DELETE FROM teacheravailabilityexceptionstbl WHERE exception_id = $1',
       [id]
     );
+    await notifyAvailabilityChanged({
+      teacherId,
+      changeType: 'removed an availability exception',
+      detail: `exception_id=${id}`,
+    });
     
     res.status(200).json({
       success: true,

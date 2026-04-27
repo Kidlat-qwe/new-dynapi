@@ -15,21 +15,25 @@ import {
 import { apiRequest } from '../../config/api';
 import { useAuth } from '../../contexts/AuthContext';
 import { useGlobalBranchFilter } from '../../contexts/GlobalBranchFilterContext';
+import { DashboardStatIcon } from '../../components/dashboard/DashboardStatIcons';
 
 const COLORS = ['#22C55E', '#94A3B8', '#F7C844', '#4F46E5'];
+const CURRENT_MONTH = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' }).slice(0, 7);
 
-const StatsCard = ({ title, value, icon, accent, description }) => (
+const StatsCard = ({ title, value, iconName, accent, description }) => (
   <div className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-gray-100 transition-all hover:shadow-md">
     <div className="flex items-start justify-between">
       <div className="flex-1 min-w-0">
         <p className="text-sm font-medium text-gray-600">{title}</p>
-        <p className="mt-2 text-3xl font-bold tracking-tight text-gray-900">{value.toLocaleString()}</p>
+        <p className="mt-2 text-3xl font-bold tracking-tight text-gray-900">
+          {typeof value === 'number' ? value.toLocaleString() : value}
+        </p>
         {description && (
           <p className="mt-2 text-xs text-gray-500 leading-snug">{description}</p>
         )}
       </div>
       <div className={`ml-4 flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-xl ${accent}`}>
-        <span className="text-xl">{icon}</span>
+        <DashboardStatIcon name={iconName} className="h-6 w-6 text-white drop-shadow-sm" />
       </div>
     </div>
   </div>
@@ -55,6 +59,7 @@ const EnrollmentDashboard = () => {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [selectedMonth, setSelectedMonth] = useState('');
 
   const fetchData = async () => {
     try {
@@ -62,6 +67,7 @@ const EnrollmentDashboard = () => {
       setError('');
       const params = new URLSearchParams();
       if (selectedBranchId) params.set('branch_id', selectedBranchId);
+      if (selectedMonth) params.set('month', selectedMonth);
       const res = await apiRequest(`/dashboard/enrollment?${params.toString()}`);
       setData(res.data);
     } catch (err) {
@@ -73,7 +79,7 @@ const EnrollmentDashboard = () => {
 
   useEffect(() => {
     fetchData();
-  }, [selectedBranchId]);
+  }, [selectedBranchId, selectedMonth]);
 
   const pieData = useMemo(() => {
     if (!data) return [];
@@ -114,6 +120,10 @@ const EnrollmentDashboard = () => {
   const activeStudents = data?.active_students ?? 0;
   const inactiveStudents = data?.inactive_students ?? 0;
   const reservedOnly = data?.reserved_only_count ?? 0;
+  const reEnrollmentRate = Number(data?.re_enrollment_rate ?? 0);
+  const reEnrollmentRateLabel = `${reEnrollmentRate.toFixed(2)}%`;
+  const reEnrollmentCount = Number(data?.re_enrollment_count ?? 0);
+  const reEnrollmentBaseStudents = Number(data?.re_enrollment_base_students ?? 0);
 
   return (
     <div className="space-y-6">
@@ -123,8 +133,23 @@ const EnrollmentDashboard = () => {
           <p className="mt-1 text-sm text-gray-500">
             Active and inactive students, reservations, and enrollment trends.
           </p>
+          {selectedMonth ? (
+            <p className="mt-1 text-xs font-medium text-amber-700">
+              Month filter: applies to the &quot;Enrollments by Month&quot; trend chart only. Top cards use current registered and enrollment status.
+            </p>
+          ) : null}
         </div>
         <div className="flex flex-wrap items-center gap-3">
+          <label className="inline-flex items-center gap-2 rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700">
+            <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">Month</span>
+            <input
+              type="month"
+              value={selectedMonth}
+              max={CURRENT_MONTH}
+              onChange={(e) => setSelectedMonth(e.target.value)}
+              className="rounded-md border border-gray-300 px-2 py-1 text-sm text-gray-700 focus:border-[#F7C844] focus:outline-none focus:ring-2 focus:ring-[#F7C844]/40"
+            />
+          </label>
           <button
             type="button"
             onClick={fetchData}
@@ -144,32 +169,39 @@ const EnrollmentDashboard = () => {
         </div>
       )}
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
         <StatsCard
           title="Total Students"
           value={totalStudents}
-          icon="🎓"
+          iconName="users"
           accent="bg-gradient-to-br from-slate-400 to-slate-500"
-          description="All students in the system (active + inactive)."
+          description="All students registered in the system (same scope as the branch filter when a branch is selected)."
         />
         <StatsCard
           title="Active Students"
           value={activeStudents}
-          icon="✅"
+          iconName="checkCircle"
           accent="bg-gradient-to-br from-emerald-400 to-emerald-500"
-          description="Currently enrolled in at least one class."
+          description="Registered students with at least one current active class enrollment."
         />
         <StatsCard
           title="Inactive Students"
           value={inactiveStudents}
-          icon="⏸️"
+          iconName="userMinus"
           accent="bg-gradient-to-br from-amber-400 to-amber-500"
-          description="Not enrolled in any class (e.g. new, dropped, or reserved only)."
+          description="Registered students with no current active enrollment."
+        />
+        <StatsCard
+          title="Re-enrollment Rate"
+          value={reEnrollmentRateLabel}
+          iconName="chartBar"
+          accent="bg-gradient-to-br from-blue-400 to-blue-500"
+          description={`${reEnrollmentCount.toLocaleString()} active students with a same-class re-enrollment (2+ enrollments in one class) out of ${reEnrollmentBaseStudents.toLocaleString()} active students.`}
         />
         <StatsCard
           title="Reserved Only"
           value={reservedOnly}
-          icon="📋"
+          iconName="clipboardList"
           accent="bg-gradient-to-br from-indigo-400 to-indigo-500"
           description="Have a reservation but no active enrollment yet."
         />

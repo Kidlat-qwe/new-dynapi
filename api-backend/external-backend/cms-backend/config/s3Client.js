@@ -23,13 +23,11 @@ export const s3Client = new S3Client(s3Config);
 export const S3_BUCKET_NAME = process.env.AWS_S3_BUCKET_NAME || 'psms';
 
 // Log S3 configuration (without sensitive data)
-if (process.env.QUIET_STARTUP !== '1') {
-  console.log('📦 S3 Configuration:', {
-    region: s3Config.region,
-    bucket: S3_BUCKET_NAME,
-    endpoint: process.env.AWS_S3_ENDPOINT || 'default',
-  });
-}
+console.log('📦 S3 Configuration:', {
+  region: s3Config.region,
+  bucket: S3_BUCKET_NAME,
+  endpoint: process.env.AWS_S3_ENDPOINT || 'default',
+});
 
 export default s3Client;
 

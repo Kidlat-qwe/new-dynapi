@@ -3,19 +3,6 @@ import { readFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, resolve } from 'path';
 
-/**
- * When mounted inside api-backend (cmsMount.js), DB_* and Firebase paths are set by the host.
- * Do not load cms-backend/.env or it would overwrite systems_config values.
- */
-if (process.env.CMS_EMBEDDED === '1') {
-  if (process.env.QUIET_STARTUP !== '1') {
-    console.log('🔧 CMS embedded in api-backend: skipping cms-backend/.env (DB from systems_config)');
-  }
-} else {
-  loadCmsBackendEnv();
-}
-
-function loadCmsBackendEnv() {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const backendDir = resolve(__dirname, '..');
@@ -51,7 +38,4 @@ for (const key of dbKeys) {
   }
 }
 
-if (process.env.QUIET_STARTUP !== '1') {
-  console.log(`🔧 NODE_ENV=${nodeEnv} (from .env file) | DB: ${process.env.DB_NAME || '(not set)'}`);
-}
-}
+console.log(`🔧 NODE_ENV=${nodeEnv} (from .env file) | DB: ${process.env.DB_NAME || '(not set)'}`);

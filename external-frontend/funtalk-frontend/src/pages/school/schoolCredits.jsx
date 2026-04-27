@@ -2,7 +2,9 @@ import { useEffect, useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import Header from '../../components/Header';
 import Sidebar from '../../components/Sidebar';
-import { fetchFuntalk } from '../../lib/api';
+import ResponsiveSelect from '../../components/ResponsiveSelect.jsx';
+import Pagination from '../../components/Pagination.jsx';
+import { API_BASE_URL } from '@/config/api.js';
 
 const SchoolCredits = () => {
   const navigate = useNavigate();
@@ -12,9 +14,11 @@ const SchoolCredits = () => {
   const [creditBalance, setCreditBalance] = useState(0);
   const [lastUpdated, setLastUpdated] = useState(null);
   const [transactions, setTransactions] = useState([]);
+  const [billingStatus, setBillingStatus] = useState(null);
   const [isFetching, setIsFetching] = useState(false);
   const [transactionTypeFilter, setTransactionTypeFilter] = useState('');
   const [dateFilter, setDateFilter] = useState('');
+  const [page, setPage] = useState(1);
 
   useEffect(() => {
     const token = localStorage.getItem('token');
@@ -44,12 +48,18 @@ const SchoolCredits = () => {
     if (user) {
       fetchCreditBalance();
       fetchTransactions();
+      fetchBillingStatus();
     }
   }, [user, transactionTypeFilter, dateFilter]);
 
   const fetchCreditBalance = async () => {
     try {
-      const response = await fetchFuntalk('/credits/balance', {});
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/credits/balance`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data) {
@@ -64,15 +74,28 @@ const SchoolCredits = () => {
   const fetchTransactions = async () => {
     setIsFetching(true);
     try {
+      const token = localStorage.getItem('token');
+      let url = `${API_BASE_URL}/credits/transactions`;
       const params = new URLSearchParams();
-      if (transactionTypeFilter) params.append('transactionType', transactionTypeFilter);
+      
+      if (transactionTypeFilter) {
+        params.append('transactionType', transactionTypeFilter);
+      }
+      
       if (dateFilter) {
         params.append('startDate', dateFilter);
         params.append('endDate', dateFilter);
       }
-      const qs = params.toString();
-      const path = qs ? `/credits/transactions?${qs}` : '/credits/transactions';
-      const response = await fetchFuntalk(path, {});
+      
+      if (params.toString()) {
+        url += `?${params.toString()}`;
+      }
+
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.transactions) {
@@ -89,6 +112,26 @@ const SchoolCredits = () => {
     }
   };
 
+  const fetchBillingStatus = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/billing/subscriptions/${user.userId}/status`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
+      const data = await response.json();
+      if (data.success && data.data) {
+        setBillingStatus(data.data);
+      } else {
+        setBillingStatus(null);
+      }
+    } catch (error) {
+      console.error('Error fetching billing status:', error);
+      setBillingStatus(null);
+    }
+  };
+
   const formatDate = (dateString) => {
     if (!dateString) return 'N/A';
     const date = new Date(dateString);
@@ -101,6 +144,13 @@ const SchoolCredits = () => {
     });
   };
 
+  const formatMoney = (n) => {
+    if (n == null || n === '') return '—';
+    const v = parseFloat(n);
+    if (Number.isNaN(v)) return '—';
+    return `${'NT$'}${v.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',')}`;
+  };
+
   const formatTransactionType = (type) => {
     const types = {
       purchase: 'Purchase',
@@ -109,6 +159,13 @@ const SchoolCredits = () => {
     };
     return types[type] || type;
   };
+
+  useEffect(() => {
+    setPage(1);
+  }, [transactionTypeFilter, dateFilter]);
+
+  const pageSize = 10;
+  const pagedTransactions = transactions.slice((page - 1) * pageSize, page * pageSize);
 
   if (isLoading) {
     return (
@@ -169,6 +226,95 @@ const SchoolCredits = () => {
                 </div>
               </div>
 
+              {billingStatus?.patty_installment?.is_patty && (
+                <div className="bg-white rounded-lg shadow border border-blue-100 p-4 sm:p-6">
+                  <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+                    <div>
+                      <h2 className="text-lg sm:text-xl font-bold text-gray-900">Patty — monthly installment</h2>
+                      <p className="mt-1 text-xs sm:text-sm text-gray-600 max-w-2xl">
+                        This plan is billed in <span className="font-medium text-gray-800">monthly slices</span>, not one
+                        full upfront payment. Each invoice below is one period&apos;s installment.
+                      </p>
+                      {billingStatus.patty_installment.monthly_payment_label && (
+                        <p className="mt-2 text-sm text-gray-800">{billingStatus.patty_installment.monthly_payment_label}</p>
+                      )}
+                      {billingStatus.patty_installment.monthly_payment_amount != null && (
+                        <p className="mt-1 text-base sm:text-lg font-semibold text-primary-700">
+                          About {formatMoney(billingStatus.patty_installment.monthly_payment_amount)} per month
+                        </p>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="mt-4 space-y-2">
+                    {(billingStatus.patty_installment.installments_recorded ?? 0) === 0 ? (
+                      <p className="text-xs sm:text-sm text-gray-500">
+                        No subscription-linked installment invoices yet. Progress will show after invoices are generated each
+                        cycle.
+                      </p>
+                    ) : (
+                      <>
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm text-gray-700">
+                          <span>Installment payment progress (paid vs pending invoices)</span>
+                          {billingStatus.patty_installment.payment_progress_percent != null && (
+                            <span className="font-semibold text-gray-900">
+                              {billingStatus.patty_installment.payment_progress_percent}%
+                            </span>
+                          )}
+                        </div>
+                        <div className="h-2.5 w-full rounded-full bg-gray-200 overflow-hidden">
+                          <div
+                            className="h-full rounded-full bg-primary-600 transition-all"
+                            style={{
+                              width: `${
+                                billingStatus.patty_installment.payment_progress_percent != null
+                                  ? Math.min(100, Math.max(0, billingStatus.patty_installment.payment_progress_percent))
+                                  : 0
+                              }%`,
+                            }}
+                            role="progressbar"
+                            aria-valuenow={
+                              billingStatus.patty_installment.payment_progress_percent != null
+                                ? billingStatus.patty_installment.payment_progress_percent
+                                : 0
+                            }
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                          />
+                        </div>
+                        <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs sm:text-sm text-gray-600">
+                          <span>
+                            Paid:{' '}
+                            <span className="font-medium text-gray-900">
+                              {billingStatus.patty_installment.installments_paid ?? 0}
+                            </span>{' '}
+                            invoice(s) · {formatMoney(billingStatus.patty_installment.amount_paid_to_date)}
+                          </span>
+                          <span>
+                            Pending:{' '}
+                            <span className="font-medium text-amber-800">
+                              {billingStatus.patty_installment.installments_pending ?? 0}
+                            </span>{' '}
+                            · {formatMoney(billingStatus.patty_installment.amount_pending_total)}
+                          </span>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {billingStatus?.is_overdue && (
+                <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 sm:p-4">
+                  <p className="text-sm text-amber-800 font-medium">
+                    Payment overdue by {billingStatus.days_overdue} day{billingStatus.days_overdue !== 1 ? 's' : ''}.
+                  </p>
+                  <p className="mt-1 text-xs sm:text-sm text-amber-700">
+                    Due date was {billingStatus.next_due_date}. Credits remain usable, but please settle invoice promptly.
+                  </p>
+                </div>
+              )}
+
               {/* Transaction History */}
               <div className="bg-white rounded-lg shadow">
                 <div className="p-4 sm:p-6 border-b border-gray-200">
@@ -179,16 +325,18 @@ const SchoolCredits = () => {
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4 mb-4 sm:mb-6">
                     <div>
                       <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-1">Transaction Type</label>
-                      <select
+                      <ResponsiveSelect
+                        id="school-credits-transaction-type"
+                        aria-label="Filter by transaction type"
                         value={transactionTypeFilter}
                         onChange={(e) => setTransactionTypeFilter(e.target.value)}
-                        className="w-full px-3 sm:px-4 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                        className="w-full px-3 sm:px-4 py-2 text-sm border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-primary-500 focus:border-primary-500 focus:outline-none"
                       >
                         <option value="">All Types</option>
                         <option value="purchase">Purchase</option>
                         <option value="deduction">Deduction</option>
                         <option value="adjustment">Adjustment</option>
-                      </select>
+                      </ResponsiveSelect>
                     </div>
                     <div>
                       <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-1">Date</label>
@@ -212,20 +360,21 @@ const SchoolCredits = () => {
                       <p className="text-sm text-gray-500">No transactions found</p>
                     </div>
                   ) : (
+                    <>
                     <div className="overflow-x-auto">
                       <table className="w-full divide-y divide-gray-200" style={{ minWidth: '800px' }}>
                         <thead className="bg-gray-50">
                           <tr>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Amount</th>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Balance Before</th>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Balance After</th>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Description</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Date</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Type</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Amount</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Balance Before</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Balance After</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Description</th>
                           </tr>
                         </thead>
                         <tbody className="bg-white divide-y divide-gray-200">
-                          {transactions.map((transaction) => (
+                          {pagedTransactions.map((transaction) => (
                             <tr key={transaction.transaction_id} className="hover:bg-gray-50">
                               <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
                                 {formatDate(transaction.created_at)}
@@ -260,6 +409,10 @@ const SchoolCredits = () => {
                         </tbody>
                       </table>
                     </div>
+                    <div className="mt-3">
+                      <Pagination totalItems={transactions.length} pageSize={pageSize} currentPage={page} onPageChange={setPage} />
+                    </div>
+                    </>
                   )}
                 </div>
               </div>

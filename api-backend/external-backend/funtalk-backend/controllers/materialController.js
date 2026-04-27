@@ -1,11 +1,12 @@
 import { query } from '../config/database.js';
 import { getFileUrl } from '../middleware/upload.js';
-import path from 'path';
+import {
+  isS3Configured,
+  uploadMaterialFileToS3,
+  removeMaterialFileFromStorage,
+} from '../services/s3Materials.js';
 import fs from 'fs';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import { notifyMaterialUploaded } from '../services/notificationDispatchService.js';
 
 /**
  * @desc    Get all materials
@@ -15,6 +16,7 @@ const __dirname = path.dirname(__filename);
 export const getMaterials = async (req, res) => {
   try {
     const { materialType, search } = req.query;
+    const isOwnerScopedRole = req.user?.userType === 'teacher' || req.user?.userType === 'school';
     
     let sqlQuery = `
       SELECT 
@@ -22,7 +24,8 @@ export const getMaterials = async (req, res) => {
         material_name,
         material_type,
         file_url,
-        created_at
+        created_at,
+        created_by_user_id
       FROM materialtbl
       WHERE 1=1
     `;
@@ -40,6 +43,12 @@ export const getMaterials = async (req, res) => {
     if (search) {
       sqlQuery += ` AND material_name ILIKE $${paramIndex}`;
       params.push(`%${search}%`);
+      paramIndex++;
+    }
+
+    if (isOwnerScopedRole) {
+      sqlQuery += ` AND created_by_user_id = $${paramIndex}`;
+      params.push(req.user.userId);
       paramIndex++;
     }
     
@@ -124,31 +133,52 @@ export const createMaterial = async (req, res) => {
     // Manual validation (since express-validator doesn't work well with multipart/form-data)
     if (!materialName || !materialName.trim()) {
       // Clean up uploaded file if validation fails
-      if (req.file) {
-        const filePath = path.join(__dirname, '..', 'uploads', 'materials', req.file.filename);
-        if (fs.existsSync(filePath)) {
-          fs.unlinkSync(filePath);
-        }
+      if (req.file?.path && fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
       }
       return res.status(400).json({
         success: false,
         message: 'Material name is required',
       });
     }
+    if (!materialType || !String(materialType).trim()) {
+      if (req.file?.path && fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
+      }
+      return res.status(400).json({
+        success: false,
+        message: 'Material type is required',
+      });
+    }
     
+    const userType = req.user?.userType || 'teacher';
+
     // Determine file URL: use uploaded file if available, otherwise use provided URL
     let finalFileUrl = null;
     if (req.file) {
-      // File was uploaded - use the uploaded file path
-      finalFileUrl = getFileUrl(req.file.filename);
+      if (isS3Configured()) {
+        try {
+          finalFileUrl = await uploadMaterialFileToS3({
+            localPath: req.file.path,
+            userType,
+            contentType: req.file.mimetype,
+          });
+        } finally {
+          if (fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+          }
+        }
+      } else {
+        finalFileUrl = getFileUrl(req.file.filename);
+      }
     } else if (fileUrl && fileUrl.trim()) {
       // URL was provided instead
       finalFileUrl = fileUrl.trim();
     }
     
     const sqlQuery = `
-      INSERT INTO materialtbl (material_name, material_type, file_url)
-      VALUES ($1, $2, $3)
+      INSERT INTO materialtbl (material_name, material_type, file_url, created_by_user_id)
+      VALUES ($1, $2, $3, $4)
       RETURNING *
     `;
     
@@ -156,9 +186,16 @@ export const createMaterial = async (req, res) => {
       materialName,
       materialType || null,
       finalFileUrl || null,
+      req.user?.userId || null,
     ];
     
     const result = await query(sqlQuery, values);
+    await notifyMaterialUploaded({
+      userId: req.user?.userId,
+      userType,
+      materialId: result.rows[0]?.material_id,
+      materialName,
+    });
     
     res.status(201).json({
       success: true,
@@ -169,13 +206,10 @@ export const createMaterial = async (req, res) => {
     });
   } catch (error) {
     // If there's an error and a file was uploaded, clean it up
-    if (req.file) {
-      const filePath = path.join(__dirname, '..', 'uploads', 'materials', req.file.filename);
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
+    if (req.file?.path && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
     }
-    
+
     console.error('Error creating material:', error);
     res.status(500).json({
       success: false,
@@ -197,7 +231,7 @@ export const updateMaterial = async (req, res) => {
     
     // Check if material exists and get current file_url
     const materialCheck = await query(
-      'SELECT material_id, file_url FROM materialtbl WHERE material_id = $1',
+      'SELECT material_id, file_url, created_by_user_id FROM materialtbl WHERE material_id = $1',
       [id]
     );
     
@@ -209,13 +243,18 @@ export const updateMaterial = async (req, res) => {
     }
     
     const oldFileUrl = materialCheck.rows[0].file_url;
-    let oldFileName = null;
-    
-    // Extract old filename if it's an uploaded file (starts with /uploads/materials/)
-    if (oldFileUrl && oldFileUrl.startsWith('/uploads/materials/')) {
-      oldFileName = path.basename(oldFileUrl);
+    const createdByUserId = materialCheck.rows[0].created_by_user_id;
+    if (
+      (req.user?.userType === 'teacher' || req.user?.userType === 'school') &&
+      Number(createdByUserId) !== Number(req.user.userId)
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: 'You can only edit your own materials.',
+      });
     }
-    
+    const userType = req.user?.userType || 'admin';
+
     // Build dynamic update query
     const updates = [];
     const values = [];
@@ -229,25 +268,40 @@ export const updateMaterial = async (req, res) => {
     }
     
     if (materialType !== undefined) {
+      if (!String(materialType).trim()) {
+        return res.status(400).json({
+          success: false,
+          message: 'Material type is required',
+        });
+      }
       updates.push(`material_type = $${paramIndex}`);
-      values.push(materialType || null);
+      values.push(String(materialType).trim());
       paramIndex++;
     }
     
     // Handle file URL update
     if (req.file) {
-      // New file was uploaded - use uploaded file path
-      newFileUrl = getFileUrl(req.file.filename);
+      if (isS3Configured()) {
+        try {
+          newFileUrl = await uploadMaterialFileToS3({
+            localPath: req.file.path,
+            userType,
+            contentType: req.file.mimetype,
+          });
+        } finally {
+          if (fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+          }
+        }
+      } else {
+        newFileUrl = getFileUrl(req.file.filename);
+      }
       updates.push(`file_url = $${paramIndex}`);
       values.push(newFileUrl);
       paramIndex++;
-      
-      // Delete old file if it was an uploaded file
-      if (oldFileName) {
-        const oldFilePath = path.join(__dirname, '..', 'uploads', 'materials', oldFileName);
-        if (fs.existsSync(oldFilePath)) {
-          fs.unlinkSync(oldFilePath);
-        }
+
+      if (oldFileUrl && oldFileUrl !== newFileUrl) {
+        await removeMaterialFileFromStorage(oldFileUrl);
       }
     } else if (fileUrl !== undefined) {
       // URL was provided (or cleared)
@@ -255,13 +309,9 @@ export const updateMaterial = async (req, res) => {
       updates.push(`file_url = $${paramIndex}`);
       values.push(newFileUrl);
       paramIndex++;
-      
-      // If URL is being cleared and old file was uploaded, delete it
-      if (!newFileUrl && oldFileName) {
-        const oldFilePath = path.join(__dirname, '..', 'uploads', 'materials', oldFileName);
-        if (fs.existsSync(oldFilePath)) {
-          fs.unlinkSync(oldFilePath);
-        }
+
+      if (oldFileUrl && oldFileUrl !== newFileUrl) {
+        await removeMaterialFileFromStorage(oldFileUrl);
       }
     }
     
@@ -290,14 +340,10 @@ export const updateMaterial = async (req, res) => {
       },
     });
   } catch (error) {
-    // If there's an error and a new file was uploaded, clean it up
-    if (req.file) {
-      const filePath = path.join(__dirname, '..', 'uploads', 'materials', req.file.filename);
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
+    if (req.file?.path && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
     }
-    
+
     console.error('Error updating material:', error);
     res.status(500).json({
       success: false,
@@ -315,19 +361,38 @@ export const updateMaterial = async (req, res) => {
 export const deleteMaterial = async (req, res) => {
   try {
     const { id } = req.params;
-    
-    const result = await query(
-      'DELETE FROM materialtbl WHERE material_id = $1 RETURNING *',
+
+    const existing = await query(
+      'SELECT material_id, file_url, created_by_user_id FROM materialtbl WHERE material_id = $1',
       [id]
     );
-    
-    if (result.rows.length === 0) {
+
+    if (existing.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Material not found',
       });
     }
-    
+
+    if (
+      (req.user?.userType === 'teacher' || req.user?.userType === 'school') &&
+      Number(existing.rows[0].created_by_user_id) !== Number(req.user.userId)
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: 'You can only delete your own materials.',
+      });
+    }
+
+    const fileUrl = existing.rows[0].file_url;
+    try {
+      await removeMaterialFileFromStorage(fileUrl);
+    } catch (storageErr) {
+      console.error('Storage cleanup failed (file may remain on disk/S3):', storageErr);
+    }
+
+    await query('DELETE FROM materialtbl WHERE material_id = $1', [id]);
+
     res.status(200).json({
       success: true,
       message: 'Material deleted successfully',

@@ -148,11 +148,10 @@ export const AuthProvider = ({ children }) => {
       localStorage.setItem('firebase_token', token);
       
       // Verify token and get user info from backend (POST request as per backend route)
-      // Pass Firebase JWT explicitly so Bearer is never confused with VITE_CMS_API_TOKEN (sk_…).
       try {
         const response = await apiRequest('/auth/verify', {
           method: 'POST',
-        }, token);
+        });
         if (response && response.user) {
           setUserInfo(response.user);
           return { success: true, user: response.user };
@@ -200,11 +199,9 @@ export const AuthProvider = ({ children }) => {
     if (!currentUser) return;
     
     try {
-      const idToken = await currentUser.getIdToken(true);
-      localStorage.setItem('firebase_token', idToken);
       const response = await apiRequest('/auth/verify', {
         method: 'POST',
-      }, idToken);
+      });
       if (response && response.user) {
         // Normalize user data to include both camelCase and snake_case for compatibility
         const normalizedUser = {

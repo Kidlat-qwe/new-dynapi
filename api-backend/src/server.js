@@ -58,6 +58,8 @@ const mountedGrading = await mountGrading(app);
 
 // Optional API token for /api/cms: accept sk_xxx OR pass Firebase ID tokens through for CMS frontend login
 app.use('/api/cms', optionalApiTokenForSystem('cms'));
+// Alias: CMS frontend currently targets /api/sms
+app.use('/api/sms', optionalApiTokenForSystem('cms'));
 // Mount CMS at /api/cms (same process, one port; DB from systems_config)
 const mountedCms = await mountCms(app);
 

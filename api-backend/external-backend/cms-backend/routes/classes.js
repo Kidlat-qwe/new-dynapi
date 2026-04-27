@@ -8,6 +8,8 @@ import { generateClassCode, extractStartTimeFromSchedule } from '../utils/classC
 import { getCustomHolidayDateSetForRange } from '../utils/holidayService.js';
 import { formatYmdLocal, parseYmdToLocalNoon } from '../utils/dateUtils.js';
 import { buildPhaseInstallmentSchedule } from '../utils/phaseInstallmentUtils.js';
+import { syncClassEndDateFromSessions } from '../utils/classEndDateSync.js';
+import { insertInvoiceWithArNumber } from '../utils/invoiceArNumber.js';
 
 const router = express.Router();
 
@@ -18,6 +20,322 @@ const getHolidayRangeFromStartDate = (startDate) => {
   return {
     startYmd: `${y}-01-01`,
     endYmd: `${y + 3}-12-31`,
+  };
+};
+
+const roundCurrency = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+
+const isInstallmentLikePackage = (pkg) => (
+  pkg && (
+    pkg.package_type === 'Installment'
+    || (pkg.package_type === 'Phase' && pkg.payment_option === 'Installment')
+  )
+);
+
+const getPackageChangeBlockedResult = (code, message, extra = {}) => ({
+  success: true,
+  data: {
+    allowed: false,
+    code,
+    message,
+    ...extra,
+  },
+});
+
+const buildPackageChangePreview = async ({ client, classId, studentId, targetPackageId }) => {
+  const [classResult, studentResult, currentProfileResult, targetPackageResult] = await Promise.all([
+    client.query(
+      `SELECT c.class_id, c.branch_id, c.program_id, c.class_name, c.level_tag,
+              p.program_name
+       FROM classestbl c
+       LEFT JOIN programstbl p ON c.program_id = p.program_id
+       WHERE c.class_id = $1`,
+      [classId]
+    ),
+    client.query(
+      `SELECT user_id, full_name, email
+       FROM userstbl
+       WHERE user_id = $1 AND user_type = 'Student'`,
+      [studentId]
+    ),
+    client.query(
+      `SELECT
+          ip.installmentinvoiceprofiles_id,
+          ip.student_id,
+          ip.class_id,
+          ip.package_id,
+          ip.amount,
+          ip.total_phases,
+          ip.generated_count,
+          ip.downpayment_paid,
+          ip.downpayment_invoice_id,
+          ip.phase_start,
+          ip.is_active,
+          p.package_name,
+          p.package_type,
+          p.payment_option,
+          p.package_price,
+          p.downpayment_amount,
+          p.branch_id AS package_branch_id
+       FROM installmentinvoiceprofilestbl ip
+       LEFT JOIN packagestbl p ON ip.package_id = p.package_id
+       WHERE ip.class_id = $1
+         AND ip.student_id = $2
+         AND ip.is_active = true
+       ORDER BY ip.installmentinvoiceprofiles_id DESC`,
+      [classId, studentId]
+    ),
+    client.query(
+      `SELECT
+          package_id,
+          package_name,
+          branch_id,
+          status,
+          package_price,
+          package_type,
+          payment_option,
+          downpayment_amount,
+          phase_start,
+          phase_end
+       FROM packagestbl
+       WHERE package_id = $1`,
+      [targetPackageId]
+    ),
+  ]);
+
+  if (classResult.rows.length === 0) {
+    return getPackageChangeBlockedResult('class_not_found', 'Class not found.');
+  }
+  if (studentResult.rows.length === 0) {
+    return getPackageChangeBlockedResult('student_not_found', 'Student not found.');
+  }
+  if (targetPackageResult.rows.length === 0) {
+    return getPackageChangeBlockedResult('target_package_not_found', 'Target package not found.');
+  }
+
+  const classRow = classResult.rows[0];
+  const studentRow = studentResult.rows[0];
+  const targetPackage = targetPackageResult.rows[0];
+
+  if (currentProfileResult.rows.length === 0) {
+    return getPackageChangeBlockedResult(
+      'missing_active_profile',
+      'This student does not have an active installment package profile for this class.',
+      {
+        class: classRow,
+        student: studentRow,
+        target_package: targetPackage,
+      }
+    );
+  }
+
+  if (currentProfileResult.rows.length > 1) {
+    return getPackageChangeBlockedResult(
+      'ambiguous_active_profiles',
+      'This student has multiple active package profiles for this class. Automatic package change is blocked.',
+      {
+        class: classRow,
+        student: studentRow,
+        target_package: targetPackage,
+      }
+    );
+  }
+
+  const currentProfile = currentProfileResult.rows[0];
+
+  if (!currentProfile.package_id) {
+    return getPackageChangeBlockedResult(
+      'missing_current_package',
+      'The active financial profile does not have a linked package. Automatic package change is blocked.',
+      {
+        class: classRow,
+        student: studentRow,
+        target_package: targetPackage,
+      }
+    );
+  }
+
+  if (Number(currentProfile.package_id) === Number(targetPackage.package_id)) {
+    return getPackageChangeBlockedResult(
+      'same_package',
+      'The target package is the same as the student’s current package.',
+      {
+        class: classRow,
+        student: studentRow,
+      }
+    );
+  }
+
+  if (targetPackage.status && targetPackage.status !== 'Active') {
+    return getPackageChangeBlockedResult(
+      'inactive_target_package',
+      'The selected package is not active.',
+      {
+        class: classRow,
+        student: studentRow,
+      }
+    );
+  }
+
+  if (
+    targetPackage.branch_id != null
+    && classRow.branch_id != null
+    && Number(targetPackage.branch_id) !== Number(classRow.branch_id)
+  ) {
+    return getPackageChangeBlockedResult(
+      'target_package_branch_mismatch',
+      'The selected package does not belong to this class branch.',
+      {
+        class: classRow,
+        student: studentRow,
+      }
+    );
+  }
+
+  if (!isInstallmentLikePackage(currentProfile) || !isInstallmentLikePackage(targetPackage)) {
+    return getPackageChangeBlockedResult(
+      'unsupported_package_type',
+      'Automatic package change currently supports installment-style packages only.',
+      {
+        class: classRow,
+        student: studentRow,
+        current_package: currentProfile,
+        target_package: targetPackage,
+      }
+    );
+  }
+
+  const activeEnrollmentResult = await client.query(
+    `SELECT COUNT(*) AS count
+     FROM classstudentstbl
+     WHERE student_id = $1
+       AND class_id = $2
+       AND COALESCE(enrollment_status, 'Active') = 'Active'`,
+    [studentId, classId]
+  );
+
+  if (parseInt(activeEnrollmentResult.rows[0]?.count || 0, 10) <= 0) {
+    return getPackageChangeBlockedResult(
+      'not_currently_enrolled',
+      'This student does not have an active enrollment record in the selected class.',
+      {
+        class: classRow,
+        student: studentRow,
+      }
+    );
+  }
+
+  const [paidRecurringResult, totalPaidResult, partialRecurringResult] = await Promise.all([
+    client.query(
+      `SELECT COUNT(*) AS paid_count
+       FROM invoicestbl i
+       WHERE i.installmentinvoiceprofiles_id = $1
+         AND i.status = 'Paid'
+         AND ($2::INTEGER IS NULL OR i.invoice_id != $2::INTEGER)`,
+      [currentProfile.installmentinvoiceprofiles_id, currentProfile.downpayment_invoice_id || null]
+    ),
+    client.query(
+      `SELECT COALESCE(SUM(p.payable_amount), 0) AS total_paid
+       FROM paymenttbl p
+       INNER JOIN invoicestbl i ON i.invoice_id = p.invoice_id
+       WHERE i.installmentinvoiceprofiles_id = $1
+         AND p.status = 'Completed'`,
+      [currentProfile.installmentinvoiceprofiles_id]
+    ),
+    client.query(
+      `SELECT COUNT(DISTINCT i.invoice_id) AS partial_count
+       FROM invoicestbl i
+       INNER JOIN paymenttbl p ON p.invoice_id = i.invoice_id
+       WHERE i.installmentinvoiceprofiles_id = $1
+         AND ($2::INTEGER IS NULL OR i.invoice_id != $2::INTEGER)
+         AND p.status = 'Completed'
+         AND COALESCE(i.status, '') <> 'Paid'`,
+      [currentProfile.installmentinvoiceprofiles_id, currentProfile.downpayment_invoice_id || null]
+    ),
+  ]);
+
+  if (parseInt(partialRecurringResult.rows[0]?.partial_count || 0, 10) > 0) {
+    return getPackageChangeBlockedResult(
+      'partial_recurring_payment_detected',
+      'This student has a partial or in-progress recurring payment. Automatic package change is blocked for now.',
+      {
+        class: classRow,
+        student: studentRow,
+        current_package: currentProfile,
+        target_package: targetPackage,
+      }
+    );
+  }
+
+  const recurringPaidCount = parseInt(paidRecurringResult.rows[0]?.paid_count || 0, 10);
+  const currentPaidTotal = roundCurrency(totalPaidResult.rows[0]?.total_paid || 0);
+  const targetDownpayment = roundCurrency(targetPackage.downpayment_amount || 0);
+  const targetRecurringAmount = roundCurrency(targetPackage.package_price || 0);
+
+  if (targetRecurringAmount <= 0 && recurringPaidCount > 0) {
+    return getPackageChangeBlockedResult(
+      'invalid_target_amount',
+      'The selected package does not have a valid recurring amount for this comparison.',
+      {
+        class: classRow,
+        student: studentRow,
+        current_package: currentProfile,
+        target_package: targetPackage,
+      }
+    );
+  }
+
+  const targetEquivalentTotal = roundCurrency(targetDownpayment + (recurringPaidCount * targetRecurringAmount));
+  const difference = roundCurrency(targetEquivalentTotal - currentPaidTotal);
+  const phaseStart = currentProfile.phase_start != null ? parseInt(currentProfile.phase_start, 10) : 1;
+  const lastPaidPhase = recurringPaidCount > 0 ? phaseStart + recurringPaidCount - 1 : null;
+
+  let allowed = true;
+  let code = 'adjustment_required';
+  let message = 'A package change adjustment invoice can be created.';
+
+  if (difference < 0) {
+    allowed = false;
+    code = 'negative_difference_blocked';
+    message = 'The student has already paid more than the target package equivalent total. Automatic package change is blocked.';
+  } else if (difference === 0) {
+    allowed = false;
+    code = 'no_difference';
+    message = 'There is no additional amount to invoice for this package change.';
+  }
+
+  return {
+    success: true,
+    data: {
+      allowed,
+      code,
+      message,
+      class: classRow,
+      student: studentRow,
+      current_package: {
+        package_id: currentProfile.package_id,
+        package_name: currentProfile.package_name,
+        package_type: currentProfile.package_type,
+        payment_option: currentProfile.payment_option,
+        downpayment_amount: roundCurrency(currentProfile.downpayment_amount || 0),
+        recurring_amount: roundCurrency(currentProfile.package_price || currentProfile.amount || 0),
+      },
+      target_package: {
+        package_id: targetPackage.package_id,
+        package_name: targetPackage.package_name,
+        package_type: targetPackage.package_type,
+        payment_option: targetPackage.payment_option,
+        downpayment_amount: targetDownpayment,
+        recurring_amount: targetRecurringAmount,
+      },
+      current_profile_id: currentProfile.installmentinvoiceprofiles_id,
+      recurring_paid_count: recurringPaidCount,
+      current_paid_total: currentPaidTotal,
+      target_equivalent_total: targetEquivalentTotal,
+      difference,
+      last_paid_phase: lastPaidPhase,
+      phase_start: phaseStart,
+    },
   };
 };
 
@@ -575,6 +893,205 @@ router.post(
         success: true,
         message: `Student moved to the other class successfully (${moveCount} enrollment(s), phase preserved).`,
         data: { student_id, source_class_id, target_class_id, enrollments_moved: moveCount },
+      });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      next(error);
+    } finally {
+      client.release();
+    }
+  }
+);
+
+/**
+ * POST /api/sms/classes/:id/students/:studentId/package-change-preview
+ * Preview the one-time package change adjustment amount.
+ * Access: Superadmin, Admin
+ */
+router.post(
+  '/:id/students/:studentId/package-change-preview',
+  [
+    param('id').isInt().withMessage('Class ID must be an integer'),
+    param('studentId').isInt().withMessage('Student ID must be an integer'),
+    body('target_package_id').isInt().withMessage('target_package_id must be an integer'),
+    handleValidationErrors,
+  ],
+  requireRole('Superadmin', 'Admin'),
+  async (req, res, next) => {
+    const client = await getClient();
+    try {
+      const classId = parseInt(req.params.id, 10);
+      const studentId = parseInt(req.params.studentId, 10);
+      const targetPackageId = parseInt(req.body.target_package_id, 10);
+
+      const preview = await buildPackageChangePreview({
+        client,
+        classId,
+        studentId,
+        targetPackageId,
+      });
+
+      res.json(preview);
+    } catch (error) {
+      next(error);
+    } finally {
+      client.release();
+    }
+  }
+);
+
+/**
+ * POST /api/sms/classes/:id/students/:studentId/package-change-invoice
+ * Create a one-time adjustment invoice for a package change.
+ * Access: Superadmin, Admin
+ */
+router.post(
+  '/:id/students/:studentId/package-change-invoice',
+  [
+    param('id').isInt().withMessage('Class ID must be an integer'),
+    param('studentId').isInt().withMessage('Student ID must be an integer'),
+    body('target_package_id').isInt().withMessage('target_package_id must be an integer'),
+    handleValidationErrors,
+  ],
+  requireRole('Superadmin', 'Admin'),
+  async (req, res, next) => {
+    const client = await getClient();
+    try {
+      await client.query('BEGIN');
+
+      const classId = parseInt(req.params.id, 10);
+      const studentId = parseInt(req.params.studentId, 10);
+      const targetPackageId = parseInt(req.body.target_package_id, 10);
+      const createdBy = req.user.userId || null;
+
+      const preview = await buildPackageChangePreview({
+        client,
+        classId,
+        studentId,
+        targetPackageId,
+      });
+
+      if (!preview?.data?.allowed) {
+        await client.query('ROLLBACK');
+        return res.status(400).json(preview);
+      }
+
+      const details = preview.data;
+      const duplicateResult = await client.query(
+        `SELECT invoice_id
+         FROM invoicestbl
+         WHERE remarks LIKE $1
+           AND status NOT IN ('Paid', 'Cancelled')
+         ORDER BY invoice_id DESC
+         LIMIT 1`,
+        [
+          `%PACKAGE_CHANGE_ADJUSTMENT;CLASS_ID:${classId};STUDENT_ID:${studentId};CURRENT_PROFILE_ID:${details.current_profile_id};TO_PACKAGE_ID:${details.target_package.package_id};%`,
+        ]
+      );
+
+      if (duplicateResult.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          success: false,
+          message: `An active package change adjustment invoice already exists (INV-${duplicateResult.rows[0].invoice_id}).`,
+          data: {
+            allowed: false,
+            code: 'existing_adjustment_invoice',
+            invoice_id: duplicateResult.rows[0].invoice_id,
+          },
+        });
+      }
+
+      const issueDate = formatYmdLocal(new Date());
+      const dueDate = issueDate;
+      const invoiceDescription = `Package change adjustment - ${details.target_package.package_name}`;
+      const remarks =
+        `PACKAGE_CHANGE_ADJUSTMENT;CLASS_ID:${classId};STUDENT_ID:${studentId};CURRENT_PROFILE_ID:${details.current_profile_id};FROM_PACKAGE_ID:${details.current_package.package_id};TO_PACKAGE_ID:${details.target_package.package_id};CURRENT_PAID:${details.current_paid_total.toFixed(2)};TARGET_EQUIVALENT:${details.target_equivalent_total.toFixed(2)};RECURRING_PAID_COUNT:${details.recurring_paid_count}`;
+
+      const newInvoice = await insertInvoiceWithArNumber(
+        client,
+        `INSERT INTO invoicestbl (invoice_description, branch_id, amount, status, remarks, issue_date, due_date, created_by, package_id, invoice_ar_number)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING *`,
+        [
+          invoiceDescription,
+          details.class.branch_id || null,
+          details.difference,
+          'Unpaid',
+          remarks,
+          issueDate,
+          dueDate,
+          createdBy,
+          details.target_package.package_id,
+        ]
+      );
+
+      await client.query(
+        `INSERT INTO invoiceitemstbl (invoice_id, description, amount)
+         VALUES ($1, $2, $3)`,
+        [
+          newInvoice.invoice_id,
+          `Package change from ${details.current_package.package_name} to ${details.target_package.package_name}`,
+          details.difference,
+        ]
+      );
+
+      await client.query(
+        `INSERT INTO invoicestudentstbl (invoice_id, student_id)
+         VALUES ($1, $2)`,
+        [newInvoice.invoice_id, studentId]
+      );
+
+      // Keep the active installment profile in sync so Installment Invoice logs
+      // and future generated invoices use the updated plan amount/package.
+      await client.query(
+        `UPDATE installmentinvoiceprofilestbl
+         SET package_id = $1,
+             amount = $2
+         WHERE installmentinvoiceprofiles_id = $3`,
+        [
+          details.target_package.package_id,
+          details.target_package.recurring_amount,
+          details.current_profile_id,
+        ]
+      );
+
+      await client.query(
+        `UPDATE installmentinvoicestbl
+         SET total_amount_including_tax = $1,
+             total_amount_excluding_tax = $2
+         WHERE installmentinvoiceprofiles_id = $3`,
+        [
+          details.target_package.recurring_amount,
+          details.target_package.recurring_amount,
+          details.current_profile_id,
+        ]
+      );
+
+      await client.query('COMMIT');
+
+      const [itemsResult, studentsResult] = await Promise.all([
+        query('SELECT * FROM invoiceitemstbl WHERE invoice_id = $1', [newInvoice.invoice_id]),
+        query(
+          `SELECT inv_student.*, u.full_name, u.email
+           FROM invoicestudentstbl inv_student
+           JOIN userstbl u ON inv_student.student_id = u.user_id
+           WHERE inv_student.invoice_id = $1`,
+          [newInvoice.invoice_id]
+        ),
+      ]);
+
+      res.status(201).json({
+        success: true,
+        message: `Adjustment invoice created and installment plan updated successfully (INV-${newInvoice.invoice_id}).`,
+        data: {
+          preview: details,
+          invoice: {
+            ...newInvoice,
+            items: itemsResult.rows,
+            students: studentsResult.rows,
+          },
+        },
       });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
@@ -1234,6 +1751,11 @@ router.post(
           }
           
           console.log(`✅ Generated ${sessionsCreated} sessions out of ${sessions.length} for class ${newClass.class_id}`);
+          try {
+            await syncClassEndDateFromSessions(client, newClass.class_id);
+          } catch (e) {
+            console.error('⚠️ Could not sync class end_date from sessions:', e.message);
+          }
         } catch (sessionGenError) {
           // Log error but don't fail class creation
           console.error('❌ Error generating class sessions:', sessionGenError);
@@ -1657,6 +2179,11 @@ router.put(
                 }
 
                 console.log(`✅ Regenerated sessions: ${sessionsUpdated} updated, ${sessionsCreated} created`);
+                try {
+                  await syncClassEndDateFromSessions(client, parseInt(id, 10));
+                } catch (e) {
+                  console.error('⚠️ Could not sync class end_date from sessions:', e.message);
+                }
               } else {
                 console.log('⚠️ No schedules found for class, skipping session regeneration');
               }
@@ -1992,6 +2519,11 @@ router.get(
           }
           
           console.log(`✅ Auto-generated ${sessionsCreated} sessions for class ${id}`);
+          try {
+            await syncClassEndDateFromSessions(query, parseInt(id, 10));
+          } catch (e) {
+            console.error('⚠️ Could not sync class end_date from sessions:', e.message);
+          }
         } catch (autoGenError) {
           // Log error but don't fail the request
           console.error('❌ Error auto-generating sessions:', autoGenError);
@@ -2920,6 +3452,12 @@ router.post(
         }
       }
 
+      try {
+        await syncClassEndDateFromSessions(query, parseInt(class_id, 10));
+      } catch (e) {
+        console.error('Could not sync class end_date from sessions:', e.message);
+      }
+
       res.json({
         success: true,
         message: `Generated ${sessionsCreated} sessions for class`,
@@ -2962,6 +3500,10 @@ router.post(
     body('installment_settings.invoice_due_date').optional().isISO8601().withMessage('Invoice due date must be a valid date'),
     body('installment_settings.invoice_generation_date').optional().isISO8601().withMessage('Invoice generation date must be a valid date'),
     body('installment_settings.frequency_months').optional().isInt({ min: 1 }).withMessage('Frequency months must be a positive integer'),
+    body('installment_scope').optional().isObject().withMessage('Installment scope must be an object'),
+    body('installment_scope.phase_start').optional().isInt({ min: 1 }).withMessage('Installment scope phase_start must be a positive integer'),
+    body('installment_scope.phase_end').optional().isInt({ min: 1 }).withMessage('Installment scope phase_end must be a positive integer'),
+    body('installment_scope.include_downpayment').optional().isBoolean().withMessage('Installment scope include_downpayment must be boolean'),
     body('phase_number')
       .optional({ nullable: true, checkFalsy: true })
       .custom((value) => {
@@ -2980,7 +3522,7 @@ router.post(
       await client.query('BEGIN');
 
       const { id: class_id } = req.params;
-      const { student_id, package_id, selected_pricing_lists = [], selected_merchandise = [], installment_settings, phase_number, per_phase_amount, reservation_invoice_settings, promo_id, promo_code } = req.body;
+      const { student_id, package_id, selected_pricing_lists = [], selected_merchandise = [], installment_settings, installment_scope, phase_number, per_phase_amount, reservation_invoice_settings, promo_id, promo_code } = req.body;
 
       // Verify class exists and get branch_id, phase, start date, and level_tag
       const classCheck = await client.query(
@@ -3041,16 +3583,22 @@ router.post(
 
       // Check if student is already enrolled
       const existingEnrollment = await client.query(
-        'SELECT classstudent_id FROM classstudentstbl WHERE student_id = $1 AND class_id = $2',
+        `SELECT classstudent_id
+              , phase_number
+         FROM classstudentstbl
+         WHERE student_id = $1
+           AND class_id = $2
+           AND COALESCE(enrollment_status, 'Active') = 'Active'
+           AND removed_at IS NULL`,
         [student_id, class_id]
       );
-      if (existingEnrollment.rows.length > 0) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({
-          success: false,
-          message: 'Student is already enrolled in this class',
-        });
-      }
+      const hasActiveEnrollmentInClass = existingEnrollment.rows.length > 0;
+      const highestActivePhaseInClass = hasActiveEnrollmentInClass
+        ? existingEnrollment.rows.reduce((max, row) => {
+            const phaseNum = parseInt(row.phase_number, 10);
+            return Number.isInteger(phaseNum) && phaseNum > max ? phaseNum : max;
+          }, 0)
+        : 0;
 
       // Update student's level_tag to match class's level_tag if they differ
       const classLevelTag = classData.level_tag;
@@ -3144,6 +3692,9 @@ router.post(
       // Optional phase range for Phase packages (used later in invoice remarks)
       let phaseStartForRemarks = null;
       let phaseEndForRemarks = null;
+      let installmentPhaseStart = null;
+      let installmentPhaseEnd = null;
+      let installmentIncludeDownpayment = true;
       // Initialize packageData to null - will be set if package_id is provided
       let packageData = null;
 
@@ -3379,9 +3930,10 @@ router.post(
             console.log('package_id column check:', err.message);
           }
 
-          const invoiceResult = await client.query(
-            `INSERT INTO invoicestbl (invoice_description, branch_id, amount, status, issue_date, due_date, created_by, package_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          const reservationInvoice = await insertInvoiceWithArNumber(
+            client,
+            `INSERT INTO invoicestbl (invoice_description, branch_id, amount, status, issue_date, due_date, created_by, package_id, invoice_ar_number)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              RETURNING *`,
             [
               `Reservation Fee - ${packageName || 'Class Reservation'}`,
@@ -3394,8 +3946,6 @@ router.post(
               package_id || null, // Link invoice to package
             ]
           );
-
-          const reservationInvoice = invoiceResult.rows[0];
 
           // Link invoice to student
           await client.query(
@@ -3444,8 +3994,64 @@ router.post(
           });
         }
         
-        // If this is a Phase package, capture its phase range for invoice remarks
-        if (packageData.package_type === 'Phase') {
+        const isInstallmentPackage =
+          packageData.package_type === 'Installment' ||
+          (packageData.package_type === 'Phase' && packageData.payment_option === 'Installment');
+
+        // For installment packages, allow enrollment scope override from UI.
+        if (isInstallmentPackage) {
+          const classMaxPhase = classData.number_of_phase ? parseInt(classData.number_of_phase, 10) : null;
+          const pkgMinPhase =
+            packageData.package_type === 'Phase' && packageData.payment_option === 'Installment'
+              ? (parseInt(packageData.phase_start, 10) || 1)
+              : 1;
+          const pkgMaxPhase =
+            packageData.package_type === 'Phase' && packageData.payment_option === 'Installment'
+              ? (parseInt(packageData.phase_end, 10) || pkgMinPhase)
+              : (classMaxPhase || pkgMinPhase);
+
+          const requestedStart = installment_scope?.phase_start != null
+            ? parseInt(installment_scope.phase_start, 10)
+            : pkgMinPhase;
+          const requestedEnd = installment_scope?.phase_end != null
+            ? parseInt(installment_scope.phase_end, 10)
+            : pkgMaxPhase;
+
+          if (!Number.isInteger(requestedStart) || !Number.isInteger(requestedEnd) || requestedEnd < requestedStart) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+              success: false,
+              message: 'Invalid installment phase scope. Ensure phase_end is greater than or equal to phase_start.',
+            });
+          }
+
+          if (requestedStart < pkgMinPhase || requestedEnd > pkgMaxPhase) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+              success: false,
+              message: `Installment phase scope must be within allowed package range: Phase ${pkgMinPhase} to Phase ${pkgMaxPhase}.`,
+            });
+          }
+
+          if (classMaxPhase && requestedEnd > classMaxPhase) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+              success: false,
+              message: `Installment phase scope exceeds class phase limit (max phase ${classMaxPhase}).`,
+            });
+          }
+
+          installmentPhaseStart = requestedStart;
+          installmentPhaseEnd = requestedEnd;
+          phaseStartForRemarks = requestedStart;
+          phaseEndForRemarks = requestedEnd;
+
+          const hasConfiguredDownpayment = parseFloat(packageData.downpayment_amount || 0) > 0;
+          installmentIncludeDownpayment = hasConfiguredDownpayment
+            ? installment_scope?.include_downpayment !== false
+            : false;
+        } else if (packageData.package_type === 'Phase') {
+          // Non-installment phase package: keep package range on remarks.
           const pkgPhaseStart = packageData.phase_start || 1;
           const pkgPhaseEnd = packageData.phase_end || pkgPhaseStart;
           phaseStartForRemarks = pkgPhaseStart;
@@ -4014,16 +4620,19 @@ router.post(
       // package_price is the monthly installment amount, not a total.
       if (package_id && packageData && (packageData.package_type === 'Installment' || isPhaseInstallmentPackage)) {
         if (packageData.package_type === 'Installment' && !packageData.downpayment_amount) {
-          await client.query('ROLLBACK');
-          return res.status(400).json({
-            success: false,
-            message: 'Downpayment amount is required for Installment packages',
-          });
+          // Allow installment-without-downpayment flow only when explicitly disabled from installment scope.
+          if (installmentIncludeDownpayment) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+              success: false,
+              message: 'Downpayment amount is required for Installment packages',
+            });
+          }
         }
         
         downpaymentAmount = parseFloat(packageData.downpayment_amount) || 0;
         
-        if (downpaymentAmount > 0) {
+        if (downpaymentAmount > 0 && installmentIncludeDownpayment) {
           const downpaymentDueDate = isPhaseInstallmentPackage
             ? (() => {
                 const enrolledDate = parseYmdToLocalNoon(issueDateStr) || new Date();
@@ -4034,9 +4643,10 @@ router.post(
             : (dueDateStr || issueDateStr);
 
           // Create downpayment invoice
-          const downpaymentInvoiceResult = await client.query(
-            `INSERT INTO invoicestbl (invoice_description, branch_id, amount, status, issue_date, due_date, created_by, package_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          downpaymentInvoice = await insertInvoiceWithArNumber(
+            client,
+            `INSERT INTO invoicestbl (invoice_description, branch_id, amount, status, issue_date, due_date, created_by, package_id, invoice_ar_number)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              RETURNING *`,
             [
               `Downpayment - ${invoiceDescription || packageName || 'Enrollment'}`,
@@ -4049,7 +4659,6 @@ router.post(
               package_id || null,
             ]
           );
-          downpaymentInvoice = downpaymentInvoiceResult.rows[0];
           
           // Link student to downpayment invoice
           await client.query(
@@ -4080,13 +4689,17 @@ router.post(
       if (isPhaseInstallmentPackage) {
         skipMainInvoice = true;
       }
+      if (package_id && packageData && packageData.package_type === 'Installment' && !installmentIncludeDownpayment) {
+        skipMainInvoice = true;
+      }
 
       let newInvoice = null;
       if (!skipMainInvoice) {
         // Create main invoice (for non-Installment packages or Installment without downpayment)
-        const invoiceResult = await client.query(
-          `INSERT INTO invoicestbl (invoice_description, branch_id, amount, status, issue_date, due_date, created_by, package_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        newInvoice = await insertInvoiceWithArNumber(
+          client,
+          `INSERT INTO invoicestbl (invoice_description, branch_id, amount, status, issue_date, due_date, created_by, package_id, invoice_ar_number)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
            RETURNING *`,
           [
             invoiceDescription, // Description based on enrollment type
@@ -4099,7 +4712,6 @@ router.post(
             package_id || null, // Link invoice to package for promo tracking
           ]
         );
-        newInvoice = invoiceResult.rows[0];
       }
 
       // Handle promo if provided (main invoice) OR on downpayment only (Installment packages)
@@ -4643,11 +5255,19 @@ router.post(
       // For regular Installment: use curriculum total, no phase_start (defaults to 1)
       let totalPhases = classData.number_of_phase || null;
       let profilePhaseStart = null;
-      if (package_id && packageData && packageData.package_type === 'Phase' && packageData.payment_option === 'Installment') {
-        const pkgStart = packageData.phase_start || 1;
-        const pkgEnd = packageData.phase_end || pkgStart;
-        profilePhaseStart = pkgStart;
-        totalPhases = Math.max(1, pkgEnd - pkgStart + 1);
+      if (package_id && packageData && (packageData.package_type === 'Installment' || (packageData.package_type === 'Phase' && packageData.payment_option === 'Installment'))) {
+        const scopedStart = installmentPhaseStart != null
+          ? installmentPhaseStart
+          : ((packageData.package_type === 'Phase' && packageData.payment_option === 'Installment')
+            ? (packageData.phase_start || 1)
+            : 1);
+        const scopedEnd = installmentPhaseEnd != null
+          ? installmentPhaseEnd
+          : ((packageData.package_type === 'Phase' && packageData.payment_option === 'Installment')
+            ? (packageData.phase_end || scopedStart)
+            : (classData.number_of_phase || scopedStart));
+        profilePhaseStart = scopedStart;
+        totalPhases = Math.max(1, scopedEnd - scopedStart + 1);
       }
       
       let installmentProfileAmount;
@@ -4672,39 +5292,29 @@ router.post(
           installment_settings.invoice_generation_date &&
           installment_settings.frequency_months) {
         try {
-          // Parse billing month (format: YYYY-MM)
-          if (!installment_settings.billing_month.includes('-')) {
-            throw new Error('Invalid billing month format. Expected YYYY-MM');
-          }
-          
-          const billingMonthParts = installment_settings.billing_month.split('-');
-          if (billingMonthParts.length !== 2) {
-            throw new Error('Invalid billing month format. Expected YYYY-MM');
-          }
-          
-          const firstBillingMonth = new Date(parseInt(billingMonthParts[0]), parseInt(billingMonthParts[1]) - 1, 1);
-          
-          // Validate dates
-          if (isNaN(firstBillingMonth.getTime())) {
-            throw new Error('Invalid billing month date');
-          }
-          
-          // Calculate day of month from invoice_due_date
-          const dueDate = new Date(installment_settings.invoice_due_date);
-          if (isNaN(dueDate.getTime())) {
-            throw new Error('Invalid invoice due date');
-          }
-          const dayOfMonth = dueDate.getDate();
+          const frequencyMonths = parseInt(installment_settings.frequency_months, 10) || 1;
 
-          // Calculate next invoice due date (first billing month + frequency)
-          const nextInvoiceDueDate = new Date(firstBillingMonth);
-          nextInvoiceDueDate.setMonth(nextInvoiceDueDate.getMonth() + (installment_settings.frequency_months || 1));
+          // Fixed cadence:
+          // - Generate on 25th of current cycle month
+          // - Due on 5th of next month
+          const cycleGenerationDate = new Date(installment_settings.invoice_issue_date || new Date());
+          cycleGenerationDate.setDate(25);
 
-          // Validate generation date
-          const generationDate = new Date(installment_settings.invoice_generation_date);
-          if (isNaN(generationDate.getTime())) {
-            throw new Error('Invalid invoice generation date');
-          }
+          const firstBillingMonth = new Date(cycleGenerationDate);
+          firstBillingMonth.setDate(1);
+          firstBillingMonth.setMonth(firstBillingMonth.getMonth() + 1);
+
+          const firstDueDate = new Date(firstBillingMonth);
+          firstDueDate.setDate(5);
+
+          const nextInvoiceDueDate = new Date(firstDueDate);
+          nextInvoiceDueDate.setMonth(nextInvoiceDueDate.getMonth() + frequencyMonths);
+
+          const generationDate = new Date(cycleGenerationDate);
+          const nextGenerationDate = new Date(cycleGenerationDate);
+          nextGenerationDate.setMonth(nextGenerationDate.getMonth() + frequencyMonths);
+          nextGenerationDate.setDate(25);
+          const dayOfMonth = 5;
 
           // Determine if downpayment is required
           const hasDownpayment = downpaymentInvoice !== null && downpaymentAmount > 0;
@@ -4792,10 +5402,10 @@ router.post(
                 ? parseInt(String(firstPhaseSchedule.current_due_date).slice(-2), 10)
                 : dayOfMonth,
               true,
-              isPhaseInstallmentPackage ? firstPhaseSchedule?.current_due_date : installment_settings.invoice_due_date,
-              isPhaseInstallmentPackage ? firstPhaseSchedule?.next_due_date : nextInvoiceDueDate.toISOString().split('T')[0],
-              isPhaseInstallmentPackage ? firstPhaseSchedule?.current_invoice_month : firstBillingMonth.toISOString().split('T')[0],
-              isPhaseInstallmentPackage ? firstPhaseSchedule?.current_generation_date : installment_settings.invoice_generation_date,
+              firstDueDate.toISOString().split('T')[0],
+              nextInvoiceDueDate.toISOString().split('T')[0],
+              firstBillingMonth.toISOString().split('T')[0],
+              generationDate.toISOString().split('T')[0],
               req.user.fullName || req.user.email || null,
               class_id, // Store class_id for phase tracking
               totalPhases, // For Phase package: count in range. Else: curriculum total
@@ -4838,15 +5448,9 @@ router.post(
             // Create the first installment invoice record.
             const studentName = studentCheck.rows[0].full_name;
             const frequency = `${installment_settings.frequency_months} month(s)`;
-            const scheduledDate = isPhaseInstallmentPackage
-              ? firstPhaseSchedule.current_due_date
-              : (installment_settings.invoice_due_date || installment_settings.invoice_generation_date);
-            const nextInvoiceMonth = isPhaseInstallmentPackage
-              ? firstPhaseSchedule.current_invoice_month
-              : nextInvoiceDueDate.toISOString().split('T')[0];
-            const nextGenerationDate = isPhaseInstallmentPackage
-              ? firstPhaseSchedule.current_generation_date
-              : generationDate.toISOString().split('T')[0];
+            const scheduledDate = firstDueDate.toISOString().split('T')[0];
+            const nextInvoiceMonth = firstBillingMonth.toISOString().split('T')[0];
+            const nextGenerationDateYmd = generationDate.toISOString().split('T')[0];
             
             const firstInstallmentRecordResult = await client.query(
               `INSERT INTO installmentinvoicestbl 
@@ -4863,28 +5467,26 @@ router.post(
                 installmentProfileAmount, // Use calculated amount for installment invoice display
                 installmentProfileAmount, // Assuming no tax for now, or can be calculated separately
                 frequency,
-                nextGenerationDate,
+                nextGenerationDateYmd,
                 nextInvoiceMonth,
               ]
             );
 
-            if (isPhaseInstallmentPackage) {
-              pendingInstallmentGeneration = {
-                installmentRecord: firstInstallmentRecordResult.rows[0],
-                profile: {
-                  student_id,
-                  branch_id,
-                  package_id: package_id || null,
-                  amount: installmentProfileAmount,
-                  frequency,
-                  description: `Installment plan for ${studentCheck.rows[0].full_name} - ${classData.program_name}`,
-                  generated_count: 0,
-                  class_id,
-                  total_phases: totalPhases,
-                  phase_start: profilePhaseStart,
-                },
-              };
-            }
+            pendingInstallmentGeneration = {
+              installmentRecord: firstInstallmentRecordResult.rows[0],
+              profile: {
+                student_id,
+                branch_id,
+                package_id: package_id || null,
+                amount: installmentProfileAmount,
+                frequency,
+                description: `Installment plan for ${studentCheck.rows[0].full_name} - ${classData.program_name}`,
+                generated_count: 0,
+                class_id,
+                total_phases: totalPhases,
+                phase_start: profilePhaseStart,
+              },
+            };
           }
           // If hasDownpayment is true, the first installment invoice record will be created
           // automatically when the downpayment is paid (handled in payments.js)
@@ -4942,7 +5544,11 @@ router.post(
       if (skipMainInvoice && downpaymentInvoice) {
         message = 'Downpayment invoice generated. Monthly installment invoices will start after downpayment is paid.';
       } else if (generatedPhaseInvoice?.invoice_id) {
-        message = `Phase ${generatedPhaseInvoice.current_phase_number || profilePhaseStart || 1} invoice generated. Student will be enrolled in that phase after payment is made.`;
+        if (isPhaseInstallmentPackage) {
+          message = `Phase ${generatedPhaseInvoice.current_phase_number || profilePhaseStart || 1} invoice generated. Student will be enrolled in that phase after payment is made.`;
+        } else {
+          message = 'First installment invoice generated. Student will be enrolled after payment is made.';
+        }
       } else if (isFullpaymentEnrollment) {
         message = 'Invoice generated. Student will be enrolled in all phases after payment is made.';
       } else if (installmentProfile) {
@@ -5421,6 +6027,34 @@ router.post(
           return res.status(400).json({
             success: false,
             message: `Room with ID ${scheduleRoomId} belongs to a different branch`,
+          });
+        }
+      }
+
+      // Existing enrollment handling:
+      // - Default behavior stays the same (reject duplicate enrollment in same class).
+      // - Allow "continue per phase" only when the requested start phase is strictly after
+      //   the student's highest active phase in this class.
+      if (hasActiveEnrollmentInClass) {
+        const requestedContinuationStart = (() => {
+          if (Number.isInteger(installmentPhaseStart) && installmentPhaseStart > 0) return installmentPhaseStart;
+          if (Number.isInteger(phaseStartForRemarks) && phaseStartForRemarks > 0) return phaseStartForRemarks;
+          if (phase_number !== undefined && phase_number !== null) {
+            const parsed = parseInt(phase_number, 10);
+            if (Number.isInteger(parsed) && parsed > 0) return parsed;
+          }
+          return null;
+        })();
+
+        const canContinuePerPhase =
+          Number.isInteger(requestedContinuationStart) &&
+          requestedContinuationStart > highestActivePhaseInClass;
+
+        if (!canContinuePerPhase) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({
+            success: false,
+            message: 'Student is already enrolled in this class',
           });
         }
       }

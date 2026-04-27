@@ -3,7 +3,8 @@ import { createPortal } from 'react-dom';
 import { useNavigate, Link } from 'react-router-dom';
 import Header from '../../components/Header';
 import Sidebar from '../../components/Sidebar';
-import { fetchFuntalk } from '../../lib/api';
+import ResponsiveSelect from '../../components/ResponsiveSelect.jsx';
+import { API_BASE_URL } from '@/config/api.js';
 
 const SchoolPackages = () => {
   const navigate = useNavigate();
@@ -52,7 +53,12 @@ const SchoolPackages = () => {
   const fetchPackages = async () => {
     setIsFetching(true);
     try {
-      const response = await fetchFuntalk('/billing/packages?isActive=true', {});
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/billing/packages?isActive=true`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.packages) {
@@ -71,7 +77,12 @@ const SchoolPackages = () => {
 
   const fetchCreditBalance = async () => {
     try {
-      const response = await fetchFuntalk('/credits/balance', {});
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/credits/balance`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.current_balance !== undefined) {
@@ -92,10 +103,12 @@ const SchoolPackages = () => {
 
     setIsPurchasing(true);
     try {
-      const response = await fetchFuntalk('/billing/create', {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/billing/create`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
         },
         body: JSON.stringify({
           packageId: selectedPackage.package_id,
@@ -123,13 +136,13 @@ const SchoolPackages = () => {
   };
 
   const formatPrice = (price) => {
-    if (!price) return '$0.00';
-    return `$${parseFloat(price).toFixed(2)}`;
+    if (!price) return 'NT$0.00';
+    return `${'NT$'}${parseFloat(price).toFixed(2)}`;
   };
 
   const calculatePricePerCredit = (price, credits) => {
-    if (!credits || credits === 0) return '$0.00';
-    return `$${(parseFloat(price) / credits).toFixed(2)}`;
+    if (!credits || credits === 0) return 'NT$0.00';
+    return `${'NT$'}${(parseFloat(price) / credits).toFixed(2)}`;
   };
 
   if (isLoading) {
@@ -232,7 +245,7 @@ const SchoolPackages = () => {
       {/* Purchase Modal */}
       {isPurchaseModalOpen && selectedPackage && createPortal(
         <div 
-          className="fixed bg-black bg-opacity-50 flex items-center justify-center p-4" 
+          className="fixed bg-black/40 backdrop-blur-sm flex items-center justify-center p-4" 
           style={{ 
             position: 'fixed', 
             top: 0, 
@@ -291,14 +304,16 @@ const SchoolPackages = () => {
                   <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-2">
                     Billing Type
                   </label>
-                  <select
+                  <ResponsiveSelect
+                    id="school-packages-billing-type"
+                    aria-label="Billing type"
                     value={billingType}
                     onChange={(e) => setBillingType(e.target.value)}
-                    className="w-full px-3 sm:px-4 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                    className="w-full px-3 sm:px-4 py-2 text-sm border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-primary-500 focus:border-primary-500 focus:outline-none"
                   >
                     <option value="invoice">Invoice (Admin Approval)</option>
                     <option value="bank_transfer">Bank Transfer (Admin Approval)</option>
-                  </select>
+                  </ResponsiveSelect>
                   <p className="mt-1 text-xs text-gray-500">
                     An invoice will be generated for admin approval. Credits will be added once payment is approved.
                   </p>

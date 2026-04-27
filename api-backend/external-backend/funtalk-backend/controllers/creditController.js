@@ -22,10 +22,40 @@ export const getBalance = async (req, res) => {
           u.name as user_name,
           u.email,
           u.user_type,
+          u.billing_type,
+          COALESCE(p.credits_per_cycle, c.current_balance, 0) AS total_credits,
+          p.credit_rate,
           c.current_balance,
+          COALESCE(paid_inv.total_paid_amount, 0)::numeric(12,2) AS paid_invoice_amount,
+          (
+            CASE
+              WHEN LOWER(COALESCE(u.billing_type, '')) = 'explore' THEN
+                COALESCE(explore_inv.total_invoice_amount, 0)::numeric
+              WHEN p.credit_rate IS NOT NULL THEN
+                (COALESCE(p.credits_per_cycle, c.current_balance, 0)::numeric * p.credit_rate::numeric)
+              ELSE
+                c.current_balance::numeric
+            END
+            - COALESCE(paid_inv.total_paid_amount, 0)
+          )::numeric(12,2) AS display_balance,
           c.last_updated
         FROM creditstbl c
         LEFT JOIN userstbl u ON c.user_id = u.user_id
+        LEFT JOIN subscriptionscheduletbl s ON s.user_id = c.user_id
+        LEFT JOIN subscriptionplantbl p ON p.plan_id = s.plan_id
+        LEFT JOIN LATERAL (
+          SELECT COALESCE(SUM(i.amount), 0) AS total_invoice_amount
+          FROM invoicetbl i
+          LEFT JOIN billingtbl b ON b.billing_id = i.billing_id
+          WHERE i.user_id = c.user_id
+            AND LOWER(COALESCE(b.billing_type, '')) = 'explore'
+        ) explore_inv ON true
+        LEFT JOIN LATERAL (
+          SELECT COALESCE(SUM(i.amount), 0) AS total_paid_amount
+          FROM invoicetbl i
+          WHERE i.user_id = c.user_id
+            AND LOWER(COALESCE(i.status, '')) = 'paid'
+        ) paid_inv ON true
         WHERE c.user_id = $1
       `;
       params = [userId];
@@ -38,10 +68,40 @@ export const getBalance = async (req, res) => {
           u.name as user_name,
           u.email,
           u.user_type,
+          u.billing_type,
+          COALESCE(p.credits_per_cycle, c.current_balance, 0) AS total_credits,
+          p.credit_rate,
           c.current_balance,
+          COALESCE(paid_inv.total_paid_amount, 0)::numeric(12,2) AS paid_invoice_amount,
+          (
+            CASE
+              WHEN LOWER(COALESCE(u.billing_type, '')) = 'explore' THEN
+                COALESCE(explore_inv.total_invoice_amount, 0)::numeric
+              WHEN p.credit_rate IS NOT NULL THEN
+                (COALESCE(p.credits_per_cycle, c.current_balance, 0)::numeric * p.credit_rate::numeric)
+              ELSE
+                c.current_balance::numeric
+            END
+            - COALESCE(paid_inv.total_paid_amount, 0)
+          )::numeric(12,2) AS display_balance,
           c.last_updated
         FROM creditstbl c
         LEFT JOIN userstbl u ON c.user_id = u.user_id
+        LEFT JOIN subscriptionscheduletbl s ON s.user_id = c.user_id
+        LEFT JOIN subscriptionplantbl p ON p.plan_id = s.plan_id
+        LEFT JOIN LATERAL (
+          SELECT COALESCE(SUM(i.amount), 0) AS total_invoice_amount
+          FROM invoicetbl i
+          LEFT JOIN billingtbl b ON b.billing_id = i.billing_id
+          WHERE i.user_id = c.user_id
+            AND LOWER(COALESCE(b.billing_type, '')) = 'explore'
+        ) explore_inv ON true
+        LEFT JOIN LATERAL (
+          SELECT COALESCE(SUM(i.amount), 0) AS total_paid_amount
+          FROM invoicetbl i
+          WHERE i.user_id = c.user_id
+            AND LOWER(COALESCE(i.status, '')) = 'paid'
+        ) paid_inv ON true
         ORDER BY c.current_balance DESC, c.last_updated DESC
       `;
     }
@@ -53,6 +113,8 @@ export const getBalance = async (req, res) => {
       data: {
         balances: result.rows,
         count: result.rows.length,
+        current_balance: userRole === 'school' ? (result.rows[0]?.current_balance || 0) : undefined,
+        last_updated: userRole === 'school' ? (result.rows[0]?.last_updated || null) : undefined,
       },
     });
   } catch (error) {
@@ -66,77 +128,100 @@ export const getBalance = async (req, res) => {
 };
 
 /**
- * @desc    Get credit transaction history (School: own transactions, Admin: all transactions)
+ * @desc    Get settled transactions (Explore fully paid + fully settled installment plans)
  * @route   GET /api/credits/transactions
  * @access  Private (School/Admin)
  */
 export const getTransactions = async (req, res) => {
   try {
-    const { startDate, endDate, transactionType, userId: queryUserId } = req.query;
     const userRole = req.user.userType;
     const userId = req.user.userId;
-    
-    let sqlQuery = `
-      SELECT 
-        ct.transaction_id,
-        ct.user_id,
-        u.name as user_name,
-        u.email,
-        ct.appointment_id,
-        a.student_name as appointment_student,
-        ct.transaction_type,
-        ct.amount,
-        ct.balance_before,
-        ct.balance_after,
-        ct.description,
-        ct.created_by,
-        creator.name as created_by_name,
-        ct.created_at
-      FROM credittransactionstbl ct
-      LEFT JOIN userstbl u ON ct.user_id = u.user_id
-      LEFT JOIN appointmenttbl a ON ct.appointment_id = a.appointment_id
-      LEFT JOIN userstbl creator ON ct.created_by = creator.user_id
-      WHERE 1=1
-    `;
-    
+    const { userId: queryUserId } = req.query;
+
     const params = [];
-    let paramIndex = 1;
-    
-    // Apply filters
+    const filters = [];
+    let idx = 1;
+
     if (userRole === 'school') {
-      // School users see only their own transactions
-      sqlQuery += ` AND ct.user_id = $${paramIndex}`;
+      filters.push(`u.user_id = $${idx}`);
       params.push(userId);
-      paramIndex++;
+      idx++;
     } else if (queryUserId) {
-      // Admin can filter by userId
-      sqlQuery += ` AND ct.user_id = $${paramIndex}`;
-      params.push(queryUserId);
-      paramIndex++;
+      filters.push(`u.user_id = $${idx}`);
+      params.push(Number(queryUserId));
+      idx++;
     }
-    
-    if (transactionType) {
-      sqlQuery += ` AND ct.transaction_type = $${paramIndex}`;
-      params.push(transactionType);
-      paramIndex++;
-    }
-    
-    if (startDate) {
-      sqlQuery += ` AND ct.created_at >= $${paramIndex}`;
-      params.push(startDate);
-      paramIndex++;
-    }
-    
-    if (endDate) {
-      sqlQuery += ` AND ct.created_at <= $${paramIndex}`;
-      params.push(endDate);
-      paramIndex++;
-    }
-    
-    sqlQuery += ` ORDER BY ct.created_at DESC`;
-    
+
+    const whereClause = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';
+
+    const sqlQuery = `
+      WITH base_users AS (
+        SELECT u.user_id, u.name AS user_name, u.email, u.billing_type
+        FROM userstbl u
+        ${whereClause}
+      ),
+      explore_paid AS (
+        SELECT
+          i.invoice_id,
+          i.user_id,
+          i.invoice_number,
+          i.amount,
+          i.created_at
+        FROM invoicetbl i
+        LEFT JOIN billingtbl b ON b.billing_id = i.billing_id
+        WHERE LOWER(COALESCE(i.status, '')) = 'paid'
+          AND LOWER(COALESCE(b.billing_type, '')) = 'explore'
+      ),
+      installment_agg AS (
+        SELECT
+          s.subscription_id,
+          s.user_id,
+          COALESCE(s.billing_duration_months, 12) AS expected_installments,
+          COUNT(i.invoice_id)::int AS generated_installments,
+          COUNT(i.invoice_id) FILTER (WHERE LOWER(COALESCE(i.status, '')) = 'paid')::int AS paid_installments,
+          COALESCE(SUM(i.amount) FILTER (WHERE LOWER(COALESCE(i.status, '')) = 'paid'), 0)::numeric(12,2) AS settled_amount,
+          MAX(i.created_at) FILTER (WHERE LOWER(COALESCE(i.status, '')) = 'paid') AS settled_at
+        FROM subscriptionscheduletbl s
+        LEFT JOIN invoicetbl i ON i.subscription_id = s.subscription_id
+        GROUP BY s.subscription_id, s.user_id, s.billing_duration_months
+      )
+      SELECT
+        CONCAT('EXP-', ep.invoice_id) AS transaction_id,
+        bu.user_id,
+        bu.user_name,
+        bu.email,
+        'full_payment_paid' AS settlement_type,
+        ep.amount::numeric(12,2) AS amount,
+        1 AS paid_installments,
+        1 AS expected_installments,
+        ep.created_at AS settled_at,
+        CONCAT('Full payment settled via invoice ', COALESCE(ep.invoice_number, CONCAT('INV-', ep.invoice_id))) AS description
+      FROM base_users bu
+      INNER JOIN explore_paid ep ON ep.user_id = bu.user_id
+
+      UNION ALL
+
+      SELECT
+        CONCAT('INS-', ia.subscription_id) AS transaction_id,
+        bu.user_id,
+        bu.user_name,
+        bu.email,
+        'installment_fully_paid' AS settlement_type,
+        ia.settled_amount AS amount,
+        ia.paid_installments,
+        ia.expected_installments,
+        ia.settled_at,
+        CONCAT('Installment plan fully settled (', ia.paid_installments, '/', ia.expected_installments, ' invoices paid)') AS description
+      FROM base_users bu
+      INNER JOIN installment_agg ia ON ia.user_id = bu.user_id
+      WHERE ia.generated_installments >= ia.expected_installments
+        AND ia.paid_installments >= ia.expected_installments
+
+      ORDER BY settled_at DESC NULLS LAST
+    `;
+
     const result = await query(sqlQuery, params);
-    
+
     res.status(200).json({
       success: true,
       data: {
@@ -145,10 +230,10 @@ export const getTransactions = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Error fetching credit transactions:', error);
+    console.error('Error fetching settled transactions:', error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching credit transactions',
+      message: 'Error fetching settled transactions',
       error: error.message,
     });
   }

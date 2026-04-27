@@ -6,6 +6,7 @@
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { pathToFileURL } from 'url';
+import { existsSync } from 'fs';
 import { getPool, ensureSystemsConfigTable } from './config/db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -44,13 +45,21 @@ function setCmsEnv(row) {
   process.env.DB_SSL = row.database_ssl ? 'true' : 'false';
   process.env.CMS_EMBEDDED = '1';
   // Firebase Admin for psms-b9ca7 — cms-backend's firebase.js reads these when initializing the 'cms' named app
-  process.env.FIREBASE_PROJECT_ID = 'psms-b9ca7';
-  // Absolute path to the CMS Admin SDK JSON so firebase.js finds it regardless of cwd
+  process.env.FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'psms-b9ca7';
+  // Absolute path to the CMS Admin SDK JSON (if present) so firebase.js finds it regardless of cwd
   const cmsAdminJsonPath = path.join(
     __dirname, '..', 'external-backend', 'cms-backend', 'config',
     'psms-b9ca7-firebase-adminsdk-fbsvc-0923308123.json'
   );
-  process.env.FIREBASE_ADMIN_SDK_PATH = cmsAdminJsonPath;
+  if (existsSync(cmsAdminJsonPath)) {
+    process.env.FIREBASE_ADMIN_SDK_PATH = cmsAdminJsonPath;
+  } else {
+    // Don't force a missing path: cms-backend will fall back to env-based credentials if available.
+    delete process.env.FIREBASE_ADMIN_SDK_PATH;
+    if (process.env.QUIET_STARTUP !== '1') {
+      console.warn('CMS: FIREBASE_ADMIN_SDK_PATH not set (Admin SDK JSON not found). Set FIREBASE_ADMIN_SDK_PATH or Firebase env vars for psms-b9ca7.');
+    }
+  }
 }
 
 /**
@@ -67,14 +76,17 @@ export async function mountCms(app) {
   );
   const row = result.rows[0];
   if (!row || !row.database_name) {
-    app.use(`${API_PREFIX}/cms`, (req, res) => {
+    const handler = (req, res) => {
       res.status(503).json({
         error: 'CMS not configured',
         hint: 'Run: node scripts/migrate-cms-to-api.js',
       });
-    });
+    };
+    // Backward + current paths (cms-frontend currently targets /api/sms)
+    app.use(`${API_PREFIX}/cms`, handler);
+    app.use(`${API_PREFIX}/sms`, handler);
     if (process.env.QUIET_STARTUP !== '1') {
-      console.log('CMS: not configured (mount placeholder at /api/cms). Run migration to enable.');
+      console.log('CMS: not configured (mount placeholder at /api/cms and /api/sms). Run migration to enable.');
     }
     return false;
   }
@@ -85,9 +97,11 @@ export async function mountCms(app) {
     const cmsRoutesPath = path.join(__dirname, '..', 'external-backend', 'cms-backend', 'routes', 'index.js');
     const url = pathToFileURL(cmsRoutesPath).href;
     const { default: cmsRouter } = await import(url);
+    // Backward + current paths (cms-frontend currently targets /api/sms)
     app.use(`${API_PREFIX}/cms`, cmsRouter);
+    app.use(`${API_PREFIX}/sms`, cmsRouter);
     if (process.env.QUIET_STARTUP !== '1') {
-      console.log('CMS: mounted at /api/cms (same process, DB from systems_config)');
+      console.log('CMS: mounted at /api/cms and /api/sms (same process, DB from systems_config)');
     }
     return true;
   } finally {

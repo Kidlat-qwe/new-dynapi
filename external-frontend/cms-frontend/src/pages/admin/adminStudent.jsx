@@ -5,6 +5,7 @@ import { useAuth } from '../../contexts/AuthContext';
 import { formatDateManila } from '../../utils/dateUtils';
 import { DEFAULT_PASSWORD_STUDENT } from '../../utils/defaultPasswords';
 import FixedTablePagination from '../../components/table/FixedTablePagination';
+import { appAlert, appConfirm } from '../../utils/appAlert';
 
 const AdminStudent = () => {
   const { signup, userInfo } = useAuth();
@@ -12,8 +13,10 @@ const AdminStudent = () => {
   const [selectedBranchName, setSelectedBranchName] = useState(userInfo?.branch_name || 'Your Branch');
   const [students, setStudents] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
   const [error, setError] = useState('');
   const [nameSearchTerm, setNameSearchTerm] = useState('');
+  const [debouncedNameSearchTerm, setDebouncedNameSearchTerm] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
   const [itemsPerPage] = useState(10);
   const [totalItems, setTotalItems] = useState(0);
@@ -36,6 +39,7 @@ const AdminStudent = () => {
     guardian_email: '',
     guardian_relationship: '',
     guardian_phone_number: '',
+    guardian_tin_number: '',
     guardian_gender: '',
     guardian_address: '',
     guardian_city: '',
@@ -49,7 +53,16 @@ const AdminStudent = () => {
 
   useEffect(() => {
     fetchStudents();
-  }, [currentPage, itemsPerPage]);
+  }, [currentPage, itemsPerPage, debouncedNameSearchTerm]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      const trimmed = nameSearchTerm.trim();
+      setDebouncedNameSearchTerm(trimmed);
+      setCurrentPage(1);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [nameSearchTerm]);
 
   // Auto-set branch_id when adminBranchId is available
   useEffect(() => {
@@ -124,13 +137,16 @@ const AdminStudent = () => {
 
   const fetchStudents = async () => {
     try {
-      setLoading(true);
+      if (!hasLoadedOnce) {
+        setLoading(true);
+      }
       const params = new URLSearchParams({
         user_type: 'Student',
         limit: String(itemsPerPage),
         page: String(currentPage),
       });
       if (adminBranchId) params.set('branch_id', String(adminBranchId));
+      if (debouncedNameSearchTerm) params.set('search', debouncedNameSearchTerm);
       const response = await apiRequest(`/users?${params.toString()}`);
       const list = (response.data || []).filter((s) => s.user_type === 'Student');
       setStudents(list);
@@ -140,7 +156,10 @@ const AdminStudent = () => {
       setError(err.message || 'Failed to fetch students');
       console.error('Error fetching students:', err);
     } finally {
-      setLoading(false);
+      if (!hasLoadedOnce) {
+        setLoading(false);
+        setHasLoadedOnce(true);
+      }
     }
   };
 
@@ -150,11 +169,18 @@ const AdminStudent = () => {
     // Verify student belongs to admin's branch
     const student = students.find(s => s.user_id === userId);
     if (student && student.branch_id !== adminBranchId) {
-      alert('You can only delete students from your branch.');
+      appAlert('You can only delete students from your branch.');
       return;
     }
     
-    if (!window.confirm('Are you sure you want to delete this student?')) {
+    if (
+      !(await appConfirm({
+        title: 'Delete student',
+        message: 'Are you sure you want to delete this student?',
+        destructive: true,
+        confirmLabel: 'Delete',
+      }))
+    ) {
       return;
     }
 
@@ -164,7 +190,7 @@ const AdminStudent = () => {
       });
       fetchStudents();
     } catch (err) {
-      alert(err.message || 'Failed to delete student');
+      appAlert(err.message || 'Failed to delete student');
     }
   };
 
@@ -185,6 +211,7 @@ const AdminStudent = () => {
       guardian_email: '',
       guardian_relationship: '',
       guardian_phone_number: '',
+      guardian_tin_number: '',
       guardian_gender: '',
       guardian_address: '',
       guardian_city: '',
@@ -201,7 +228,7 @@ const AdminStudent = () => {
     
     // Verify student belongs to admin's branch
     if (student.branch_id !== adminBranchId) {
-      alert('You can only edit students from your branch.');
+      appAlert('You can only edit students from your branch.');
       return;
     }
     
@@ -222,6 +249,7 @@ const AdminStudent = () => {
       guardian_email: '',
       guardian_relationship: '',
       guardian_phone_number: '',
+      guardian_tin_number: '',
       guardian_gender: '',
       guardian_address: '',
       guardian_city: '',
@@ -244,6 +272,7 @@ const AdminStudent = () => {
           guardian_email: guardian.email || '',
           guardian_relationship: guardian.relationship || '',
           guardian_phone_number: guardian.guardian_phone_number || '',
+          guardian_tin_number: guardian.tin_number || '',
           guardian_gender: guardian.gender || '',
           guardian_address: guardian.address || '',
           guardian_city: guardian.city || '',
@@ -338,6 +367,7 @@ const AdminStudent = () => {
               email: formData.guardian_email.trim(),
               relationship: formData.guardian_relationship.trim(),
               guardian_phone_number: formData.guardian_phone_number.trim(),
+              tin_number: formData.guardian_tin_number.trim() || null,
               gender: formData.guardian_gender,
               address: formData.guardian_address.trim(),
               city: formData.guardian_city.trim(),
@@ -355,6 +385,7 @@ const AdminStudent = () => {
               email: formData.guardian_email.trim(),
               relationship: formData.guardian_relationship.trim(),
               guardian_phone_number: formData.guardian_phone_number.trim(),
+              tin_number: formData.guardian_tin_number.trim() || null,
               gender: formData.guardian_gender,
               address: formData.guardian_address.trim(),
               city: formData.guardian_city.trim(),
@@ -388,6 +419,7 @@ const AdminStudent = () => {
               email: formData.guardian_email.trim(),
               relationship: formData.guardian_relationship.trim(),
               guardian_phone_number: formData.guardian_phone_number.trim(),
+              tin_number: formData.guardian_tin_number.trim() || null,
               gender: formData.guardian_gender,
               address: formData.guardian_address.trim(),
               city: formData.guardian_city.trim(),
@@ -422,11 +454,7 @@ const AdminStudent = () => {
     }
   };
 
-  const filteredStudents = students.filter((student) => {
-    const matchesName = !nameSearchTerm || 
-      student.full_name?.toLowerCase().includes(nameSearchTerm.toLowerCase());
-    return matchesName;
-  });
+  const filteredStudents = students;
 
   if (loading) {
     return (
@@ -1005,6 +1033,21 @@ const AdminStudent = () => {
                         {formErrors.guardian_phone_number && (
                           <p className="mt-1 text-sm text-red-600">{formErrors.guardian_phone_number}</p>
                         )}
+                      </div>
+
+                      <div>
+                        <label htmlFor="guardian_tin_number" className="label-field">
+                          Guardian TIN Number
+                        </label>
+                        <input
+                          type="text"
+                          id="guardian_tin_number"
+                          name="guardian_tin_number"
+                          value={formData.guardian_tin_number}
+                          onChange={handleInputChange}
+                          className="input-field"
+                          placeholder="Optional"
+                        />
                       </div>
 
                       <div>

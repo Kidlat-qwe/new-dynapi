@@ -3,15 +3,31 @@ import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import Header from '../../components/Header';
 import Sidebar from '../../components/Sidebar';
-import { fetchFuntalk } from '../../lib/api';
+import { API_BASE_URL } from '@/config/api.js';
+
+const toYyyyMmDd = (date) => {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+};
+
+const toMonthKey = (date) => {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  return `${y}-${m}`;
+};
 
 const TeacherAvailability = () => {
   const navigate = useNavigate();
   const [user, setUser] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [teacherEmploymentType, setTeacherEmploymentType] = useState('part_time');
   const [availability, setAvailability] = useState([]);
   const [exceptions, setExceptions] = useState([]);
+  const [appointments, setAppointments] = useState([]);
+  const [calendarMonth, setCalendarMonth] = useState(() => toMonthKey(new Date()));
   const [isFetching, setIsFetching] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isExceptionModalOpen, setIsExceptionModalOpen] = useState(false);
@@ -30,6 +46,8 @@ const TeacherAvailability = () => {
     isBlocked: true,
   });
   const [formErrors, setFormErrors] = useState({});
+  const [selectedMeeting, setSelectedMeeting] = useState(null);
+  const [isMeetingDetailModalOpen, setIsMeetingDetailModalOpen] = useState(false);
 
   useEffect(() => {
     const token = localStorage.getItem('token');
@@ -58,15 +76,43 @@ const TeacherAvailability = () => {
   // Fetch availability
   useEffect(() => {
     if (user) {
+      fetchTeacherProfile();
       fetchAvailability();
       fetchExceptions();
+      fetchAppointments();
     }
   }, [user]);
+
+  const fetchTeacherProfile = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/teachers/me/profile`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      const data = await response.json();
+      if (data.success && data.data?.profile) {
+        setTeacherEmploymentType(
+          String(data.data.profile.employment_type || 'part_time').toLowerCase() === 'full_time'
+            ? 'full_time'
+            : 'part_time'
+        );
+      }
+    } catch (error) {
+      console.error('Error fetching teacher profile:', error);
+    }
+  };
 
   const fetchAvailability = async () => {
     setIsFetching(true);
     try {
-      const response = await fetchFuntalk(`/availability/teacher/${user.userId}`, {});
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/availability/teacher/${user.userId}`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.availability) {
@@ -85,7 +131,12 @@ const TeacherAvailability = () => {
 
   const fetchExceptions = async () => {
     try {
-      const response = await fetchFuntalk(`/availability/teacher/${user.userId}/exceptions`, {});
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/availability/teacher/${user.userId}/exceptions`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.exceptions) {
@@ -96,6 +147,26 @@ const TeacherAvailability = () => {
     } catch (error) {
       console.error('Error fetching exceptions:', error);
       setExceptions([]);
+    }
+  };
+
+  const fetchAppointments = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/appointments`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      const data = await response.json();
+      if (data.success && data.data?.appointments) {
+        setAppointments(data.data.appointments);
+      } else {
+        setAppointments([]);
+      }
+    } catch (error) {
+      console.error('Error fetching appointments:', error);
+      setAppointments([]);
     }
   };
 
@@ -181,10 +252,13 @@ const TeacherAvailability = () => {
     }
 
     try {
-      const path = editingItem
-        ? `/availability/${editingItem.availability_id}`
-        : '/availability';
+      const token = localStorage.getItem('token');
+      const url = editingItem
+        ? `${API_BASE_URL}/availability/${editingItem.availability_id}`
+        : `${API_BASE_URL}/availability`;
+      
       const method = editingItem ? 'PUT' : 'POST';
+      
       const requestBody = editingItem
         ? {
             startTime: formData.startTime,
@@ -198,9 +272,12 @@ const TeacherAvailability = () => {
             isActive: formData.isActive,
           };
 
-      const response = await fetchFuntalk(path, {
+      const response = await fetch(url, {
         method,
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
         body: JSON.stringify(requestBody),
       });
 
@@ -219,13 +296,18 @@ const TeacherAvailability = () => {
   };
 
   const handleDelete = async (id) => {
-    if (!window.confirm('Are you sure you want to delete this availability slot?')) {
+    const ok = await window.appConfirm?.('Are you sure you want to delete this availability slot?');
+    if (!ok) {
       return;
     }
 
     try {
-      const response = await fetchFuntalk(`/availability/${id}`, {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/availability/${id}`, {
         method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
       });
 
       const data = await response.json();
@@ -249,9 +331,13 @@ const TeacherAvailability = () => {
     }
 
     try {
-      const response = await fetchFuntalk('/availability/exceptions', {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/availability/exceptions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
         body: JSON.stringify(exceptionFormData),
       });
 
@@ -270,13 +356,18 @@ const TeacherAvailability = () => {
   };
 
   const handleDeleteException = async (id) => {
-    if (!window.confirm('Are you sure you want to remove this exception?')) {
+    const ok = await window.appConfirm?.('Are you sure you want to remove this exception?');
+    if (!ok) {
       return;
     }
 
     try {
-      const response = await fetchFuntalk(`/availability/exceptions/${id}`, {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/availability/exceptions/${id}`, {
         method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
       });
 
       const data = await response.json();
@@ -307,6 +398,80 @@ const TeacherAvailability = () => {
       month: 'short', 
       day: 'numeric' 
     });
+  };
+
+  const formatTime = (timeString) => {
+    if (!timeString) return 'Time TBA';
+    const [hourPart, minutePart] = String(timeString).split(':');
+    const hours = Number(hourPart);
+    const minutes = Number(minutePart || 0);
+    if (Number.isNaN(hours) || Number.isNaN(minutes)) return String(timeString).slice(0, 5);
+    const period = hours >= 12 ? 'PM' : 'AM';
+    const h12 = hours % 12 || 12;
+    return `${h12}:${String(minutes).padStart(2, '0')} ${period}`;
+  };
+
+  const formatStatus = (status) => {
+    const map = {
+      pending: 'Pending',
+      approved: 'Approved',
+      completed: 'Completed',
+      cancelled: 'Cancelled',
+      no_show: 'No Show',
+    };
+    const key = String(status || '').toLowerCase();
+    return map[key] || 'Unknown';
+  };
+
+  const getStatusBadgeClass = (status) => {
+    const key = String(status || '').toLowerCase();
+    if (key === 'approved') return 'bg-blue-100 text-blue-800';
+    if (key === 'pending') return 'bg-yellow-100 text-yellow-800';
+    if (key === 'completed') return 'bg-green-100 text-green-800';
+    if (key === 'cancelled') return 'bg-red-100 text-red-800';
+    if (key === 'no_show') return 'bg-gray-100 text-gray-700';
+    return 'bg-gray-100 text-gray-700';
+  };
+
+  const openMeetingDetail = (meeting) => {
+    setSelectedMeeting(meeting);
+    setIsMeetingDetailModalOpen(true);
+  };
+
+  const monthDate = new Date(`${calendarMonth}-01T00:00:00`);
+  const monthLabel = monthDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  const firstDayOfMonth = new Date(monthDate.getFullYear(), monthDate.getMonth(), 1);
+  const lastDayOfMonth = new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 0);
+  const leadingEmptyDays = firstDayOfMonth.getDay();
+  const totalDays = lastDayOfMonth.getDate();
+  const meetingDaySet = new Set(
+    appointments
+      .filter((apt) => !['cancelled', 'no_show'].includes(String(apt.status || '').toLowerCase()))
+      .map((apt) => String(apt.appointment_date || '').slice(0, 10))
+      .filter(Boolean)
+  );
+  const exceptionDaySet = new Set(exceptions.map((ex) => String(ex.exception_date || '').slice(0, 10)).filter(Boolean));
+  const meetingsByDate = appointments
+    .filter((apt) => !['cancelled', 'no_show'].includes(String(apt.status || '').toLowerCase()))
+    .reduce((acc, apt) => {
+      const dateKey = String(apt.appointment_date || '').slice(0, 10);
+      if (!dateKey) return acc;
+      if (!acc[dateKey]) acc[dateKey] = [];
+      acc[dateKey].push(apt);
+      return acc;
+    }, {});
+
+  Object.keys(meetingsByDate).forEach((dateKey) => {
+    meetingsByDate[dateKey].sort((a, b) =>
+      String(a.appointment_time || '').localeCompare(String(b.appointment_time || ''))
+    );
+  });
+  const todayKey = toYyyyMmDd(new Date());
+
+  const getDayStatus = (isoDate) => {
+    if (exceptionDaySet.has(isoDate)) return 'exception';
+    if (meetingDaySet.has(isoDate)) return 'meeting';
+    return 'free';
   };
 
   if (isLoading) {
@@ -347,12 +512,139 @@ const TeacherAvailability = () => {
                   >
                     Add Exception
                   </button>
-                  <button
-                    onClick={() => setIsModalOpen(true)}
-                    className="w-full sm:w-auto px-3 sm:px-4 py-2 text-xs sm:text-sm font-medium text-white bg-primary-600 rounded-lg hover:bg-primary-700 transition-colors"
-                  >
-                    Add Availability
-                  </button>
+                  {teacherEmploymentType !== 'full_time' && (
+                    <button
+                      onClick={() => setIsModalOpen(true)}
+                      className="w-full sm:w-auto px-3 sm:px-4 py-2 text-xs sm:text-sm font-medium text-white bg-primary-600 rounded-lg hover:bg-primary-700 transition-colors"
+                    >
+                      Add Availability
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {teacherEmploymentType === 'full_time' && (
+                <div className="rounded-lg border border-blue-100 bg-blue-50 px-4 py-3 text-sm text-blue-800">
+                  Full-time mode is active. You are available for booking all days and times by default.
+                  Add exceptions for leaves/time-off. Booked slots and exception blocks are unavailable.
+                </div>
+              )}
+
+              {/* Calendar Overview */}
+              <div className="bg-white rounded-lg shadow">
+                <div className="p-4 sm:p-6 border-b border-gray-200">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <h2 className="text-lg sm:text-xl font-bold text-gray-900">Schedule Calendar</h2>
+                      <p className="mt-1 text-xs sm:text-sm text-gray-600">
+                        Track meeting days, exception days, and free days.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const d = new Date(`${calendarMonth}-01T00:00:00`);
+                          d.setMonth(d.getMonth() - 1);
+                          setCalendarMonth(toMonthKey(d));
+                        }}
+                        className="px-2 py-1 text-sm border border-gray-300 rounded hover:bg-gray-50"
+                        aria-label="Previous month"
+                      >
+                        ←
+                      </button>
+                      <span className="text-sm font-medium text-gray-800 min-w-[130px] text-center">{monthLabel}</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const d = new Date(`${calendarMonth}-01T00:00:00`);
+                          d.setMonth(d.getMonth() + 1);
+                          setCalendarMonth(toMonthKey(d));
+                        }}
+                        className="px-2 py-1 text-sm border border-gray-300 rounded hover:bg-gray-50"
+                        aria-label="Next month"
+                      >
+                        →
+                      </button>
+                    </div>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-3 text-xs">
+                    <span className="inline-flex items-center gap-1 text-gray-700">
+                      <span className="h-2.5 w-2.5 rounded-full bg-blue-500" />
+                      Meeting
+                    </span>
+                    <span className="inline-flex items-center gap-1 text-gray-700">
+                      <span className="h-2.5 w-2.5 rounded-full bg-amber-500" />
+                      Exception
+                    </span>
+                    <span className="inline-flex items-center gap-1 text-gray-700">
+                      <span className="h-2.5 w-2.5 rounded-full bg-green-500" />
+                      Free
+                    </span>
+                  </div>
+                </div>
+                <div className="p-4 sm:p-6">
+                  <div className="grid grid-cols-7 gap-1 text-center text-xs font-semibold text-gray-500 mb-2">
+                    <div>Sun</div>
+                    <div>Mon</div>
+                    <div>Tue</div>
+                    <div>Wed</div>
+                    <div>Thu</div>
+                    <div>Fri</div>
+                    <div>Sat</div>
+                  </div>
+                  <div className="grid grid-cols-7 gap-1">
+                    {Array.from({ length: leadingEmptyDays }).map((_, idx) => (
+                      <div key={`empty-${idx}`} className="h-16 sm:h-20 rounded border border-transparent" />
+                    ))}
+                    {Array.from({ length: totalDays }).map((_, idx) => {
+                      const day = idx + 1;
+                      const cellDate = new Date(monthDate.getFullYear(), monthDate.getMonth(), day);
+                      const isoDate = toYyyyMmDd(cellDate);
+                      const status = getDayStatus(isoDate);
+                      const isToday = isoDate === todayKey;
+                      const dayMeetings = meetingsByDate[isoDate] || [];
+                      const statusClasses =
+                        status === 'exception'
+                          ? 'bg-amber-50 border-amber-200'
+                          : status === 'meeting'
+                          ? 'bg-blue-50 border-blue-200'
+                          : 'bg-green-50 border-green-200';
+                      const dotClasses =
+                        status === 'exception' ? 'bg-amber-500' : status === 'meeting' ? 'bg-blue-500' : 'bg-green-500';
+
+                      return (
+                        <div
+                          key={isoDate}
+                          className={`h-24 sm:h-28 rounded border p-1.5 text-left ${statusClasses} ${
+                            isToday ? 'ring-2 ring-primary-500' : ''
+                          }`}
+                          title={`${isoDate} - ${status}`}
+                        >
+                          <div className="text-xs font-semibold text-gray-800">{day}</div>
+                          <div className="mt-1 inline-flex items-center gap-1">
+                            <span className={`h-2 w-2 rounded-full ${dotClasses}`} />
+                            <span className="text-[10px] text-gray-600 capitalize">{status}</span>
+                          </div>
+                          {dayMeetings.length > 0 && (
+                            <div className="mt-1.5 space-y-1 max-h-[44px] sm:max-h-[64px] overflow-y-auto pr-0.5">
+                              {dayMeetings.map((meeting) => (
+                                <button
+                                  key={meeting.appointment_id}
+                                  type="button"
+                                  onClick={() => openMeetingDetail(meeting)}
+                                  className="w-full text-left px-1.5 py-0.5 rounded bg-blue-100 text-blue-800 hover:bg-blue-200 transition-colors text-[10px] font-medium"
+                                  title={`View meeting details (${formatTime(meeting.appointment_time)})`}
+                                >
+                                  {formatTime(meeting.appointment_time)}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
               </div>
 
@@ -363,7 +655,14 @@ const TeacherAvailability = () => {
                   <p className="mt-1 text-xs sm:text-sm text-gray-600">Set your recurring weekly availability</p>
                 </div>
                 <div className="p-4 sm:p-6">
-                  {isFetching ? (
+                  {teacherEmploymentType === 'full_time' ? (
+                    <div className="rounded-lg border border-gray-200 bg-gray-50 p-4">
+                      <p className="text-sm font-medium text-gray-900">Full-time availability</p>
+                      <p className="mt-1 text-sm text-gray-600">
+                        Weekly schedule setup is not required for full-time teachers.
+                      </p>
+                    </div>
+                  ) : isFetching ? (
                     <div className="text-center py-8">
                       <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600 mx-auto"></div>
                       <p className="mt-3 text-sm text-gray-600">Loading...</p>
@@ -380,10 +679,10 @@ const TeacherAvailability = () => {
                       <table className="w-full divide-y divide-gray-200" style={{ minWidth: '600px' }}>
                         <thead className="bg-gray-50">
                           <tr>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Day</th>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Time</th>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
-                            <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Day</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Time</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Status</th>
+                            <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 tracking-wider">Actions</th>
                           </tr>
                         </thead>
                         <tbody className="bg-white divide-y divide-gray-200">
@@ -483,9 +782,9 @@ const TeacherAvailability = () => {
       </div>
 
       {/* Add/Edit Availability Modal */}
-      {isModalOpen && createPortal(
+      {isModalOpen && teacherEmploymentType !== 'full_time' && createPortal(
         <div 
-          className="fixed bg-black bg-opacity-50 flex items-center justify-center p-4" 
+          className="fixed bg-black/40 backdrop-blur-sm flex items-center justify-center p-4" 
           style={{ 
             position: 'fixed', 
             top: 0, 
@@ -631,7 +930,7 @@ const TeacherAvailability = () => {
       {/* Add Exception Modal */}
       {isExceptionModalOpen && createPortal(
         <div 
-          className="fixed bg-black bg-opacity-50 flex items-center justify-center p-4" 
+          className="fixed bg-black/40 backdrop-blur-sm flex items-center justify-center p-4" 
           style={{ 
             position: 'fixed', 
             top: 0, 
@@ -778,6 +1077,76 @@ const TeacherAvailability = () => {
           )}
         </svg>
       </button>
+
+      {isMeetingDetailModalOpen && selectedMeeting && createPortal(
+        <div
+          className="fixed bg-black/40 backdrop-blur-sm flex items-center justify-center p-4"
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            zIndex: 99999,
+          }}
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setIsMeetingDetailModalOpen(false);
+              setSelectedMeeting(null);
+            }
+          }}
+        >
+          <div
+            className="bg-white rounded-lg shadow-xl max-w-lg w-full"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="p-4 sm:p-6">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-lg sm:text-xl font-bold text-gray-900">Meeting details</h2>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsMeetingDetailModalOpen(false);
+                    setSelectedMeeting(null);
+                  }}
+                  className="text-gray-400 hover:text-gray-600 transition-colors p-1"
+                  aria-label="Close meeting details"
+                >
+                  <svg className="w-5 h-5 sm:w-6 sm:h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+
+              <div className="space-y-2 text-sm text-gray-700">
+                <div><span className="font-medium text-gray-900">Date:</span> {formatDate(selectedMeeting.appointment_date)}</div>
+                <div><span className="font-medium text-gray-900">Time:</span> {formatTime(selectedMeeting.appointment_time)}</div>
+                <div><span className="font-medium text-gray-900">Student:</span> {selectedMeeting.student_name || 'N/A'}</div>
+                <div><span className="font-medium text-gray-900">School:</span> {selectedMeeting.school_name || 'N/A'}</div>
+                <div className="flex items-center gap-2">
+                  <span className="font-medium text-gray-900">Status:</span>
+                  <span className={`px-2 py-0.5 text-xs font-semibold rounded-full ${getStatusBadgeClass(selectedMeeting.status)}`}>
+                    {formatStatus(selectedMeeting.status)}
+                  </span>
+                </div>
+                {selectedMeeting.meeting_link && (
+                  <div className="pt-1">
+                    <a
+                      href={String(selectedMeeting.meeting_link).startsWith('http') ? selectedMeeting.meeting_link : `https://${selectedMeeting.meeting_link}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center px-3 py-1.5 text-xs font-medium text-white bg-primary-600 rounded-md hover:bg-primary-700 transition-colors"
+                    >
+                      Open meeting link
+                    </a>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
     </div>
   );
 };

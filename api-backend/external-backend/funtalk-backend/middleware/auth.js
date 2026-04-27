@@ -3,23 +3,10 @@ import { config } from '../config/config.js';
 import { query } from '../config/database.js';
 
 /**
- * Middleware to verify JWT token and authenticate user.
- * If req.apiToken is set (by API gateway / api-backend API key auth), skip JWT and allow through.
+ * Middleware to verify JWT token and authenticate user
  */
 export const authenticate = async (req, res, next) => {
   try {
-    // Already authenticated by API gateway (e.g. Bearer sk_xxx for system-scoped API token)
-    if (req.apiToken) {
-      req.user = {
-        userId: null,
-        email: 'api-token@gateway',
-        name: 'API Token',
-        userType: config.userTypes.SUPERADMIN,
-        status: 'active',
-      };
-      return next();
-    }
-
     const token = req.headers.authorization?.split(' ')[1]; // Bearer <token>
     
     if (!token) {

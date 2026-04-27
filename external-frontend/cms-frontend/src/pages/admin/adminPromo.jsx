@@ -4,6 +4,7 @@ import { apiRequest } from '../../config/api';
 import { useAuth } from '../../contexts/AuthContext';
 import { formatDateManila } from '../../utils/dateUtils';
 import FixedTablePagination from '../../components/table/FixedTablePagination';
+import { appAlert, appConfirm } from '../../utils/appAlert';
 
 const ITEMS_PER_PAGE = 10;
 
@@ -237,11 +238,19 @@ const AdminPromo = () => {
     // Verify promo belongs to admin's branch
     const promo = promos.find(p => p.promo_id === promoId);
     if (promo && promo.branch_id !== adminBranchId) {
-      alert('You can only delete promos from your branch.');
+      appAlert('You can only delete promos from your branch.');
       return;
     }
     
-    if (!window.confirm('Are you sure you want to delete this promo? This will also delete all promo merchandise and usage records.')) {
+    if (
+      !(await appConfirm({
+        title: 'Delete promo',
+        message:
+          'Are you sure you want to delete this promo? This will also delete all promo merchandise and usage records.',
+        destructive: true,
+        confirmLabel: 'Delete',
+      }))
+    ) {
       return;
     }
 
@@ -251,7 +260,7 @@ const AdminPromo = () => {
       });
       fetchPromos();
     } catch (err) {
-      alert(err.message || 'Failed to delete promo');
+      appAlert(err.message || 'Failed to delete promo');
     }
   };
 
@@ -302,7 +311,7 @@ const AdminPromo = () => {
     
     // Verify promo belongs to admin's branch
     if (promoItem.branch_id !== adminBranchId) {
-      alert('You can only edit promos from your branch.');
+      appAlert('You can only edit promos from your branch.');
       return;
     }
     
@@ -424,19 +433,19 @@ const AdminPromo = () => {
 
   const handleAddMerchandise = () => {
     if (!newMerchandise.merchandise_id) {
-      alert('Please select merchandise');
+      appAlert('Please select merchandise');
       return;
     }
 
     const merchItem = merchandise.find(m => m.merchandise_id === parseInt(newMerchandise.merchandise_id));
     if (!merchItem) {
-      alert('Merchandise not found');
+      appAlert('Merchandise not found');
       return;
     }
 
     // Check if already added
     if (formData.selectedMerchandise.some(m => m.merchandise_id === parseInt(newMerchandise.merchandise_id))) {
-      alert('This merchandise is already added');
+      appAlert('This merchandise is already added');
       return;
     }
 

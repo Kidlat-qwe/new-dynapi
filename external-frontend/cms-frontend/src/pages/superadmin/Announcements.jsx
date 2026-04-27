@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { useSearchParams } from 'react-router-dom';
-import API_BASE_URL, { apiRequest, getCmsFetchHeaders } from '../../config/api';
+import API_BASE_URL, { apiRequest } from '../../config/api';
+import { useAuth } from '../../contexts/AuthContext';
 import { formatDateManila } from '../../utils/dateUtils';
 import FixedTablePagination from '../../components/table/FixedTablePagination';
+import { appAlert, appConfirm } from '../../utils/appAlert';
 
 const RECIPIENT_GROUPS = [
   { value: 'All', label: 'All' },
@@ -34,6 +36,9 @@ const formatInPHTime = (isoOrDateString, options = {}) => {
 };
 
 const Announcements = () => {
+  const { userInfo } = useAuth();
+  const userType = userInfo?.user_type || userInfo?.userType;
+  const canManageAnnouncements = userType === 'Superadmin';
   const [searchParams, setSearchParams] = useSearchParams();
   const [announcements, setAnnouncements] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -76,6 +81,7 @@ const Announcements = () => {
   const [totalPages, setTotalPages] = useState(0);
   const [highlightedAnnouncementId, setHighlightedAnnouncementId] = useState(null);
   const highlightedRowRef = useRef(null);
+  const searchHydratedRef = useRef(false);
 
   useEffect(() => {
     fetchAnnouncements();
@@ -281,7 +287,14 @@ const Announcements = () => {
 
   const handleDelete = async (announcementId) => {
     setOpenMenuId(null);
-    if (!window.confirm('Are you sure you want to delete this announcement?')) {
+    if (
+      !(await appConfirm({
+        title: 'Delete announcement',
+        message: 'Are you sure you want to delete this announcement?',
+        destructive: true,
+        confirmLabel: 'Delete',
+      }))
+    ) {
       return;
     }
 
@@ -291,7 +304,7 @@ const Announcements = () => {
       });
       fetchAnnouncements();
     } catch (err) {
-      alert(err.message || 'Failed to delete announcement');
+      appAlert(err.message || 'Failed to delete announcement');
     }
   };
 
@@ -375,11 +388,12 @@ const Announcements = () => {
     setAttachmentUploading(true);
     setError('');
     try {
+      const token = localStorage.getItem('firebase_token');
       const fd = new FormData();
       fd.append('attachment', file);
       const res = await fetch(`${API_BASE_URL}/upload/announcement-file`, {
         method: 'POST',
-        headers: getCmsFetchHeaders(),
+        headers: { Authorization: `Bearer ${token}` },
         body: fd,
       });
       const data = await res.json();
@@ -553,6 +567,22 @@ const Announcements = () => {
     setCurrentPage(1);
     fetchAnnouncements();
   };
+
+  useEffect(() => {
+    if (!searchHydratedRef.current) {
+      searchHydratedRef.current = true;
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (currentPage !== 1) {
+        setCurrentPage(1);
+      } else {
+        fetchAnnouncements();
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [titleSearchTerm]);
 
   const handleReset = () => {
     setTitleSearchTerm('');
@@ -812,15 +842,19 @@ const Announcements = () => {
       {/* Table Section */}
       <div className="bg-white rounded-lg shadow-sm p-6">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-4">
-          <button
-            onClick={openCreateModal}
-            className="btn-primary flex items-center justify-center space-x-2 w-full sm:w-auto"
-          >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-            </svg>
-            <span>Create</span>
-          </button>
+          {canManageAnnouncements ? (
+            <button
+              onClick={openCreateModal}
+              className="btn-primary flex items-center justify-center space-x-2 w-full sm:w-auto"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+              </svg>
+              <span>Create</span>
+            </button>
+          ) : (
+            <div />
+          )}
           <div className="relative options-menu-container">
             <button
               onClick={handleOptionsMenuClick}
@@ -1058,20 +1092,24 @@ const Announcements = () => {
                                 >
                                   View Details
                                 </button>
-                                <button
-                                  type="button"
-                                  onClick={() => openEditModal(announcement)}
-                                  className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100"
-                                >
-                                  Edit
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleDelete(announcement.announcement_id)}
-                                  className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50"
-                                >
-                                  Delete
-                                </button>
+                                {canManageAnnouncements ? (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => openEditModal(announcement)}
+                                      className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100"
+                                    >
+                                      Edit
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDelete(announcement.announcement_id)}
+                                      className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50"
+                                    >
+                                      Delete
+                                    </button>
+                                  </>
+                                ) : null}
                               </div>,
                               document.body
                             )}

@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { apiRequest } from '../../config/api';
 import { useGlobalBranchFilter } from '../../contexts/GlobalBranchFilterContext';
 import FixedTablePagination from '../../components/table/FixedTablePagination';
+import { appAlert, appConfirm } from '../../utils/appAlert';
 
 const ITEMS_PER_PAGE = 10;
 
@@ -140,7 +141,14 @@ const PricingList = () => {
 
   const handleDelete = async (pricingListId) => {
     setOpenMenuId(null);
-    if (!window.confirm('Are you sure you want to delete this pricing list?')) {
+    if (
+      !(await appConfirm({
+        title: 'Delete pricing list',
+        message: 'Are you sure you want to delete this pricing list?',
+        destructive: true,
+        confirmLabel: 'Delete',
+      }))
+    ) {
       return;
     }
 
@@ -150,7 +158,7 @@ const PricingList = () => {
       });
       fetchPricingLists();
     } catch (err) {
-      alert(err.message || 'Failed to delete pricing list');
+      appAlert(err.message || 'Failed to delete pricing list');
     }
   };
 

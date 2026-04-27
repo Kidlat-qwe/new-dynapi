@@ -1,4 +1,4 @@
-import { getCmsAuth } from '../config/firebase.js';
+import admin from '../config/firebase.js';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, resolve } from 'path';
@@ -34,7 +34,7 @@ async function listAllUsers(options = {}) {
   } = options;
 
   try {
-    const auth = getCmsAuth();
+    const auth = admin.auth();
 
     // If UID is provided, get specific user
     if (uid) {

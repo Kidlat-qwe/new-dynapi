@@ -7,6 +7,7 @@ const GlobalBranchFilterContext = createContext(null);
 
 const SUPPORTED_ROUTE_PREFIXES = ['/superadmin/', '/superfinance/'];
 const SUPPORTED_ROUTE_SEGMENTS = new Set([
+  'daily-operational-dashboard',
   'financial-dashboard',
   'operational-dashboard',
   'enrollment-dashboard',
@@ -19,6 +20,10 @@ const SUPPORTED_ROUTE_SEGMENTS = new Set([
   'invoice',
   'installment-invoice',
   'payment-logs',
+  'acknowledgement-receipts',
+  'merchandise',
+  'promo',
+  'system-logs',
   'daily-summary-sales',
   'report',
   'calendar-schedule',
@@ -98,6 +103,7 @@ export const GlobalBranchFilterProvider = ({ children }) => {
     () => branches.find((branch) => String(branch.branch_id) === String(selectedBranchId)) || null,
     [branches, selectedBranchId]
   );
+  const selectedBranchDisplayName = selectedBranch?.branch_nickname || selectedBranch?.branch_name || 'All Branches';
 
   const value = useMemo(
     () => ({
@@ -107,12 +113,12 @@ export const GlobalBranchFilterProvider = ({ children }) => {
       setSelectedBranchId,
       clearSelectedBranch: () => setSelectedBranchId(''),
       selectedBranch,
-      selectedBranchName: selectedBranch?.branch_name || 'All Branches',
-      selectedBranchNameParts: formatBranchNameParts(selectedBranch?.branch_name || 'All Branches'),
+      selectedBranchName: selectedBranchDisplayName,
+      selectedBranchNameParts: formatBranchNameParts(selectedBranchDisplayName),
       shouldShowBranchFilter,
       isEligibleRole,
     }),
-    [branches, loadingBranches, selectedBranchId, selectedBranch, shouldShowBranchFilter, isEligibleRole]
+    [branches, loadingBranches, selectedBranchId, selectedBranch, selectedBranchDisplayName, shouldShowBranchFilter, isEligibleRole]
   );
 
   return (

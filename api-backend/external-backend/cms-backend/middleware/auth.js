@@ -1,4 +1,4 @@
-import { getCmsAuth } from '../config/firebase.js';
+import admin from '../config/firebase.js';
 import { query } from '../config/database.js';
 
 /**
@@ -22,7 +22,7 @@ export const verifyFirebaseToken = async (req, res, next) => {
     const idToken = authHeader.split('Bearer ')[1];
 
     // Verify the token with Firebase
-    const decodedToken = await getCmsAuth().verifyIdToken(idToken);
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
 
     // Attach user info to request
     req.user = {

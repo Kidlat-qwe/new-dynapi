@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-
-import { fetchFuntalk } from '../lib/api';
+import { API_BASE_URL } from '@/config/api.js';
+import ResponsiveSelect from '../components/ResponsiveSelect';
 
 const Signup = () => {
   const navigate = useNavigate();
@@ -84,7 +84,7 @@ const Signup = () => {
     setErrors({}); // Clear previous errors
 
     try {
-      const response = await fetchFuntalk('/auth/register', {
+      const response = await fetch(`${API_BASE_URL}/auth/register`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -132,9 +132,6 @@ const Signup = () => {
           case 'superadmin':
             navigate('/superadmin/dashboard');
             break;
-          case 'admin':
-            navigate('/admin/dashboard');
-            break;
           case 'school':
             navigate('/school/dashboard');
             break;
@@ -175,7 +172,7 @@ const Signup = () => {
               <label htmlFor="userType" className="label">
                 Account Type
               </label>
-              <select
+              <ResponsiveSelect
                 id="userType"
                 name="userType"
                 value={formData.userType}
@@ -184,18 +181,15 @@ const Signup = () => {
                 disabled={isLoading}
               >
                 <option value="superadmin">Super Admin</option>
-                <option value="admin">Admin</option>
                 <option value="school">School</option>
                 <option value="teacher">Teacher</option>
-              </select>
+              </ResponsiveSelect>
               {errors.userType && (
                 <p className="error-message">{errors.userType}</p>
               )}
               <p className="mt-1 text-xs sm:text-sm text-gray-500">
                 {formData.userType === 'superadmin'
                   ? 'Platform owner/developer - Full system access'
-                  : formData.userType === 'admin'
-                  ? 'Operational staff - Manage schools and teachers'
                   : formData.userType === 'school'
                   ? 'For educational institutions'
                   : 'For individual teachers'}
@@ -207,7 +201,7 @@ const Signup = () => {
               <label htmlFor="name" className="label">
                 {formData.userType === 'school'
                   ? 'School Name'
-                  : formData.userType === 'superadmin' || formData.userType === 'admin'
+                  : formData.userType === 'superadmin'
                   ? 'Full Name'
                   : 'Full Name'}
               </label>

@@ -2,8 +2,7 @@ import { useEffect, useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import Header from '../../components/Header';
 import Sidebar from '../../components/Sidebar';
-
-import { fetchFuntalk } from '../../lib/api';
+import { API_BASE_URL } from '@/config/api.js';
 
 const TeacherDashboard = () => {
   const navigate = useNavigate();
@@ -47,7 +46,12 @@ const TeacherDashboard = () => {
   const fetchAppointments = async () => {
     setIsFetching(true);
     try {
-      const response = await fetchFuntalk('/appointments', {});
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/appointments`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.appointments) {
@@ -273,7 +277,7 @@ const TeacherDashboard = () => {
                               <span className={`px-2 py-1 text-xs font-semibold rounded-full ${getStatusColor(appointment.status)}`}>
                                 {formatStatus(appointment.status)}
                               </span>
-                              {appointment.meeting_link && (appointment.status === 'approved' || appointment.status === 'pending') && (
+                              {appointment.meeting_link && appointment.status === 'approved' && (
                                 <Link
                                   to={`/teacher/appointments`}
                                   className="px-3 py-1.5 text-xs sm:text-sm bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors"

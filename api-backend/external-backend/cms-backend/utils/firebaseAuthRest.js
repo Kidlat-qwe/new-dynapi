@@ -13,7 +13,7 @@ const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
 const FIREBASE_AUTH_DOMAIN = process.env.FIREBASE_AUTH_DOMAIN || 'psms-b9ca7.firebaseapp.com';
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'psms-b9ca7';
 
-if (!FIREBASE_API_KEY && process.env.QUIET_STARTUP !== '1') {
+if (!FIREBASE_API_KEY) {
   console.warn('⚠️  FIREBASE_API_KEY not set in environment variables. Firebase Auth REST API operations will fail.');
   console.warn('   Add FIREBASE_API_KEY to your .env file (get it from Firebase Console > Project Settings > General > Web API Key)');
 }

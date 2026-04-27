@@ -3,29 +3,295 @@
 @tailwind utilities;
 
 @layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  /* UI baseline: keep palette, improve readability */
+  html {
+    @apply antialiased;
+  }
+
   body {
-    @apply bg-gray-50 text-gray-900;
+    @apply text-gray-900;
+    background: radial-gradient(circle at top, #DFC1CB 0%, #f9f3ef 38%, #fffdfb 100%);
+  }
+
+  /* Hide vertical/horizontal scrollbars globally while keeping scroll behavior */
+  * {
+    -ms-overflow-style: none; /* IE and Edge */
+    scrollbar-width: none; /* Firefox */
+  }
+
+  *::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+    display: none; /* Chrome, Safari, Opera */
   }
 }
 
 @layer components {
+  /* Spacing + typography system (8px scale) */
+  .page-shell {
+    @apply max-w-7xl mx-auto space-y-4 sm:space-y-6;
+  }
+
+  .page-header {
+    @apply flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3;
+  }
+
+  .page-title {
+    @apply text-2xl sm:text-3xl font-bold text-gray-900 tracking-tight;
+  }
+
+  .page-subtitle {
+    @apply mt-1 text-sm sm:text-base text-gray-600 leading-relaxed;
+  }
+
+  /* Cards (grayscale-only structure; keep existing palette colors for accents) */
+  .card {
+    @apply bg-white rounded-xl border shadow-sm;
+    border-color: #DFC1CB;
+    box-shadow: 0 6px 20px rgba(90, 57, 49, 0.08);
+  }
+
+  .card-padded {
+    @apply p-4 sm:p-5 md:p-6;
+  }
+
+  .card-title {
+    @apply text-base sm:text-lg font-semibold text-gray-900;
+  }
+
+  .card-subtitle {
+    @apply mt-1 text-sm text-gray-600;
+  }
+
+  /* Form controls: consistent height, padding, focus, typography */
   .input-field {
-    @apply w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none transition-all duration-200;
+    @apply w-full px-3 py-2.5 text-sm border border-gray-300 rounded-lg bg-white text-gray-900 placeholder:text-gray-400;
+    @apply focus:ring-2 outline-none transition-colors duration-150;
+    --tw-ring-color: #AF8F7E;
+    border-color: #DFC1CB;
+    @apply disabled:bg-gray-50 disabled:text-gray-500 disabled:cursor-not-allowed;
   }
   
   .btn-primary {
-    @apply w-full bg-primary-600 text-white py-3 rounded-lg font-semibold hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed;
+    /* Primary button: consistent size and hierarchy */
+    @apply w-full inline-flex items-center justify-center gap-2;
+    @apply text-white px-4 py-2.5 rounded-lg text-sm font-semibold;
+    background-color: #B66681;
+    @apply focus:outline-none focus:ring-2 focus:ring-offset-2;
+    --tw-ring-color: #AF8F7E;
+    @apply transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed;
 }
 
+  .btn-primary:hover {
+    background-color: #A7816D;
+  }
+
   .btn-secondary {
-    @apply w-full bg-white text-primary-600 py-3 rounded-lg font-semibold border-2 border-primary-600 hover:bg-primary-50 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 transition-all duration-200;
+    /* Secondary button: grayscale surface + existing primary accent */
+    @apply w-full inline-flex items-center justify-center gap-2;
+    @apply bg-white px-4 py-2.5 rounded-lg text-sm font-semibold;
+    color: #A7816D;
+    border: 1px solid #DFC1CB;
+    @apply focus:outline-none focus:ring-2 focus:ring-offset-2;
+    --tw-ring-color: #AF8F7E;
+    @apply transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed;
 }
+
+  .btn-secondary:hover {
+    background-color: #DFC1CB;
+    color: #7b5a4a;
+  }
   
   .label {
-    @apply block text-sm font-medium text-gray-700 mb-2;
+    @apply block text-xs sm:text-sm font-medium text-gray-700 mb-1.5;
 }
 
   .error-message {
-    @apply text-red-600 text-sm mt-1;
+    @apply text-red-600 text-xs sm:text-sm mt-1;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Desktop-first: ≥1024px — preserve original main/table layout (unchanged)   */
+/* -------------------------------------------------------------------------- */
+@media (min-width: 1024px) {
+  main table {
+    @apply w-full table-fixed;
+    min-width: 0 !important;
+  }
+
+  main th {
+    @apply px-3 py-2 text-xs;
+  }
+
+  main td {
+    @apply px-3 py-2 text-sm align-top;
+    white-space: normal !important;
+    word-break: break-word;
+  }
+
+  main .overflow-x-auto {
+    overflow-x: hidden !important;
+  }
+
+  main [style*='min-width'] {
+    min-width: 0 !important;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Tablet & phone: max-width 1023px — responsive without changing ≥1024px     */
+/* -------------------------------------------------------------------------- */
+@media (max-width: 1023px) {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  #root {
+    max-width: 100%;
+    overflow-x: hidden;
+  }
+
+  /* Flex main must shrink so wide content does not push the viewport */
+  .min-h-screen > .flex > main.flex-1,
+  .min-h-screen .flex > main.flex-1 {
+    min-width: 0;
+  }
+
+  /* Touch-friendly form controls; 16px reduces iOS input zoom */
+  .input-field,
+  input.input-field,
+  select.input-field,
+  textarea.input-field {
+    min-height: 2.75rem;
+    font-size: 1rem;
+  }
+
+  textarea.input-field {
+    min-height: 6.5rem;
+  }
+
+  .btn-primary,
+  .btn-secondary {
+    min-height: 2.75rem;
+  }
+
+  .label {
+    @apply text-sm;
+  }
+
+  .page-title {
+    @apply text-xl;
+  }
+
+  .page-subtitle {
+    @apply text-sm;
+  }
+
+  /* Wide data tables: horizontal scroll inside the card, not the page */
+  main .overflow-x-auto {
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+  }
+
+  /* Reveal a thin horizontal scrollbar in table regions (global * hides scrollbars) */
+  main .overflow-x-auto {
+    scrollbar-width: thin;
+  }
+
+  main .overflow-x-auto::-webkit-scrollbar {
+    display: block;
+    height: 5px;
+  }
+
+  main .overflow-x-auto::-webkit-scrollbar-thumb {
+    background: rgba(90, 57, 49, 0.25);
+    border-radius: 4px;
+  }
+
+  /* Only widen scroll-region tables so horizontal swipe works; leave table-fixed layouts intact */
+  main .overflow-x-auto table {
+    width: max-content;
+    min-width: 100%;
+    max-width: none;
+    table-layout: auto;
+  }
+
+  /* Media in main should not overflow the viewport */
+  main img,
+  main video,
+  main canvas {
+    max-width: 100%;
+    height: auto;
+  }
+
+  /*
+   * Auth pages only (Login/Signup root uses flex items-center justify-center).
+   * Never use `.min-h-screen img` — dashboards wrap <Header> in `.min-h-screen`, and forcing
+   * height:auto on header logos overrides Tailwind `h-10`/`h-12` (logo balloons on mobile).
+   */
+  .min-h-screen.flex.items-center.justify-center img {
+    max-width: min(56vw, 8.5rem);
+    max-height: 2.75rem;
+    width: auto;
+    object-fit: contain;
+  }
+
+  /* Long sidebar menus: scroll inside panel on short phones */
+  aside nav {
+    max-height: calc(100dvh - 5rem - env(safe-area-inset-bottom, 0px));
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: max(0.5rem, env(safe-area-inset-bottom, 0px));
+  }
+
+  /* Sticky header: respect notches / home indicator */
+  header.sticky {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+
+  /*
+   * Mobile: some pages end up scrolling a nested container, which breaks `position: sticky`.
+   * Keep desktop behavior unchanged by only forcing a fixed header on small screens.
+   */
+  .min-h-screen > header.sticky {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+  }
+
+  /* Offset page content so it doesn't sit under the fixed header (Header is h-16 = 4rem). */
+  .min-h-screen > header.sticky + .flex {
+    padding-top: calc(4rem + env(safe-area-inset-top, 0px));
+  }
+
+  /* Floating sidebar toggle (all dashboard pages) */
+  button[aria-label='Toggle sidebar'].fixed.bottom-6.right-6 {
+    bottom: calc(1.5rem + env(safe-area-inset-bottom, 0px));
+    right: calc(1.5rem + env(safe-area-inset-right, 0px));
+  }
+
+  /* Modals & global dialogs: stay in view, scroll when tall */
+  #root .fixed.inset-0.flex.items-center.justify-center {
+    padding-top: max(0.75rem, env(safe-area-inset-top, 0px));
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom, 0px));
+    padding-left: max(0.75rem, env(safe-area-inset-left, 0px));
+    padding-right: max(0.75rem, env(safe-area-inset-right, 0px));
+    align-items: center;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  [role='alertdialog'],
+  [role='dialog'] {
+    max-height: min(90dvh, calc(100dvh - 1.5rem));
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
   }
 }

@@ -2,7 +2,9 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import Header from '../../components/Header';
 import Sidebar from '../../components/Sidebar';
-import { fetchFuntalk } from '../../lib/api';
+import ResponsiveSelect from '../../components/ResponsiveSelect.jsx';
+import Pagination from '../../components/Pagination.jsx';
+import { API_BASE_URL } from '@/config/api.js';
 
 const SchoolReports = () => {
   const navigate = useNavigate();
@@ -17,6 +19,7 @@ const SchoolReports = () => {
   const [dateFilter, setDateFilter] = useState('');
   const [students, setStudents] = useState([]);
   const [teachers, setTeachers] = useState([]);
+  const [page, setPage] = useState(1);
 
   useEffect(() => {
     const token = localStorage.getItem('token');
@@ -53,15 +56,28 @@ const SchoolReports = () => {
   const fetchAppointments = async () => {
     setIsFetching(true);
     try {
+      const token = localStorage.getItem('token');
+      let url = `${API_BASE_URL}/appointments`;
       const params = new URLSearchParams();
-      if (statusFilter) params.append('status', statusFilter);
+      
+      if (statusFilter) {
+        params.append('status', statusFilter);
+      }
+      
       if (dateFilter) {
         params.append('startDate', dateFilter);
         params.append('endDate', dateFilter);
       }
-      const qs = params.toString();
-      const path = qs ? `/appointments?${qs}` : '/appointments';
-      const response = await fetchFuntalk(path, {});
+      
+      if (params.toString()) {
+        url += `?${params.toString()}`;
+      }
+
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.appointments) {
@@ -80,7 +96,12 @@ const SchoolReports = () => {
 
   const fetchStudents = async () => {
     try {
-      const response = await fetchFuntalk('/students', {});
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/students`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.students) {
@@ -93,7 +114,12 @@ const SchoolReports = () => {
 
   const fetchTeachers = async () => {
     try {
-      const response = await fetchFuntalk('/teachers', {});
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/teachers`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.teachers) {
@@ -118,6 +144,13 @@ const SchoolReports = () => {
     const matchesTeacher = !teacherFilter || apt.teacher_id === parseInt(teacherFilter);
     return matchesStatus && matchesStudent && matchesTeacher;
   });
+
+  useEffect(() => {
+    setPage(1);
+  }, [statusFilter, studentFilter, teacherFilter, dateFilter]);
+
+  const pageSize = 10;
+  const pagedAppointments = filteredAppointments.slice((page - 1) * pageSize, page * pageSize);
 
   // Format date and time
   const formatDateTime = (date, time) => {
@@ -227,22 +260,26 @@ const SchoolReports = () => {
                       />
                     </div>
                     <div>
-                      <select
+                      <ResponsiveSelect
+                        id="school-reports-status-filter"
+                        aria-label="Filter by status"
                         value={statusFilter}
                         onChange={(e) => setStatusFilter(e.target.value)}
-                        className="w-full px-3 sm:px-4 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                        className="w-full px-3 sm:px-4 py-2 text-sm border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-primary-500 focus:border-primary-500 focus:outline-none"
                       >
                         <option value="">All Status</option>
                         <option value="completed">Completed</option>
                         <option value="cancelled">Cancelled</option>
                         <option value="no_show">No Show</option>
-                      </select>
+                      </ResponsiveSelect>
                     </div>
                     <div>
-                      <select
+                      <ResponsiveSelect
+                        id="school-reports-teacher-filter"
+                        aria-label="Filter by teacher"
                         value={teacherFilter}
                         onChange={(e) => setTeacherFilter(e.target.value)}
-                        className="w-full px-3 sm:px-4 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                        className="w-full px-3 sm:px-4 py-2 text-sm border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-primary-500 focus:border-primary-500 focus:outline-none"
                       >
                         <option value="">All Teachers</option>
                         {teachers.map((teacher) => (
@@ -250,7 +287,7 @@ const SchoolReports = () => {
                             {teacher.fullname}
                           </option>
                         ))}
-                      </select>
+                      </ResponsiveSelect>
                     </div>
                     <div>
                       <input
@@ -272,20 +309,21 @@ const SchoolReports = () => {
                     <div className="p-8 text-center">
                       <p className="text-sm text-gray-500">No records found</p>
                     </div>
-                  ) : (
+                ) : (
+                    <>
                     <table className="w-full divide-y divide-gray-200" style={{ minWidth: '900px' }}>
                       <thead className="bg-gray-50">
                         <tr>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Date</th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Student</th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Teacher</th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Class Time</th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Feedback</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Date</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Student</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Teacher</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Class Time</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Status</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Feedback</th>
                         </tr>
                       </thead>
                       <tbody className="bg-white divide-y divide-gray-200">
-                        {filteredAppointments.map((apt) => (
+                        {pagedAppointments.map((apt) => (
                           <tr key={apt.appointment_id} className="hover:bg-gray-50">
                             <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
                               {apt.appointment_date ? new Date(apt.appointment_date).toLocaleDateString('en-US', {
@@ -321,6 +359,10 @@ const SchoolReports = () => {
                         ))}
                       </tbody>
                     </table>
+                    <div className="px-4 py-3 sm:px-6 border-t border-gray-200">
+                      <Pagination totalItems={filteredAppointments.length} pageSize={pageSize} currentPage={page} onPageChange={setPage} />
+                    </div>
+                    </>
                   )}
                 </div>
               </div>

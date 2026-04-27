@@ -1,21 +1,55 @@
 import { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
+import { useLocation } from 'react-router-dom';
 import { apiRequest } from '../../config/api';
 import { useAuth } from '../../contexts/AuthContext';
 import { useGlobalBranchFilter } from '../../contexts/GlobalBranchFilterContext';
 import * as XLSX from 'xlsx';
 import { formatDateManila } from '../../utils/dateUtils';
 import FixedTablePagination from '../../components/table/FixedTablePagination';
+import { appAlert } from '../../utils/appAlert';
+import { uploadInvoicePaymentImage } from '../../utils/uploadInvoicePaymentImage';
+import { BranchPaymentLogTabs } from '../../components/paymentLogs/PaymentLogsViewTabs';
+import PaymentAttachmentViewerModal from '../../components/paymentLogs/PaymentAttachmentViewerModal';
+
+/** Same options as Record Payment on Invoice page (see Invoice.jsx payment_method select) */
+const RETURN_FIX_PAYMENT_METHOD_OPTIONS = [
+  'Cash',
+  'Online Banking',
+  'Credit Card',
+  'E-wallets',
+];
+
+const getReturnFixPaymentMethodOptions = (currentValue) => {
+  const c = (currentValue || '').trim();
+  if (!c) return RETURN_FIX_PAYMENT_METHOD_OPTIONS;
+  if (RETURN_FIX_PAYMENT_METHOD_OPTIONS.includes(c)) return RETURN_FIX_PAYMENT_METHOD_OPTIONS;
+  return [c, ...RETURN_FIX_PAYMENT_METHOD_OPTIONS];
+};
 
 const PaymentLogs = () => {
+  const location = useLocation();
   const { userInfo } = useAuth();
   const { selectedBranchId: globalBranchId } = useGlobalBranchFilter();
+  /** main = all except Returned; return = finance sent back for reference/attachment fix */
+  const [branchLogTab, setBranchLogTab] = useState(() => {
+    const params = new URLSearchParams(location.search);
+    return params.get('notificationTab') === 'return' ? 'return' : 'main';
+  });
+  const [returnFixPayment, setReturnFixPayment] = useState(null);
+  const [returnFixRef, setReturnFixRef] = useState('');
+  const [returnFixAttachment, setReturnFixAttachment] = useState('');
+  const [returnFixPaymentMethod, setReturnFixPaymentMethod] = useState('Cash');
+  const [returnFixIssueDate, setReturnFixIssueDate] = useState('');
+  const [returnFixAttachmentUploading, setReturnFixAttachmentUploading] = useState(false);
+  const [returnFixLoading, setReturnFixLoading] = useState(false);
   const [payments, setPayments] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [searchTerm, setSearchTerm] = useState('');
   const [filterBranch, setFilterBranch] = useState('');
-  const [filterStatus, setFilterStatus] = useState('');
+  /** Finance approval filter — matches the Approval column and dashboard "verified" (Approved) vs pending */
+  const [filterFinanceApproval, setFilterFinanceApproval] = useState('');
   /** YYYY-MM-DD; empty = no bound (server-side issue_date_from / issue_date_to) */
   const [filterIssueDateFrom, setFilterIssueDateFrom] = useState('');
   const [filterIssueDateTo, setFilterIssueDateTo] = useState('');
@@ -40,6 +74,7 @@ const PaymentLogs = () => {
   const [showAttachmentViewer, setShowAttachmentViewer] = useState(false);
   const [attachmentViewerUrl, setAttachmentViewerUrl] = useState(null);
   const [pagination, setPagination] = useState({ page: 1, limit: 10, total: 0, totalPages: 1 });
+  const latestFetchIdRef = useRef(0);
 
   useEffect(() => {
     fetchPayments(1);
@@ -47,10 +82,39 @@ const PaymentLogs = () => {
   }, []);
 
   useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const notificationTab = params.get('notificationTab');
+    const financeApproval = params.get('financeApproval');
+    if (notificationTab === 'main' || notificationTab === 'return') {
+      setBranchLogTab(notificationTab);
+    }
+    if (financeApproval === 'approved' || financeApproval === 'pending') {
+      setFilterFinanceApproval(financeApproval);
+    } else if (financeApproval === 'all' || financeApproval === '') {
+      setFilterFinanceApproval('');
+    }
+    const issueFrom = (params.get('issue_date_from') || '').trim().slice(0, 10);
+    const issueTo = (params.get('issue_date_to') || '').trim().slice(0, 10);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(issueFrom)) {
+      setFilterIssueDateFrom(issueFrom);
+    }
+    if (/^\d{4}-\d{2}-\d{2}$/.test(issueTo)) {
+      setFilterIssueDateTo(issueTo);
+    }
+  }, [location.search]);
+
+  useEffect(() => {
     setFilterBranch(globalBranchId || '');
     setOpenBranchDropdown(false);
     setBranchDropdownRect(null);
   }, [globalBranchId]);
+
+  useEffect(() => {
+    if (branchLogTab === 'return') {
+      setOpenStatusDropdown(false);
+      setStatusDropdownRect(null);
+    }
+  }, [branchLogTab]);
 
   // Refetch when branch or status filter changes (server-side filter), reset to page 1
   const isInitialMount = useRef(true);
@@ -60,7 +124,7 @@ const PaymentLogs = () => {
       return;
     }
     fetchPayments(1);
-  }, [filterBranch, filterStatus, filterIssueDateFrom, filterIssueDateTo]);
+  }, [filterBranch, filterFinanceApproval, filterIssueDateFrom, filterIssueDateTo, branchLogTab]);
 
   // Close dropdowns when clicking outside
   useEffect(() => {
@@ -91,15 +155,28 @@ const PaymentLogs = () => {
   }, [openBranchDropdown, openStatusDropdown, openPaymentMethodDropdown, openApprovalMenuId]);
 
   const fetchPayments = async (page = 1) => {
+    const fetchId = ++latestFetchIdRef.current;
     try {
       setLoading(true);
       const limit = 10;
       const params = new URLSearchParams({ limit: String(limit), page: String(page) });
       if (filterBranch) params.set('branch_id', filterBranch);
-      if (filterStatus) params.set('status', filterStatus);
       if (filterIssueDateFrom) params.set('issue_date_from', filterIssueDateFrom);
       if (filterIssueDateTo) params.set('issue_date_to', filterIssueDateTo);
+      if (branchLogTab === 'return') {
+        params.set('approval_status', 'Returned');
+      } else if (filterFinanceApproval === 'approved') {
+        params.set('status', 'Completed');
+        params.set('approval_status', 'Approved');
+        params.set('exclude_approval_status', 'Returned');
+      } else if (filterFinanceApproval === 'pending') {
+        params.set('status', 'Completed');
+        params.set('exclude_approval_status', 'Approved,Returned');
+      } else {
+        params.set('exclude_approval_status', 'Returned');
+      }
       const response = await apiRequest(`/payments?${params.toString()}`);
+      if (fetchId !== latestFetchIdRef.current) return;
       setPayments(response.data || []);
       if (response.pagination) {
         setPagination({
@@ -111,10 +188,12 @@ const PaymentLogs = () => {
       }
       setError('');
     } catch (err) {
+      if (fetchId !== latestFetchIdRef.current) return;
       console.error('Error fetching payments:', err);
       setError('Failed to load payments. Please try again.');
       setPayments([]);
     } finally {
+      if (fetchId !== latestFetchIdRef.current) return;
       setLoading(false);
     }
   };
@@ -175,17 +254,17 @@ const PaymentLogs = () => {
 
     // Require both values
     if (!originalRef) {
-      alert('This payment has no reference number recorded. Please ask the encoder to update it from the Record Payment modal.');
+      appAlert('This payment has no reference number recorded. Please ask the encoder to update it from the Record Payment modal.');
       return;
     }
     if (!enteredRef) {
-      alert('Please enter the reference number exactly as shown on the receipt image.');
+      appAlert('Please enter the reference number exactly as shown on the receipt image.');
       return;
     }
 
     // Enforce match between encoded reference and verifier input
     if (enteredRef !== originalRef) {
-      alert('Reference number does not match the one originally recorded for this payment.\n\nPlease double-check the receipt and coordinate with the encoder before approving.');
+      appAlert('Reference number does not match the one originally recorded for this payment.\n\nPlease double-check the receipt and coordinate with the encoder before approving.');
       return;
     }
 
@@ -204,9 +283,89 @@ const PaymentLogs = () => {
       closeReferenceModal();
       await fetchPayments(pagination.page);
     } catch (err) {
-      alert(err.message || 'Failed to save and approve payment.');
+      appAlert(err.message || 'Failed to save and approve payment.');
     } finally {
       setReferenceModalUpdating(false);
+    }
+  };
+
+  const openReturnFixModal = (payment) => {
+    setReturnFixPayment(payment);
+    setReturnFixRef((payment.reference_number || '').trim());
+    setReturnFixAttachment(payment.payment_attachment_url || '');
+    setReturnFixPaymentMethod((payment.payment_method || 'Cash').trim() || 'Cash');
+    setReturnFixIssueDate((payment.issue_date || '').slice(0, 10));
+  };
+
+  const closeReturnFixModal = () => {
+    setReturnFixPayment(null);
+    setReturnFixRef('');
+    setReturnFixAttachment('');
+    setReturnFixPaymentMethod('Cash');
+    setReturnFixIssueDate('');
+    setReturnFixAttachmentUploading(false);
+  };
+
+  const handleReturnFixAttachmentChange = async (e) => {
+    const file = e.target?.files?.[0];
+    if (!file) return;
+    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    if (!allowed.includes(file.type)) {
+      appAlert('Please select an image (JPEG, PNG, WebP, or GIF).');
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      appAlert('Image must be 5MB or less.');
+      return;
+    }
+    setReturnFixAttachmentUploading(true);
+    try {
+      const imageUrl = await uploadInvoicePaymentImage(file);
+      setReturnFixAttachment(imageUrl);
+    } catch (err) {
+      console.error('Return-fix attachment upload:', err);
+      appAlert(err.message || 'Failed to upload image. Please try again.');
+    } finally {
+      setReturnFixAttachmentUploading(false);
+      e.target.value = '';
+    }
+  };
+
+  const clearReturnFixAttachment = () => {
+    setReturnFixAttachment('');
+  };
+
+  const submitReturnFix = async (e) => {
+    e?.preventDefault();
+    if (!returnFixPayment) return;
+    setReturnFixLoading(true);
+    try {
+      const refTrim = returnFixRef.trim();
+      const attTrim = returnFixAttachment.trim();
+      const issueDateTrim = String(returnFixIssueDate || '').trim();
+      if (!issueDateTrim) {
+        appAlert('Please select the correct payment date before resubmitting.');
+        return;
+      }
+      await apiRequest(`/payments/${returnFixPayment.payment_id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          reference_number: refTrim || undefined,
+          attachment_url: attTrim === '' ? null : attTrim,
+          payment_method: returnFixPaymentMethod.trim() || undefined,
+          issue_date: issueDateTrim,
+        }),
+      });
+      await apiRequest(`/payments/${returnFixPayment.payment_id}/resubmit-for-verification`, {
+        method: 'PUT',
+      });
+      appAlert('Payment updated and sent back to Finance for verification.');
+      closeReturnFixModal();
+      await fetchPayments(pagination.page);
+    } catch (err) {
+      appAlert(err.message || 'Failed to update and resubmit.');
+    } finally {
+      setReturnFixLoading(false);
     }
   };
 
@@ -249,6 +408,20 @@ const PaymentLogs = () => {
     return `₱${parseFloat(amount).toFixed(2)}`;
   };
 
+  const formatInvoiceIssuedBy = (payment) => {
+    const name = (payment.invoice_issued_by_name || '').trim();
+    const email = (payment.invoice_issued_by_email || '').trim();
+    if (name) return name;
+    if (email) return email;
+    const recorderName = (payment.payment_created_by_name || '').trim();
+    const recorderEmail = (payment.payment_created_by_email || '').trim();
+    if (recorderName) return recorderName;
+    if (recorderEmail) return recorderEmail;
+    if (payment?.created_by) return `User #${payment.created_by}`;
+    if (!payment?.student_id) return 'Walk-in / AR';
+    return 'System';
+  };
+
   const getStatusBadge = (status) => {
     const statusColors = {
       'Completed': 'bg-green-100 text-green-800',
@@ -267,7 +440,9 @@ const PaymentLogs = () => {
   const getPaymentMethodBadge = (method) => {
     const methodColors = {
       'Cash': 'bg-blue-100 text-blue-800',
+      'Online Banking': 'bg-pink-100 text-pink-800',
       'Credit Card': 'bg-purple-100 text-purple-800',
+      'E-wallets': 'bg-indigo-100 text-indigo-800',
       'Debit Card': 'bg-indigo-100 text-indigo-800',
       'Bank Transfer': 'bg-teal-100 text-teal-800',
       'Check': 'bg-orange-100 text-orange-800',
@@ -282,11 +457,6 @@ const PaymentLogs = () => {
     );
   };
 
-  const getUniqueStatuses = () => {
-    const statuses = [...new Set(payments.map(p => p.status).filter(Boolean))];
-    return statuses.sort();
-  };
-
   const getUniquePaymentMethods = () => {
     const methods = [...new Set(payments.map(p => p.payment_method).filter(Boolean))];
     return methods.sort();
@@ -296,15 +466,29 @@ const PaymentLogs = () => {
     const matchesSearch = !searchTerm || 
       payment.invoice_description?.toLowerCase().includes(searchTerm.toLowerCase()) ||
       payment.student_name?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      payment.invoice_issued_by_name?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      payment.invoice_issued_by_email?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      payment.returned_by_name?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      payment.invoice_ar_number?.toLowerCase().includes(searchTerm.toLowerCase()) ||
       payment.reference_number?.toLowerCase().includes(searchTerm.toLowerCase()) ||
       payment.payment_id?.toString().includes(searchTerm);
     
     const matchesBranch = !filterBranch || payment.branch_id?.toString() === filterBranch;
-    const matchesStatus = !filterStatus || payment.status === filterStatus;
+    const matchesFinanceApproval =
+      branchLogTab === 'return' ||
+      !filterFinanceApproval ||
+      (filterFinanceApproval === 'approved' &&
+        (payment.approval_status || 'Pending') === 'Approved') ||
+      (filterFinanceApproval === 'pending' &&
+        (payment.approval_status || 'Pending') !== 'Approved');
     const matchesPaymentMethod = !filterPaymentMethod || payment.payment_method === filterPaymentMethod;
     
-    return matchesSearch && matchesBranch && matchesStatus && matchesPaymentMethod;
+    return matchesSearch && matchesBranch && matchesFinanceApproval && matchesPaymentMethod;
   });
+  const filteredTotalAmount = filteredPayments.reduce(
+    (sum, payment) => sum + (parseFloat(payment.payable_amount) || 0),
+    0
+  );
 
   const handleExportClick = () => {
     setSelectedExportBranches([]);
@@ -346,6 +530,18 @@ const PaymentLogs = () => {
         if (branchId) params.set('branch_id', String(branchId));
         if (filterIssueDateFrom) params.set('issue_date_from', filterIssueDateFrom);
         if (filterIssueDateTo) params.set('issue_date_to', filterIssueDateTo);
+        if (branchLogTab === 'return') {
+          params.set('approval_status', 'Returned');
+        } else if (filterFinanceApproval === 'approved') {
+          params.set('status', 'Completed');
+          params.set('approval_status', 'Approved');
+          params.set('exclude_approval_status', 'Returned');
+        } else if (filterFinanceApproval === 'pending') {
+          params.set('status', 'Completed');
+          params.set('exclude_approval_status', 'Approved,Returned');
+        } else {
+          params.set('exclude_approval_status', 'Returned');
+        }
         return apiRequest(`/payments?${params.toString()}`);
       };
 
@@ -369,46 +565,45 @@ const PaymentLogs = () => {
       allPayments = results.flat();
 
       if (allPayments.length === 0) {
-        alert('No payment records found to export.');
+        appAlert('No payment records found to export.');
         setExportLoading(false);
         return;
       }
 
       // Prepare data for Excel
-      const excelData = allPayments.map(payment => ({
-        'Invoice ID': payment.invoice_id ? `INV-${payment.invoice_id}` : '-',
-        'Invoice Description': payment.invoice_description || '-',
-        'Student Name': payment.student_name || 'N/A',
-        'Student Email': payment.student_email || '-',
-        'Payment Method': payment.payment_method || '-',
-        'Payment Type': payment.payment_type || '-',
-        'Amount (₱)': payment.payable_amount ? parseFloat(payment.payable_amount).toFixed(2) : '0.00',
-        'Status': payment.status || 'N/A',
-        'Branch': getBranchName(payment.branch_id) || payment.branch_name || 'N/A',
-        'Issue Date': payment.issue_date ? formatDate(payment.issue_date) : '-',
-        'Reference Number': payment.reference_number || '-',
-        'Remarks': payment.remarks || '-',
-      }));
+      const excelData = allPayments.map((payment) => {
+        const row = {
+          'Invoice ID': payment.invoice_id ? `INV-${payment.invoice_id}` : '-',
+          'Invoice Description': payment.invoice_description || '-',
+          'Student Name': payment.student_name || 'N/A',
+          'Student Email': payment.student_email || '-',
+          'Issued by': formatInvoiceIssuedBy(payment),
+        };
+        if (branchLogTab === 'return') {
+          row['Returned by'] = payment.returned_by_name || '-';
+        }
+        row['Payment Method'] = payment.payment_method || '-';
+        row['Package/Item'] = payment.invoice_description || '-';
+        row['Level Tag'] = payment.student_level_tag || '-';
+        row['Amount (₱)'] = payment.payable_amount ? parseFloat(payment.payable_amount).toFixed(2) : '0.00';
+        row['Status'] = payment.status || 'N/A';
+        row['Branch'] = getBranchName(payment.branch_id) || payment.branch_name || 'N/A';
+        row['Issue Date'] = payment.issue_date ? formatDate(payment.issue_date) : '-';
+        row['AR#'] = payment.invoice_ar_number || '-';
+        row['Reference Number'] = payment.reference_number || '-';
+        row['Remarks'] = payment.remarks || '-';
+        return row;
+      });
 
       // Create workbook and worksheet
       const wb = XLSX.utils.book_new();
       const ws = XLSX.utils.json_to_sheet(excelData);
 
       // Set column widths
-      ws['!cols'] = [
-        { wch: 12 },  // Invoice ID
-        { wch: 30 },  // Invoice Description
-        { wch: 25 },  // Student Name
-        { wch: 30 },  // Student Email
-        { wch: 18 },  // Payment Method
-        { wch: 18 },  // Payment Type
-        { wch: 15 },  // Amount
-        { wch: 12 },  // Status
-        { wch: 25 },  // Branch
-        { wch: 15 },  // Issue Date
-        { wch: 20 },  // Reference Number
-        { wch: 30 },  // Remarks
-      ];
+      const widthList = [12, 30, 25, 30, 22];
+      if (branchLogTab === 'return') widthList.push(22);
+      widthList.push(18, 18, 15, 12, 25, 15, 10, 20, 30);
+      ws['!cols'] = widthList.map((wch) => ({ wch }));
 
       // Add worksheet to workbook
       XLSX.utils.book_append_sheet(wb, ws, 'Payment Logs');
@@ -427,7 +622,7 @@ const PaymentLogs = () => {
       setExportLoading(false);
     } catch (error) {
       console.error('Export error:', error);
-      alert('Failed to export payment logs. Please try again.');
+      appAlert('Failed to export payment logs. Please try again.');
       setExportLoading(false);
     }
   };
@@ -443,15 +638,19 @@ const PaymentLogs = () => {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-        <div>
-          <h1 className="text-2xl sm:text-3xl font-bold text-gray-900">Payment Logs</h1>
-          <p className="text-sm text-gray-500 mt-1">View and manage all payment records</p>
+      <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+        <div className="min-w-0">
+          <h1 className="text-xl sm:text-2xl font-bold text-gray-900">Payment Logs</h1>
+          <p className="mt-1 text-sm text-gray-600 max-w-2xl">
+            View and manage all payment records. Use the <span className="font-medium text-gray-800">Return</span> tab for
+            items Finance sent back when the reference did not match the attachment — update details, then resubmit for
+            verification.
+          </p>
         </div>
         <button
+          type="button"
           onClick={handleExportClick}
-          className="flex items-center justify-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
+          className="flex shrink-0 items-center justify-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
         >
           <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
@@ -460,11 +659,11 @@ const PaymentLogs = () => {
         </button>
       </div>
 
+      <BranchPaymentLogTabs value={branchLogTab} onChange={setBranchLogTab} />
+
       {/* Error Message */}
       {error && (
-        <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">
-          {error}
-        </div>
+        <div className="rounded-lg bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-700">{error}</div>
       )}
 
       {/* Payment Logs List */}
@@ -512,23 +711,50 @@ const PaymentLogs = () => {
             Inclusive range on payment date. Leave both empty for all dates.
           </p>
         </div>
-          {/* Table fits viewport - no horizontal scroll; compact responsive layout */}
-          <div className="rounded-lg overflow-hidden">
-            <table className="divide-y divide-gray-200 w-full" style={{ tableLayout: 'fixed' }}>
-              <colgroup>
-                <col style={{ width: '12%' }} />
-                <col style={{ width: '14%' }} />
-                <col style={{ width: '9%' }} />
-                <col style={{ width: '8%' }} />
-                <col style={{ width: '8%' }} />
-                <col style={{ width: '14%' }} />
-                <col style={{ width: '12%' }} />
-                <col style={{ width: '9%' }} />
-                <col style={{ width: '14%' }} />
-              </colgroup>
+          <div className="mb-2 px-1">
+            <p className="text-sm font-semibold text-gray-700">
+              Total Amount: <span className="text-emerald-700">₱{filteredTotalAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+            </p>
+          </div>
+          <div className="rounded-lg overflow-x-auto">
+            <table className="divide-y divide-gray-200 w-full" style={{ tableLayout: 'fixed', minWidth: '1360px' }}>
+              {branchLogTab === 'return' ? (
+                <colgroup>
+                  <col style={{ width: '8%' }} />
+                  <col style={{ width: '9%' }} />
+                  <col style={{ width: '9%' }} />
+                  <col style={{ width: '7%' }} />
+                  <col style={{ width: '6%' }} />
+                  <col style={{ width: '6%' }} />
+                  <col style={{ width: '10%' }} />
+                  <col style={{ width: '8%' }} />
+                  <col style={{ width: '8%' }} />
+                  <col style={{ width: '8%' }} />
+                  <col style={{ width: '6%' }} />
+                  <col style={{ width: '5%' }} />
+                  <col style={{ width: '12%' }} />
+                  <col style={{ width: '8%' }} />
+                </colgroup>
+              ) : (
+                <colgroup>
+                  <col style={{ width: '9%' }} />
+                  <col style={{ width: '10%' }} />
+                  <col style={{ width: '9%' }} />
+                  <col style={{ width: '8%' }} />
+                  <col style={{ width: '7%' }} />
+                  <col style={{ width: '7%' }} />
+                  <col style={{ width: '12%' }} />
+                  <col style={{ width: '8%' }} />
+                  <col style={{ width: '8%' }} />
+                  <col style={{ width: '8%' }} />
+                  <col style={{ width: '6%' }} />
+                  <col style={{ width: '11%' }} />
+                  <col style={{ width: '8%' }} />
+                </colgroup>
+              )}
               <thead className="bg-gray-50 table-header-stable">
                 <tr>
-                  <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-[12%]">
+                  <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-[11%]">
                     <div className="flex flex-col space-y-2 max-w-[160px]">
                       <div className="flex items-center space-x-1 min-h-[6px]">
                         <span className={`inline-block w-1.5 h-1.5 rounded-full flex-shrink-0 ${searchTerm ? 'bg-primary-600' : 'invisible'}`} aria-hidden />
@@ -558,8 +784,20 @@ const PaymentLogs = () => {
                       </div>
                     </div>
                   </th>
-                  <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-[14%]">
-                    STUDENT
+                  <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-[11%]">
+                    Branch
+                  </th>
+                  <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-[8%]">
+                    Date
+                  </th>
+                  <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-[13%]">
+                    Student Name
+                  </th>
+                  <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    <span className="leading-tight">package/<br />item</span>
+                  </th>
+                  <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Level Tag
                   </th>
                   <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-[9%]">
                     <div className="relative payment-method-filter-dropdown">
@@ -585,53 +823,65 @@ const PaymentLogs = () => {
                     </div>
                   </th>
                   <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-[8%]">
-                    TYPE
+                    AMOUNT
                   </th>
                   <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-[8%]">
-                    AMOUNT
+                    TOTAL AMOUNT
                   </th>
                   <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-[14%]">
                     <div className="relative status-filter-dropdown">
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          const rect = e.currentTarget.getBoundingClientRect();
-                          setStatusDropdownRect(rect);
-                          setOpenStatusDropdown(!openStatusDropdown);
-                          setOpenPaymentMethodDropdown(false);
-                          setPaymentMethodDropdownRect(null);
-                          setOpenBranchDropdown(false);
-                          setBranchDropdownRect(null);
-                        }}
-                        className="flex items-center space-x-1 hover:text-gray-700"
-                      >
-                        <span>Payment Status</span>
-                        {filterStatus && (
-                          <span className="inline-flex items-center justify-center w-1.5 h-1.5 bg-primary-600 rounded-full"></span>
-                        )}
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                        </svg>
-                      </button>
+                      {branchLogTab === 'return' ? (
+                        <span className="inline-flex items-center space-x-1 text-gray-500">Return status</span>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const rect = e.currentTarget.getBoundingClientRect();
+                            setStatusDropdownRect(rect);
+                            setOpenStatusDropdown(!openStatusDropdown);
+                            setOpenPaymentMethodDropdown(false);
+                            setPaymentMethodDropdownRect(null);
+                            setOpenBranchDropdown(false);
+                            setBranchDropdownRect(null);
+                          }}
+                          className="flex items-center space-x-1 hover:text-gray-700"
+                        >
+                          <span title="Finance approval — same as Financial Dashboard verified / unverified">
+                            Status
+                          </span>
+                          {filterFinanceApproval ? (
+                            <span className="inline-flex items-center justify-center w-1.5 h-1.5 bg-primary-600 rounded-full" aria-hidden />
+                          ) : null}
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                          </svg>
+                        </button>
+                      )}
                     </div>
                   </th>
-                  <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-[12%]">
-                    <span>Branch</span>
-                  </th>
-                  <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-[9%]">
-                    DATE
-                  </th>
-                  <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-[14%]">
+                  {branchLogTab === 'return' ? (
+                    <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Returned by
+                    </th>
+                  ) : null}
+                  <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-[11%]">
                     REFERENCE
+                  </th>
+                  <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-[7%]">
+                    AR#
+                  </th>
+                  <th className="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Issued By
                   </th>
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-200">
                 {filteredPayments.length === 0 ? (
                   <tr>
-                    <td colSpan={9} className="px-6 py-12 text-center">
+                    <td colSpan={branchLogTab === 'return' ? 14 : 13} className="px-6 py-12 text-center">
                       <p className="text-gray-500">
-                        {searchTerm || filterBranch || filterStatus || filterPaymentMethod
+                        {searchTerm || filterBranch || filterFinanceApproval || filterPaymentMethod
                           ? 'No matching payments. Try adjusting your search or filters.'
                           : 'No payment records yet.'}
                       </p>
@@ -643,6 +893,27 @@ const PaymentLogs = () => {
                     <td className="px-3 py-2.5 whitespace-nowrap text-sm font-semibold text-gray-900 min-w-0">
                       {payment.invoice_id ? `INV-${payment.invoice_id}` : '-'}
                     </td>
+                    <td className="px-3 py-2.5 text-sm text-gray-900 align-top min-w-0">
+                      {(() => {
+                        const branchName = getBranchName(payment.branch_id) || payment.branch_name || 'N/A';
+                        if (!branchName || branchName === 'N/A') {
+                          return <span className="text-gray-400">-</span>;
+                        }
+                        const formatted = formatBranchName(branchName);
+                        const fullText = formatted.location ? `${formatted.company} - ${formatted.location}` : formatted.company;
+                        return (
+                          <div className="flex flex-col leading-tight min-w-0">
+                            <span className="font-medium truncate" title={fullText}>{formatted.company}</span>
+                            {formatted.location && (
+                              <span className="text-xs text-gray-500 truncate" title={formatted.location}>{formatted.location}</span>
+                            )}
+                          </div>
+                        );
+                      })()}
+                    </td>
+                    <td className="px-3 py-2.5 whitespace-nowrap text-sm text-gray-500 min-w-0">
+                      {formatDate(payment.issue_date)}
+                    </td>
                     <td className="px-3 py-2.5 text-sm text-gray-900 min-w-0">
                       <div className="flex flex-col min-w-0">
                         <span className="font-medium truncate" title={payment.student_name || 'N/A'}>{payment.student_name || 'N/A'}</span>
@@ -651,18 +922,38 @@ const PaymentLogs = () => {
                         )}
                       </div>
                     </td>
+                    <td className="px-3 py-2.5 text-sm text-gray-800 min-w-0">
+                      <span className="truncate block" title={payment.invoice_description || '-'}>
+                        {payment.invoice_description || '-'}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2.5 text-sm text-gray-700 min-w-0">
+                      <span className="truncate block" title={payment.student_level_tag || '-'}>
+                        {payment.student_level_tag || '-'}
+                      </span>
+                    </td>
                     <td className="px-3 py-2.5 whitespace-nowrap text-sm min-w-0">
                       {getPaymentMethodBadge(payment.payment_method)}
-                    </td>
-                    <td className="px-3 py-2.5 whitespace-nowrap text-sm text-gray-900 min-w-0">
-                      {payment.payment_type || '-'}
                     </td>
                     <td className="px-3 py-2.5 whitespace-nowrap text-sm font-semibold text-green-600 min-w-0">
                       {formatCurrency(payment.payable_amount)}
                     </td>
+                    <td className="px-3 py-2.5 whitespace-nowrap text-sm font-semibold text-emerald-700 min-w-0">
+                      {formatCurrency((parseFloat(payment.payable_amount) || 0) + (parseFloat(payment.tip_amount) || 0))}
+                    </td>
                     <td className="px-3 py-2.5 text-sm payment-status-cell align-top min-w-0 overflow-hidden">
                       <div className="min-w-0 max-w-full">
-                        {approvalLoadingId === payment.payment_id ? (
+                        {branchLogTab === 'return' ? (
+                          <div className="space-y-1">
+                            <button
+                              type="button"
+                              onClick={() => openReturnFixModal(payment)}
+                              className="text-xs font-semibold text-primary-700 hover:text-primary-900 underline"
+                            >
+                              Update reference and resubmit
+                            </button>
+                          </div>
+                        ) : approvalLoadingId === payment.payment_id ? (
                           <span className="text-gray-400 text-xs">Updating...</span>
                         ) : (() => {
                           const isApproved = (payment.approval_status || 'Pending') === 'Approved';
@@ -709,29 +1000,25 @@ const PaymentLogs = () => {
                         })()}
                       </div>
                     </td>
-                    <td className="px-3 py-2.5 text-sm text-gray-900 align-top min-w-0">
-                      {(() => {
-                        const branchName = getBranchName(payment.branch_id) || payment.branch_name || 'N/A';
-                        if (!branchName || branchName === 'N/A') {
-                          return <span className="text-gray-400">-</span>;
-                        }
-                        const formatted = formatBranchName(branchName);
-                        const fullText = formatted.location ? `${formatted.company} - ${formatted.location}` : formatted.company;
-                        return (
-                          <div className="flex flex-col leading-tight min-w-0">
-                            <span className="font-medium truncate" title={fullText}>{formatted.company}</span>
-                            {formatted.location && (
-                              <span className="text-xs text-gray-500 truncate" title={formatted.location}>{formatted.location}</span>
-                            )}
-                          </div>
-                        );
-                      })()}
-                    </td>
-                    <td className="px-3 py-2.5 whitespace-nowrap text-sm text-gray-500 min-w-0">
-                      {formatDate(payment.issue_date)}
-                    </td>
+                    {branchLogTab === 'return' ? (
+                      <td className="px-3 py-2.5 text-sm text-gray-800 align-top min-w-0">
+                        <span className="truncate block" title={payment.returned_by_name || ''}>
+                          {payment.returned_by_name || '—'}
+                        </span>
+                      </td>
+                    ) : null}
                     <td className="px-3 py-2.5 text-sm text-gray-500 min-w-0">
                       <span className="truncate block" title={payment.reference_number || '-'}>{payment.reference_number || '-'}</span>
+                    </td>
+                    <td className="px-3 py-2.5 text-sm text-gray-600 min-w-0">
+                      <span className="truncate block" title={payment.invoice_ar_number || ''}>
+                        {payment.invoice_ar_number || '—'}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2.5 text-sm text-gray-800 min-w-0">
+                      <span className="truncate block" title={formatInvoiceIssuedBy(payment)}>
+                        {formatInvoiceIssuedBy(payment)}
+                      </span>
                     </td>
                   </tr>
                 ))
@@ -798,14 +1085,14 @@ const PaymentLogs = () => {
         document.body
       )}
 
-      {/* Status filter dropdown - portaled to avoid table overflow clipping */}
-      {openStatusDropdown && statusDropdownRect && createPortal(
+      {/* Approval filter (finance verification) — portaled to avoid table overflow clipping */}
+      {branchLogTab === 'main' && openStatusDropdown && statusDropdownRect && createPortal(
         <div
-          className="fixed status-filter-dropdown-portal w-48 bg-white rounded-md shadow-lg z-[100] border border-gray-200 max-h-60 overflow-y-auto py-1"
+          className="fixed status-filter-dropdown-portal w-52 bg-white rounded-md shadow-lg z-[100] border border-gray-200 max-h-60 overflow-y-auto py-1"
           style={{
             top: `${statusDropdownRect.bottom + 4}px`,
             left: `${statusDropdownRect.left}px`,
-            minWidth: `${Math.max(statusDropdownRect.width, 192)}px`,
+            minWidth: `${Math.max(statusDropdownRect.width, 208)}px`,
           }}
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
@@ -814,33 +1101,44 @@ const PaymentLogs = () => {
             type="button"
             onClick={(e) => {
               e.stopPropagation();
-              setFilterStatus('');
+              setFilterFinanceApproval('');
               setOpenStatusDropdown(false);
               setStatusDropdownRect(null);
             }}
             className={`block w-full text-left px-4 py-2 text-xs hover:bg-gray-100 ${
-              !filterStatus ? 'bg-gray-100 font-medium' : 'text-gray-700'
+              !filterFinanceApproval ? 'bg-gray-100 font-medium' : 'text-gray-700'
             }`}
           >
-            All Statuses
+            All approvals
           </button>
-          {getUniqueStatuses().map((status) => (
-            <button
-              key={status}
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                setFilterStatus(status);
-                setOpenStatusDropdown(false);
-                setStatusDropdownRect(null);
-              }}
-              className={`block w-full text-left px-4 py-2 text-xs hover:bg-gray-100 ${
-                filterStatus === status ? 'bg-gray-100 font-medium' : 'text-gray-700'
-              }`}
-            >
-              {status}
-            </button>
-          ))}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setFilterFinanceApproval('approved');
+              setOpenStatusDropdown(false);
+              setStatusDropdownRect(null);
+            }}
+            className={`block w-full text-left px-4 py-2 text-xs hover:bg-gray-100 ${
+              filterFinanceApproval === 'approved' ? 'bg-gray-100 font-medium' : 'text-gray-700'
+            }`}
+          >
+            Approved (verified)
+          </button>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setFilterFinanceApproval('pending');
+              setOpenStatusDropdown(false);
+              setStatusDropdownRect(null);
+            }}
+            className={`block w-full text-left px-4 py-2 text-xs hover:bg-gray-100 ${
+              filterFinanceApproval === 'pending' ? 'bg-gray-100 font-medium' : 'text-gray-700'
+            }`}
+          >
+            Pending approval
+          </button>
         </div>,
         document.body
       )}
@@ -899,6 +1197,7 @@ const PaymentLogs = () => {
                     onChange={(e) => setReferenceModalInput(e.target.value)}
                     className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
                     placeholder="Enter reference number (e.g. cash voucher, receipt no.)"
+                    required
                   />
                 </div>
                 <div className="flex justify-end gap-3">
@@ -925,48 +1224,161 @@ const PaymentLogs = () => {
         document.body
       )}
 
-      {/* Attachment viewer modal (portaled so overlay covers header) */}
-      {showAttachmentViewer && attachmentViewerUrl && createPortal(
+      {/* Returned payment: fix reference / attachment and resubmit (portaled) */}
+      {returnFixPayment && createPortal(
         <div
           className="fixed inset-0 z-[9999] flex items-center justify-center backdrop-blur-sm bg-black/5 p-4"
-          onClick={() => { setShowAttachmentViewer(false); setAttachmentViewerUrl(null); }}
+          onClick={closeReturnFixModal}
         >
           <div
-            className="bg-white rounded-lg shadow-xl w-full max-w-4xl max-h-[90vh] flex flex-col"
+            className="bg-white rounded-lg shadow-xl w-full max-w-lg max-h-[90vh] overflow-y-auto"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex justify-between items-center px-4 py-2 border-b border-gray-200">
-              <span className="text-sm font-medium text-gray-700">Payment attachment</span>
-              <button
-                type="button"
-                onClick={() => { setShowAttachmentViewer(false); setAttachmentViewerUrl(null); }}
-                className="p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-md"
-                aria-label="Close"
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            <div className="flex-1 min-h-0 p-4 overflow-auto flex items-center justify-center">
-              {/\.(jpe?g|png|gif|webp|bmp)(\?|$)/i.test(attachmentViewerUrl) ? (
-                <img
-                  src={attachmentViewerUrl}
-                  alt="Payment attachment"
-                  className="max-w-full max-h-[75vh] w-auto object-contain rounded-lg"
-                />
-              ) : (
-                <iframe
-                  src={attachmentViewerUrl}
-                  title="Payment attachment"
-                  className="w-full min-h-[70vh] border-0 rounded-lg bg-gray-100"
-                />
+            <div className="p-6">
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="text-xl font-semibold text-gray-900">Fix &amp; resubmit for verification</h2>
+                <button
+                  type="button"
+                  onClick={closeReturnFixModal}
+                  className="text-gray-400 hover:text-gray-600"
+                  disabled={returnFixLoading}
+                >
+                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+              <p className="text-sm text-gray-600 mb-2">
+                INV-{returnFixPayment.invoice_id} · {returnFixPayment.student_name || 'N/A'}
+              </p>
+              {returnFixPayment.return_reason && (
+                <div className="mb-4 rounded-md bg-amber-50 border border-amber-100 px-3 py-2 text-sm text-amber-900">
+                  <span className="font-medium">Finance note: </span>
+                  {returnFixPayment.return_reason}
+                </div>
               )}
+              <form onSubmit={submitReturnFix}>
+                <div className="mb-4">
+                  <label htmlFor="return_fix_payment_method" className="block text-sm font-medium text-gray-700 mb-2">
+                    Payment method
+                  </label>
+                  <p className="text-xs text-gray-500 mb-2">
+                    Change this if it does not match your proof of payment (for example cash vs online banking).
+                  </p>
+                  <select
+                    id="return_fix_payment_method"
+                    value={returnFixPaymentMethod}
+                    onChange={(e) => setReturnFixPaymentMethod(e.target.value)}
+                    disabled={returnFixLoading || returnFixAttachmentUploading}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500 bg-white text-sm"
+                  >
+                    {getReturnFixPaymentMethodOptions(returnFixPaymentMethod).map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="mb-4">
+                  <label htmlFor="return_fix_issue_date" className="block text-sm font-medium text-gray-700 mb-2">
+                    Payment date
+                  </label>
+                  <p className="text-xs text-gray-500 mb-2">
+                    Update the payment date to match the actual receipt date before resubmitting.
+                  </p>
+                  <input
+                    id="return_fix_issue_date"
+                    type="date"
+                    value={returnFixIssueDate}
+                    onChange={(e) => setReturnFixIssueDate(e.target.value)}
+                    disabled={returnFixLoading || returnFixAttachmentUploading}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                    required
+                  />
+                </div>
+                <div className="mb-4">
+                  <label className="block text-sm font-medium text-gray-700 mb-2">Reference number</label>
+                  <input
+                    type="text"
+                    value={returnFixRef}
+                    onChange={(e) => setReturnFixRef(e.target.value)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                    placeholder="Match the value on the receipt image"
+                  />
+                </div>
+                <div className="mb-6">
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Proof of payment (image)</label>
+                  <p className="text-xs text-gray-500 mb-2">
+                    Upload a new receipt or proof if you are replacing the image (JPEG, PNG, WebP, or GIF, max 5MB).
+                  </p>
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp,image/gif"
+                    onChange={handleReturnFixAttachmentChange}
+                    disabled={returnFixLoading || returnFixAttachmentUploading}
+                    className="block w-full text-sm text-gray-600 file:mr-3 file:py-2 file:px-3 file:rounded-md file:border-0 file:bg-gray-100 file:text-gray-700 hover:file:bg-gray-200"
+                  />
+                  {returnFixAttachmentUploading && (
+                    <p className="text-xs text-amber-600 mt-2">Uploading image…</p>
+                  )}
+                  {returnFixAttachment && !returnFixAttachmentUploading && (
+                    <div className="mt-3 flex flex-col sm:flex-row sm:items-start gap-3">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAttachmentViewerUrl(returnFixAttachment);
+                          setShowAttachmentViewer(true);
+                        }}
+                        className="shrink-0 rounded-lg border border-gray-200 overflow-hidden focus:outline-none focus:ring-2 focus:ring-primary-500"
+                      >
+                        <img
+                          src={returnFixAttachment}
+                          alt="Proof of payment preview"
+                          className="max-h-36 w-auto max-w-full object-contain"
+                        />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={clearReturnFixAttachment}
+                        className="text-sm font-medium text-red-600 hover:text-red-800 self-start"
+                      >
+                        Remove image
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-3">
+                  <button
+                    type="button"
+                    onClick={closeReturnFixModal}
+                    className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-md"
+                    disabled={returnFixLoading || returnFixAttachmentUploading}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="px-4 py-2 text-sm font-medium text-white bg-primary-600 hover:bg-primary-700 rounded-md disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled={returnFixLoading || returnFixAttachmentUploading}
+                  >
+                    {returnFixLoading ? 'Saving...' : 'Save & resubmit to Finance'}
+                  </button>
+                </div>
+              </form>
             </div>
           </div>
         </div>,
         document.body
       )}
+
+      <PaymentAttachmentViewerModal
+        open={showAttachmentViewer && Boolean(attachmentViewerUrl)}
+        url={attachmentViewerUrl}
+        onClose={() => {
+          setShowAttachmentViewer(false);
+          setAttachmentViewerUrl(null);
+        }}
+      />
 
       {/* Payment Status approval dropdown - portaled */}
       {openApprovalMenuId && createPortal(

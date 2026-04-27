@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import Header from '../../components/Header';
 import Sidebar from '../../components/Sidebar';
-import { fetchFuntalk } from '../../lib/api';
+import { API_BASE_URL } from '@/config/api.js';
+import Pagination from '../../components/Pagination.jsx';
 
 const Credits = () => {
   const navigate = useNavigate();
@@ -13,7 +14,8 @@ const Credits = () => {
   const [transactions, setTransactions] = useState([]);
   const [isFetching, setIsFetching] = useState(false);
   const [activeTab, setActiveTab] = useState('balances'); // 'balances' or 'transactions'
-  const [transactionTypeFilter, setTransactionTypeFilter] = useState('');
+  const [balancesPage, setBalancesPage] = useState(1);
+  const [transactionsPage, setTransactionsPage] = useState(1);
 
   useEffect(() => {
     const token = localStorage.getItem('token');
@@ -45,12 +47,17 @@ const Credits = () => {
       fetchBalances();
       fetchTransactions();
     }
-  }, [user, transactionTypeFilter]);
+  }, [user]);
 
   const fetchBalances = async () => {
     setIsFetching(true);
     try {
-      const response = await fetchFuntalk('/credits/balance', {});
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/credits/balance`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.balances) {
@@ -69,11 +76,12 @@ const Credits = () => {
 
   const fetchTransactions = async () => {
     try {
-      const params = new URLSearchParams();
-      if (transactionTypeFilter) params.append('transactionType', transactionTypeFilter);
-      const qs = params.toString();
-      const path = qs ? `/credits/transactions?${qs}` : '/credits/transactions';
-      const response = await fetchFuntalk(path, {});
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/credits/transactions`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.transactions) {
@@ -89,8 +97,24 @@ const Credits = () => {
   };
 
   // Calculate totals
-  const totalBalance = balances.reduce((sum, b) => sum + (parseInt(b.current_balance) || 0), 0);
-  const totalUsers = balances.length;
+  const unsettledBalances = balances.filter((b) => Number(b.display_balance) > 0);
+  const totalBalance = unsettledBalances.reduce((sum, b) => sum + (Number(b.display_balance) || 0), 0);
+  const totalUnsettledTransactions = unsettledBalances.length;
+  const totalSettledTransactions = transactions.length;
+
+  useEffect(() => {
+    setBalancesPage(1);
+    setTransactionsPage(1);
+  }, [activeTab, balances.length, transactions.length]);
+
+  const pageSize = 10;
+  const pagedBalances = unsettledBalances.slice((balancesPage - 1) * pageSize, balancesPage * pageSize);
+  const pagedTransactions = transactions.slice((transactionsPage - 1) * pageSize, transactionsPage * pageSize);
+
+  const formatCurrency = (value) => {
+    const n = Number(value || 0);
+    return `${'NT$'}${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  };
 
   // Format date
   const formatDate = (dateString) => {
@@ -105,26 +129,20 @@ const Credits = () => {
     });
   };
 
-  // Format transaction type
-  const formatTransactionType = (type) => {
+  // Format settled transaction type
+  const formatSettlementType = (type) => {
     const types = {
-      purchase: 'Purchase',
-      deduction: 'Deduction',
-      refund: 'Refund',
-      adjustment: 'Adjustment',
-      expired: 'Expired',
+      full_payment_paid: 'Full Payment',
+      installment_fully_paid: 'Installment Completed',
     };
     return types[type] || type;
   };
 
-  // Get transaction type color
-  const getTransactionTypeColor = (type) => {
+  // Get settled transaction type color
+  const getSettlementTypeColor = (type) => {
     const colors = {
-      purchase: 'bg-green-100 text-green-800',
-      deduction: 'bg-red-100 text-red-800',
-      refund: 'bg-blue-100 text-blue-800',
-      adjustment: 'bg-yellow-100 text-yellow-800',
-      expired: 'bg-gray-100 text-gray-800',
+      full_payment_paid: 'bg-green-100 text-green-800',
+      installment_fully_paid: 'bg-blue-100 text-blue-800',
     };
     return colors[type] || 'bg-gray-100 text-gray-800';
   };
@@ -157,7 +175,7 @@ const Credits = () => {
               {/* Page Header */}
               <div>
                 <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold text-gray-900">Credits</h1>
-                <p className="mt-1 sm:mt-2 text-xs sm:text-sm md:text-base text-gray-600">View credit balances and transaction history</p>
+                <p className="mt-1 sm:mt-2 text-xs sm:text-sm md:text-base text-gray-600">View credit balances and settled transactions</p>
               </div>
 
               {/* Summary Cards */}
@@ -173,7 +191,7 @@ const Credits = () => {
                     </div>
                     <div className="ml-4 flex-1">
                       <p className="text-xs sm:text-sm font-medium text-gray-500">Total Balance</p>
-                      <p className="text-xl sm:text-2xl font-bold text-gray-900">{totalBalance.toLocaleString()}</p>
+                      <p className="text-xl sm:text-2xl font-bold text-gray-900">{formatCurrency(totalBalance)}</p>
                     </div>
                   </div>
                 </div>
@@ -188,8 +206,8 @@ const Credits = () => {
                       </div>
                     </div>
                     <div className="ml-4 flex-1">
-                      <p className="text-xs sm:text-sm font-medium text-gray-500">Total Users</p>
-                      <p className="text-xl sm:text-2xl font-bold text-gray-900">{totalUsers}</p>
+                      <p className="text-xs sm:text-sm font-medium text-gray-500">Total Unsettled Transactions</p>
+                      <p className="text-xl sm:text-2xl font-bold text-gray-900">{totalUnsettledTransactions}</p>
                     </div>
                   </div>
                 </div>
@@ -204,8 +222,8 @@ const Credits = () => {
                       </div>
                     </div>
                     <div className="ml-4 flex-1">
-                      <p className="text-xs sm:text-sm font-medium text-gray-500">Total Transactions</p>
-                      <p className="text-xl sm:text-2xl font-bold text-gray-900">{transactions.length}</p>
+                      <p className="text-xs sm:text-sm font-medium text-gray-500">Total Settled Transactions</p>
+                      <p className="text-xl sm:text-2xl font-bold text-gray-900">{totalSettledTransactions}</p>
                     </div>
                   </div>
                 </div>
@@ -233,7 +251,7 @@ const Credits = () => {
                           : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
                       }`}
                     >
-                      Transaction History
+                      Settled Transactions
                     </button>
                   </nav>
                 </div>
@@ -247,28 +265,30 @@ const Credits = () => {
                           <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-primary-600 mx-auto"></div>
                           <p className="mt-3 text-sm text-gray-600">Loading balances...</p>
                         </div>
-                      ) : balances.length === 0 ? (
+                      ) : unsettledBalances.length === 0 ? (
                         <div className="p-8 text-center">
                           <svg className="mx-auto h-12 w-12 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                           </svg>
-                          <h3 className="mt-3 text-base font-medium text-gray-900">No balances found</h3>
-                          <p className="mt-1 text-sm text-gray-600">No credit balances available</p>
+                          <h3 className="mt-3 text-base font-medium text-gray-900">No unsettled balances found</h3>
+                          <p className="mt-1 text-sm text-gray-600">All balances are settled</p>
                         </div>
                       ) : (
+                        <>
                         <div className="overflow-x-auto overflow-hidden">
                           <table className="w-full divide-y divide-gray-200" style={{ minWidth: '900px' }}>
                             <thead className="bg-gray-50">
                               <tr>
-                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">User</th>
-                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden lg:table-cell">Email</th>
-                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Role</th>
-                                <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Balance</th>
-                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden md:table-cell">Last Updated</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">User</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider hidden lg:table-cell">Email</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Role</th>
+                                <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 tracking-wider">Credits</th>
+                                <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 tracking-wider">Balance</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Last Updated</th>
                               </tr>
                             </thead>
                             <tbody className="bg-white divide-y divide-gray-200">
-                              {balances.map((balance) => (
+                              {pagedBalances.map((balance) => (
                                 <tr key={balance.credit_id} className="hover:bg-gray-50">
                                   <td className="px-6 py-4 whitespace-nowrap">
                                     <div className="text-sm font-medium text-gray-900">{balance.user_name || 'N/A'}</div>
@@ -282,9 +302,14 @@ const Credits = () => {
                                     </span>
                                   </td>
                                   <td className="px-6 py-4 whitespace-nowrap text-right">
-                                    <div className="text-sm font-bold text-gray-900">{(parseInt(balance.current_balance) || 0).toLocaleString()}</div>
+                                    <div className="text-sm font-medium text-gray-900">
+                                      {(Number(balance.total_credits) || 0).toLocaleString()}
+                                    </div>
                                   </td>
-                                  <td className="px-6 py-4 whitespace-nowrap hidden md:table-cell">
+                                  <td className="px-6 py-4 whitespace-nowrap text-right">
+                                    <div className="text-sm font-bold text-gray-900">{formatCurrency(Number(balance.display_balance) || 0)}</div>
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap">
                                     <div className="text-sm text-gray-500">{formatDate(balance.last_updated)}</div>
                                   </td>
                                 </tr>
@@ -292,77 +317,65 @@ const Credits = () => {
                             </tbody>
                           </table>
                         </div>
+                        <div className="mt-3">
+                          <Pagination
+                            totalItems={unsettledBalances.length}
+                            pageSize={pageSize}
+                            currentPage={balancesPage}
+                            onPageChange={setBalancesPage}
+                          />
+                        </div>
+                        </>
                       )}
                     </div>
                   ) : (
                     <div>
-                      {/* Transaction Type Filter */}
-                      <div className="mb-4">
-                        <select
-                          value={transactionTypeFilter}
-                          onChange={(e) => setTransactionTypeFilter(e.target.value)}
-                          className="px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
-                        >
-                          <option value="">All Transaction Types</option>
-                          <option value="purchase">Purchase</option>
-                          <option value="deduction">Deduction</option>
-                          <option value="refund">Refund</option>
-                          <option value="adjustment">Adjustment</option>
-                          <option value="expired">Expired</option>
-                        </select>
-                      </div>
-
                       {transactions.length === 0 ? (
                         <div className="p-8 text-center">
                           <svg className="mx-auto h-12 w-12 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
                           </svg>
-                          <h3 className="mt-3 text-base font-medium text-gray-900">No transactions found</h3>
-                          <p className="mt-1 text-sm text-gray-600">No credit transactions available</p>
+                          <h3 className="mt-3 text-base font-medium text-gray-900">No settled transactions found</h3>
+                          <p className="mt-1 text-sm text-gray-600">No settled payment records available yet</p>
                         </div>
                       ) : (
+                        <>
                         <div className="overflow-x-auto overflow-hidden">
-                          <table className="w-full divide-y divide-gray-200" style={{ minWidth: '1200px' }}>
+                          <table className="w-full divide-y divide-gray-200" style={{ minWidth: '1100px' }}>
                             <thead className="bg-gray-50">
                               <tr>
-                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
-                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">User</th>
-                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden lg:table-cell">Type</th>
-                                <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Amount</th>
-                                <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider hidden xl:table-cell">Balance Before</th>
-                                <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider hidden xl:table-cell">Balance After</th>
-                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden md:table-cell">Description</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Settled Date</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">User</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider hidden lg:table-cell">Type</th>
+                                <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 tracking-wider">Amount</th>
+                                <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 tracking-wider hidden xl:table-cell">Installments</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider hidden md:table-cell">Description</th>
                               </tr>
                             </thead>
                             <tbody className="bg-white divide-y divide-gray-200">
-                              {transactions.map((transaction) => (
+                              {pagedTransactions.map((transaction) => (
                                 <tr key={transaction.transaction_id} className="hover:bg-gray-50">
                                   <td className="px-6 py-4 whitespace-nowrap">
-                                    <div className="text-sm text-gray-900">{formatDate(transaction.created_at)}</div>
+                                    <div className="text-sm text-gray-900">{formatDate(transaction.settled_at)}</div>
                                   </td>
                                   <td className="px-6 py-4 whitespace-nowrap">
                                     <div className="text-sm font-medium text-gray-900">{transaction.user_name || 'N/A'}</div>
                                     <div className="text-xs text-gray-500">{transaction.email || ''}</div>
                                   </td>
                                   <td className="px-6 py-4 whitespace-nowrap hidden lg:table-cell">
-                                    <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${getTransactionTypeColor(transaction.transaction_type)}`}>
-                                      {formatTransactionType(transaction.transaction_type)}
+                                    <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${getSettlementTypeColor(transaction.settlement_type)}`}>
+                                      {formatSettlementType(transaction.settlement_type)}
                                     </span>
                                   </td>
                                   <td className="px-6 py-4 whitespace-nowrap text-right">
-                                    <div className={`text-sm font-medium ${
-                                      transaction.transaction_type === 'deduction' ? 'text-red-600' : 
-                                      transaction.transaction_type === 'purchase' || transaction.transaction_type === 'refund' ? 'text-green-600' : 
-                                      'text-gray-900'
-                                    }`}>
-                                      {transaction.transaction_type === 'deduction' ? '-' : '+'}{(parseInt(transaction.amount) || 0).toLocaleString()}
+                                    <div className="text-sm font-medium text-green-700">
+                                      {formatCurrency(Number(transaction.amount) || 0)}
                                     </div>
                                   </td>
                                   <td className="px-6 py-4 whitespace-nowrap text-right hidden xl:table-cell">
-                                    <div className="text-sm text-gray-500">{(parseInt(transaction.balance_before) || 0).toLocaleString()}</div>
-                                  </td>
-                                  <td className="px-6 py-4 whitespace-nowrap text-right hidden xl:table-cell">
-                                    <div className="text-sm font-medium text-gray-900">{(parseInt(transaction.balance_after) || 0).toLocaleString()}</div>
+                                    <div className="text-sm text-gray-600">
+                                      {(Number(transaction.paid_installments) || 0)}/{(Number(transaction.expected_installments) || 0)}
+                                    </div>
                                   </td>
                                   <td className="px-6 py-4 hidden md:table-cell">
                                     <div className="text-sm text-gray-500">{transaction.description || '-'}</div>
@@ -372,6 +385,15 @@ const Credits = () => {
                             </tbody>
                           </table>
                         </div>
+                        <div className="mt-3">
+                          <Pagination
+                            totalItems={transactions.length}
+                            pageSize={pageSize}
+                            currentPage={transactionsPage}
+                            onPageChange={setTransactionsPage}
+                          />
+                        </div>
+                        </>
                       )}
                     </div>
                   )}

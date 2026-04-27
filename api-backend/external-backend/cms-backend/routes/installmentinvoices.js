@@ -9,6 +9,7 @@ import {
   buildPhaseInstallmentSchedule,
   isPhaseInstallmentProfile,
 } from '../utils/phaseInstallmentUtils.js';
+import { insertInvoiceWithArNumber } from '../utils/invoiceArNumber.js';
 
 const router = express.Router();
 
@@ -24,8 +25,26 @@ const enrichInstallmentInvoiceRow = async (row) => {
     phase_start: row.phase_start,
   };
 
+  const totalPhases = row.total_phases != null ? parseInt(row.total_phases, 10) : null;
+  const phaseStart = row.phase_start != null ? parseInt(row.phase_start, 10) : 1;
+  const paidPhases = parseInt(row.paid_phases || 0, 10) || 0;
+  const generatedPhases = parseInt(row.generated_phases || row.generated_count || 0, 10) || 0;
+  const lastEnrolledPhaseNumber = row.last_enrolled_phase_number != null
+    ? parseInt(row.last_enrolled_phase_number, 10)
+    : null;
+  // Billing progress for the Installment Invoice Logs should reflect billing records only,
+  // not historical class enrollment phase. This keeps it consistent with Invoice page data.
+  const billingPhaseProgress = Math.max(paidPhases, generatedPhases, 0);
+  const displayPhaseProgress = totalPhases != null
+    ? Math.min(billingPhaseProgress, totalPhases)
+    : billingPhaseProgress;
+
   if (!isPhaseInstallmentProfile(profile)) {
-    return row;
+    return {
+      ...row,
+      display_phase_progress: displayPhaseProgress,
+      last_enrolled_phase_number: lastEnrolledPhaseNumber,
+    };
   }
 
   try {
@@ -38,6 +57,8 @@ const enrichInstallmentInvoiceRow = async (row) => {
 
     return {
       ...row,
+      display_phase_progress: displayPhaseProgress,
+      last_enrolled_phase_number: lastEnrolledPhaseNumber,
       current_phase_number: schedule.current_phase_number,
       current_phase_start_date: schedule.current_phase_start_date,
       current_issue_date: schedule.current_issue_date,
@@ -55,6 +76,8 @@ const enrichInstallmentInvoiceRow = async (row) => {
   } catch (error) {
     return {
       ...row,
+      display_phase_progress: displayPhaseProgress,
+      last_enrolled_phase_number: lastEnrolledPhaseNumber,
       phase_schedule_error: error.message,
     };
   }
@@ -645,19 +668,31 @@ router.get(
       let sql = `
         SELECT ii.*, ip.student_id, ip.branch_id, ip.package_id, ip.amount as profile_amount, 
                ip.frequency as profile_frequency, ip.description, ip.class_id, ip.total_phases, ip.generated_count, ip.phase_start,
+               ip.is_active as profile_is_active,
                ip.downpayment_invoice_id,
                c.start_date::text as class_start_date,
-               (SELECT COUNT(*) 
+               (SELECT COUNT(DISTINCT COALESCE(i.invoice_chain_root_id, i.invoice_id))
                 FROM invoicestbl i 
                 WHERE i.installmentinvoiceprofiles_id = ip.installmentinvoiceprofiles_id 
                   AND i.status = 'Paid'
-                  AND (ip.downpayment_invoice_id IS NULL OR i.invoice_id != ip.downpayment_invoice_id::INTEGER)
+                  AND (
+                    ip.downpayment_invoice_id IS NULL OR
+                    COALESCE(i.invoice_chain_root_id, i.invoice_id) != ip.downpayment_invoice_id::INTEGER
+                  )
                ) as paid_phases,
-               (SELECT COUNT(*) 
+               (SELECT COUNT(DISTINCT COALESCE(i.invoice_chain_root_id, i.invoice_id))
                 FROM invoicestbl i 
                 WHERE i.installmentinvoiceprofiles_id = ip.installmentinvoiceprofiles_id 
-                  AND (ip.downpayment_invoice_id IS NULL OR i.invoice_id != ip.downpayment_invoice_id::INTEGER)
+                  AND (
+                    ip.downpayment_invoice_id IS NULL OR
+                    COALESCE(i.invoice_chain_root_id, i.invoice_id) != ip.downpayment_invoice_id::INTEGER
+                  )
                ) as generated_phases,
+               (SELECT MAX(cs.phase_number)
+                FROM classstudentstbl cs
+                WHERE cs.student_id = ip.student_id
+                  AND cs.class_id = ip.class_id
+               ) as last_enrolled_phase_number,
                p.program_name, u.full_name as student_name
         FROM installmentinvoicestbl ii
         JOIN installmentinvoiceprofilestbl ip ON ii.installmentinvoiceprofiles_id = ip.installmentinvoiceprofiles_id
@@ -665,7 +700,6 @@ router.get(
         LEFT JOIN programstbl p ON c.program_id = p.program_id
         LEFT JOIN userstbl u ON ip.student_id = u.user_id
         WHERE 1=1
-          AND ip.is_active = true
       `;
       const params = [];
       let paramCount = 0;
@@ -802,6 +836,48 @@ router.put(
 );
 
 /**
+ * DELETE /api/sms/installment-invoices/invoices/:id
+ * Delete an installment invoice log row
+ * Access: Superadmin, Admin, Finance
+ */
+router.delete(
+  '/invoices/:id',
+  [
+    param('id').isInt().withMessage('Invoice ID must be an integer'),
+    handleValidationErrors,
+  ],
+  requireRole('Superadmin', 'Admin', 'Finance'),
+  async (req, res, next) => {
+    try {
+      const { id } = req.params;
+
+      const existingInvoice = await query(
+        'SELECT * FROM installmentinvoicestbl WHERE installmentinvoicedtl_id = $1',
+        [id]
+      );
+      if (existingInvoice.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'Installment invoice not found',
+        });
+      }
+
+      await query(
+        'DELETE FROM installmentinvoicestbl WHERE installmentinvoicedtl_id = $1',
+        [id]
+      );
+
+      res.json({
+        success: true,
+        message: 'Installment invoice deleted successfully',
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
  * POST /api/sms/installment-invoices/process-due
  * Manually trigger processing of due installment invoices
  * Access: Superadmin, Admin
@@ -866,6 +942,7 @@ router.post(
       const installmentResult = await client.query(
         `SELECT ii.*, ip.student_id, ip.branch_id, ip.package_id, ip.amount as profile_amount, 
                 ip.frequency as profile_frequency, ip.description, ip.class_id, ip.total_phases, ip.generated_count, ip.phase_start,
+                ip.is_active as profile_is_active,
                 ip.downpayment_invoice_id,
                 p.program_name, u.full_name as student_name
          FROM installmentinvoicestbl ii
@@ -886,6 +963,14 @@ router.post(
       }
 
       const installmentInvoice = installmentResult.rows[0];
+      if (installmentInvoice.profile_is_active === false) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          success: false,
+          message: 'This student has already been unenrolled. Existing installment invoices and payment logs are preserved, but new installment invoices can no longer be generated.',
+        });
+      }
+
       const profile = {
         student_id: installmentInvoice.student_id,
         branch_id: installmentInvoice.branch_id,
@@ -928,9 +1013,10 @@ router.post(
       const effectiveDueDate = due_date;
 
       // Create invoice (link to installment invoice profile for phase tracking)
-      const invoiceResult = await client.query(
-        `INSERT INTO invoicestbl (invoice_description, branch_id, amount, status, remarks, issue_date, due_date, created_by, installmentinvoiceprofiles_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      const newInvoice = await insertInvoiceWithArNumber(
+        client,
+        `INSERT INTO invoicestbl (invoice_description, branch_id, amount, status, remarks, issue_date, due_date, created_by, installmentinvoiceprofiles_id, invoice_ar_number)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          RETURNING *`,
         [
           'TEMP',
@@ -946,8 +1032,6 @@ router.post(
           installmentInvoice.installmentinvoiceprofiles_id, // Link to installment profile
         ]
       );
-
-      const newInvoice = invoiceResult.rows[0];
 
       // Update invoice description
       await client.query(
@@ -982,25 +1066,23 @@ router.post(
       const totalPhases = installmentInvoice.total_phases;
       const maxInvoices = totalPhases !== null ? totalPhases : null; // Max invoices = total_phases (downpayment doesn't count)
       
-      // Calculate how many phases are actually paid (downpayment is NOT counted as a phase)
-      // Only count paid installment invoices, excluding downpayment invoice
-      // Get detailed list for debugging
-      const paidInvoicesDetailResult = await client.query(
-        `SELECT i.invoice_id, i.invoice_description, i.status, i.installmentinvoiceprofiles_id
-         FROM invoicestbl i 
-         WHERE i.installmentinvoiceprofiles_id = $1 
+      const canonicalCountsResult = await client.query(
+        `SELECT COUNT(DISTINCT COALESCE(i.invoice_chain_root_id, i.invoice_id)) AS paid_phase_count
+         FROM invoicestbl i
+         WHERE i.installmentinvoiceprofiles_id = $1
            AND i.status = 'Paid'
-           AND ($2::INTEGER IS NULL OR i.invoice_id != $2::INTEGER)
-         ORDER BY i.invoice_id`,
+           AND (
+             $2::INTEGER IS NULL OR
+             COALESCE(i.invoice_chain_root_id, i.invoice_id) != $2::INTEGER
+           )`,
         [installmentInvoice.installmentinvoiceprofiles_id, installmentInvoice.downpayment_invoice_id || null]
       );
       
-      const paidPhases = paidInvoicesDetailResult.rows.length;
+      const paidPhases = parseInt(canonicalCountsResult.rows[0]?.paid_phase_count || 0, 10);
       const currentCount = installmentInvoice.generated_count || 0;
       
       // Debug logging
       console.log('Paid invoices count:', paidPhases);
-      console.log('Paid invoices detail:', JSON.stringify(paidInvoicesDetailResult.rows, null, 2));
       console.log('Total phases:', totalPhases);
       console.log('Downpayment invoice ID:', installmentInvoice.downpayment_invoice_id);
       

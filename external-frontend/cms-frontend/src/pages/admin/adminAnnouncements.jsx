@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { useSearchParams } from 'react-router-dom';
-import API_BASE_URL, { apiRequest, getCmsFetchHeaders } from '../../config/api';
+import API_BASE_URL, { apiRequest } from '../../config/api';
 import { useAuth } from '../../contexts/AuthContext';
 import { formatDateManila } from '../../utils/dateUtils';
 import FixedTablePagination from '../../components/table/FixedTablePagination';
+import { appAlert, appConfirm } from '../../utils/appAlert';
 
 const RECIPIENT_GROUPS = [
   { value: 'All', label: 'All' },
@@ -77,6 +78,7 @@ const AdminAnnouncements = () => {
   const [totalPages, setTotalPages] = useState(0);
   const [highlightedAnnouncementId, setHighlightedAnnouncementId] = useState(null);
   const highlightedRowRef = useRef(null);
+  const searchHydratedRef = useRef(false);
 
   useEffect(() => {
     fetchAnnouncements();
@@ -272,7 +274,14 @@ const AdminAnnouncements = () => {
 
   const handleDelete = async (announcementId) => {
     setOpenMenuId(null);
-    if (!window.confirm('Are you sure you want to delete this announcement?')) {
+    if (
+      !(await appConfirm({
+        title: 'Delete announcement',
+        message: 'Are you sure you want to delete this announcement?',
+        destructive: true,
+        confirmLabel: 'Delete',
+      }))
+    ) {
       return;
     }
 
@@ -282,7 +291,7 @@ const AdminAnnouncements = () => {
       });
       fetchAnnouncements();
     } catch (err) {
-      alert(err.message || 'Failed to delete announcement');
+      appAlert(err.message || 'Failed to delete announcement');
     }
   };
 
@@ -368,11 +377,12 @@ const AdminAnnouncements = () => {
     setAttachmentUploading(true);
     setError('');
     try {
+      const token = localStorage.getItem('firebase_token');
       const fd = new FormData();
       fd.append('attachment', file);
       const res = await fetch(`${API_BASE_URL}/upload/announcement-file`, {
         method: 'POST',
-        headers: getCmsFetchHeaders(),
+        headers: { Authorization: `Bearer ${token}` },
         body: fd,
       });
       const data = await res.json();
@@ -541,6 +551,22 @@ const AdminAnnouncements = () => {
     setCurrentPage(1);
     fetchAnnouncements();
   };
+
+  useEffect(() => {
+    if (!searchHydratedRef.current) {
+      searchHydratedRef.current = true;
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (currentPage !== 1) {
+        setCurrentPage(1);
+      } else {
+        fetchAnnouncements();
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [titleSearchTerm]);
 
   const handleReset = () => {
     setTitleSearchTerm('');

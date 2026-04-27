@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiRequest } from '../config/api';
 import { useAuth } from '../contexts/AuthContext';
+import { getNotificationDestination } from '../utils/notificationNavigation';
 import ToastNotification from './ToastNotification';
 
 const NotificationDropdown = () => {
@@ -11,27 +12,11 @@ const NotificationDropdown = () => {
   const [notifications, setNotifications] = useState([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [markAllLoading, setMarkAllLoading] = useState(false);
   const [selectedAnnouncement, setSelectedAnnouncement] = useState(null);
   const [toastNotifications, setToastNotifications] = useState([]);
   const [previousNotificationIds, setPreviousNotificationIds] = useState(new Set());
   const dropdownRef = useRef(null);
-
-  // Get announcements page path based on user role
-  const getAnnouncementsPath = () => {
-    const userType = userInfo?.user_type || userInfo?.userType;
-    switch (userType) {
-      case 'Superadmin':
-        return '/superadmin/announcements';
-      case 'Admin':
-        return '/admin/announcements';
-      case 'Teacher':
-        return '/teacher/announcements';
-      case 'Student':
-        return '/student/announcements';
-      default:
-        return '/superadmin/announcements';
-    }
-  };
 
   // Fetch notifications
   const fetchNotifications = async (showToasts = false) => {
@@ -175,6 +160,27 @@ const NotificationDropdown = () => {
     }
   };
 
+  // Mark all currently visible notifications as read
+  const markAllAsRead = async () => {
+    if (unreadCount <= 0 || markAllLoading) return;
+
+    try {
+      setMarkAllLoading(true);
+      await apiRequest('/announcements/read-all', {
+        method: 'POST',
+      });
+
+      setNotifications((prevNotifications) =>
+        prevNotifications.map((notif) => ({ ...notif, is_read: true }))
+      );
+      setUnreadCount(0);
+    } catch (error) {
+      console.error('Error marking all announcements as read:', error);
+    } finally {
+      setMarkAllLoading(false);
+    }
+  };
+
   // Handle notification click - navigate to announcements page
   const handleNotificationClick = (announcement) => {
     if (!announcement.is_read) {
@@ -185,9 +191,8 @@ const NotificationDropdown = () => {
     setIsOpen(false);
     setSelectedAnnouncement(null);
     
-    // Navigate to announcements page with announcement ID as query parameter
-    const announcementsPath = getAnnouncementsPath();
-    navigate(`${announcementsPath}?highlight=${announcement.announcement_id}`);
+    // Navigate to the notification's parent/source page.
+    navigate(getNotificationDestination(announcement, userInfo));
   };
 
   // Format date
@@ -275,11 +280,21 @@ const NotificationDropdown = () => {
           {/* Header */}
           <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
             <h3 className="text-lg font-semibold text-gray-900">Notifications</h3>
-            {unreadCount > 0 && (
-              <span className="text-sm text-gray-600">
-                {unreadCount} unread
-              </span>
-            )}
+            <div className="flex items-center gap-3">
+              {unreadCount > 0 && (
+                <span className="text-sm text-gray-600">
+                  {unreadCount} unread
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={markAllAsRead}
+                disabled={unreadCount <= 0 || markAllLoading}
+                className="text-xs font-semibold text-blue-600 hover:text-blue-700 disabled:text-gray-400 disabled:cursor-not-allowed"
+              >
+                {markAllLoading ? 'Marking...' : 'Mark all as read'}
+              </button>
+            </div>
           </div>
 
           {/* Content */}

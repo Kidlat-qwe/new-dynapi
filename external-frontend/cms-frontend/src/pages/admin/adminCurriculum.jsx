@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { apiRequest } from '../../config/api';
 import FixedTablePagination from '../../components/table/FixedTablePagination';
+import { appAlert, appConfirm } from '../../utils/appAlert';
 
 const ITEMS_PER_PAGE = 10;
 
@@ -115,7 +116,14 @@ const AdminCurriculum = () => {
 
   const handleDelete = async (curriculumId) => {
     setOpenMenuId(null);
-    if (!window.confirm('Are you sure you want to delete this curriculum?')) {
+    if (
+      !(await appConfirm({
+        title: 'Delete curriculum',
+        message: 'Are you sure you want to delete this curriculum?',
+        destructive: true,
+        confirmLabel: 'Delete',
+      }))
+    ) {
       return;
     }
 
@@ -125,7 +133,7 @@ const AdminCurriculum = () => {
       });
       fetchCurricula();
     } catch (err) {
-      alert(err.message || 'Failed to delete curriculum');
+      appAlert(err.message || 'Failed to delete curriculum');
     }
   };
 

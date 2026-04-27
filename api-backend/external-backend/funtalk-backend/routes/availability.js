@@ -28,6 +28,11 @@ router.get(
   [
     param('teacherId').isInt().withMessage('Valid teacher ID is required'),
     query('date').isISO8601().withMessage('Valid date is required'),
+    query('excludeAppointmentId').optional().isInt().withMessage('excludeAppointmentId must be an integer'),
+    query('classType')
+      .optional()
+      .isIn(['group', 'one_on_one', 'vip'])
+      .withMessage('classType must be group, one_on_one, or vip'),
   ],
   handleValidationErrors,
   availabilityController.getAvailableSlots

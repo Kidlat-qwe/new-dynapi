@@ -1,4 +1,26 @@
 import db from '../config/database.js';
+import fs from 'fs';
+import { isS3Configured, uploadTeacherProfileFileToS3 } from '../services/s3Materials.js';
+
+const toPublicUploadPath = (filename) => `/uploads/materials/${filename}`;
+
+const uploadTeacherAsset = async (file, assetType) => {
+  if (!file) return null;
+  if (isS3Configured()) {
+    const uploadedUrl = await uploadTeacherProfileFileToS3({
+      localPath: file.path,
+      assetType,
+      contentType: file.mimetype,
+    });
+    try {
+      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+    } catch {
+      // no-op
+    }
+    return uploadedUrl;
+  }
+  return toPublicUploadPath(file.filename);
+};
 
 /**
  * @desc    Get all teachers with optional filters
@@ -21,6 +43,7 @@ export const getTeachers = async (req, res) => {
         t.video_intro,
         t.docs,
         t.status,
+        t.employment_type,
         t.created_at,
         u.name as user_name,
         u.phone_number,
@@ -190,7 +213,7 @@ export const createTeacher = async (req, res) => {
       audioIntro || null,
       videoIntro || null,
       docs || null,
-      'pending', // Default status
+      'active', // Default status
     ];
     
     const result = await db.query(query, values);
@@ -412,7 +435,22 @@ export const getTeacherAppointments = async (req, res) => {
     
     const query = `
       SELECT 
-        a.*,
+        a.appointment_id,
+        a.user_id,
+        a.teacher_id,
+        a.meeting_id,
+        a.material_id,
+        a.appointment_date::text AS appointment_date,
+        a.appointment_time::text AS appointment_time,
+        a.class_type,
+        a.student_name,
+        a.student_age,
+        a.student_level,
+        a.additional_notes,
+        a.status,
+        a.approved_by,
+        a.created_at,
+        a.student_id,
         u.name as school_name,
         u.email as school_email
       FROM appointmenttbl a
@@ -435,6 +473,138 @@ export const getTeacherAppointments = async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Error fetching teacher appointments',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * @desc    Get current teacher profile
+ * @route   GET /api/teachers/me/profile
+ * @access  Private (Teacher)
+ */
+export const getMyTeacherProfile = async (req, res) => {
+  try {
+    const teacherId = req.user.userId;
+    const result = await db.query(
+      `SELECT
+         teacher_id,
+         fullname,
+         email,
+         gender,
+         description,
+         profile_picture,
+         docs,
+         audio_intro,
+         video_intro,
+         status,
+         employment_type,
+         created_at
+       FROM teachertbl
+       WHERE teacher_id = $1`,
+      [teacherId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Teacher profile not found',
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        profile: result.rows[0],
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching teacher profile:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching teacher profile',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * @desc    Update current teacher profile with media assets
+ * @route   PUT /api/teachers/me/profile
+ * @access  Private (Teacher)
+ */
+export const updateMyTeacherProfile = async (req, res) => {
+  try {
+    const teacherId = req.user.userId;
+    const files = req.files || {};
+
+    const check = await db.query('SELECT teacher_id FROM teachertbl WHERE teacher_id = $1', [teacherId]);
+    if (check.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Teacher profile not found',
+      });
+    }
+
+    const profilePicture = await uploadTeacherAsset(files.profilePhoto?.[0], 'profile_photo');
+    const docs = await uploadTeacherAsset(files.curriculumVitae?.[0], 'cv_file');
+    const audioIntro = await uploadTeacherAsset(files.introAudio?.[0], 'intro_audio');
+    const videoIntro = await uploadTeacherAsset(files.introVideo?.[0], 'intro_video');
+    const introText = req.body?.introText;
+
+    const updates = [];
+    const values = [];
+    let i = 1;
+
+    if (profilePicture !== null) {
+      updates.push(`profile_picture = $${i++}`);
+      values.push(profilePicture);
+    }
+    if (docs !== null) {
+      updates.push(`docs = $${i++}`);
+      values.push(docs);
+    }
+    if (audioIntro !== null) {
+      updates.push(`audio_intro = $${i++}`);
+      values.push(audioIntro);
+    }
+    if (videoIntro !== null) {
+      updates.push(`video_intro = $${i++}`);
+      values.push(videoIntro);
+    }
+    if (introText !== undefined) {
+      updates.push(`description = $${i++}`);
+      values.push(introText || null);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No profile fields to update',
+      });
+    }
+
+    values.push(teacherId);
+    const result = await db.query(
+      `UPDATE teachertbl
+       SET ${updates.join(', ')}
+       WHERE teacher_id = $${i}
+       RETURNING teacher_id, fullname, email, gender, description, profile_picture, docs, audio_intro, video_intro, status`,
+      values
+    );
+
+    res.status(200).json({
+      success: true,
+      message: 'Teacher profile updated successfully',
+      data: {
+        profile: result.rows[0],
+      },
+    });
+  } catch (error) {
+    console.error('Error updating teacher profile:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating teacher profile',
       error: error.message,
     });
   }

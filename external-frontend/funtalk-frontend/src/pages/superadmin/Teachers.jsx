@@ -3,8 +3,10 @@ import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import Header from '../../components/Header';
 import Sidebar from '../../components/Sidebar';
-
-import { fetchFuntalk } from '../../lib/api';
+import { API_BASE_URL } from '@/config/api.js';
+import ResponsiveSelect from '../../components/ResponsiveSelect';
+import Pagination from '../../components/Pagination.jsx';
+import { computeFixedActionMenuPosition } from '../../utils/actionMenuPosition.js';
 
 const Teachers = () => {
   const navigate = useNavigate();
@@ -16,8 +18,22 @@ const Teachers = () => {
   const [nameSearch, setNameSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [genderFilter, setGenderFilter] = useState('');
+  const [page, setPage] = useState(1);
   const [openMenuId, setOpenMenuId] = useState(null);
   const [menuPosition, setMenuPosition] = useState({ top: 0, right: 0 });
+  const [isDetailsModalOpen, setIsDetailsModalOpen] = useState(false);
+  const [isDetailsLoading, setIsDetailsLoading] = useState(false);
+  const [selectedTeacher, setSelectedTeacher] = useState(null);
+  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+  const [editingTeacherId, setEditingTeacherId] = useState(null);
+  const [isEditSubmitting, setIsEditSubmitting] = useState(false);
+  const [editError, setEditError] = useState('');
+  const [editFormData, setEditFormData] = useState({
+    fullname: '',
+    email: '',
+    gender: '',
+    description: '',
+  });
   
   // Media preview modal state
   const [mediaModal, setMediaModal] = useState({
@@ -75,12 +91,27 @@ const Teachers = () => {
   const fetchTeachers = async () => {
     setIsFetching(true);
     try {
+      const token = localStorage.getItem('token');
+      let url = `${API_BASE_URL}/teachers`;
       const params = new URLSearchParams();
-      if (statusFilter) params.append('status', statusFilter);
-      if (genderFilter) params.append('gender', genderFilter);
-      const qs = params.toString();
-      const path = qs ? `/teachers?${qs}` : '/teachers';
-      const response = await fetchFuntalk(path, {});
+      
+      if (statusFilter) {
+        params.append('status', statusFilter);
+      }
+      
+      if (genderFilter) {
+        params.append('gender', genderFilter);
+      }
+      
+      if (params.toString()) {
+        url += `?${params.toString()}`;
+      }
+
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.teachers) {
@@ -97,11 +128,25 @@ const Teachers = () => {
     }
   };
 
-  // Filter teachers based on name search
+  const searchQuery = nameSearch.trim().toLowerCase();
+
   const filteredTeachers = teachers.filter((t) => {
-    const matchesName = !nameSearch || t.fullname?.toLowerCase().includes(nameSearch.toLowerCase());
-    return matchesName;
+    if (!searchQuery) return true;
+    const name = String(t.fullname || '').toLowerCase();
+    const email = String(t.email || '').toLowerCase();
+    return name.includes(searchQuery) || email.includes(searchQuery);
   });
+
+  const noMatchesWithData = teachers.length > 0 && filteredTeachers.length === 0;
+  const emptyListNoFilters =
+    teachers.length === 0 && !statusFilter && !genderFilter && !nameSearch.trim();
+
+  useEffect(() => {
+    setPage(1);
+  }, [nameSearch, statusFilter, genderFilter]);
+
+  const pageSize = 10;
+  const pagedTeachers = filteredTeachers.slice((page - 1) * pageSize, page * pageSize);
 
   // Format gender for display
   const formatGender = (gender) => {
@@ -141,11 +186,14 @@ const Teachers = () => {
     e.stopPropagation();
     const button = e.currentTarget;
     const rect = button.getBoundingClientRect();
-    
-    setMenuPosition({
-      top: rect.bottom + window.scrollY + 1,
-      right: window.innerWidth - rect.right + window.scrollX,
+    // Keep menu near trigger and in-viewport on mobile/desktop.
+    const pos = computeFixedActionMenuPosition({
+      rect,
+      menuWidth: 192, // w-40 / w-48
+      menuHeight: 170,
+      gap: 6,
     });
+    setMenuPosition(pos);
     
     setOpenMenuId(openMenuId === teacherId ? null : teacherId);
   };
@@ -153,9 +201,13 @@ const Teachers = () => {
   // Handle status change
   const handleStatusChange = async (teacherId, newStatus) => {
     try {
-      const response = await fetchFuntalk(`/teachers/${teacherId}/status`, {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/teachers/${teacherId}/status`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
         body: JSON.stringify({ status: newStatus }),
       });
 
@@ -168,6 +220,111 @@ const Teachers = () => {
     } catch (error) {
       console.error('Error updating teacher status:', error);
       alert('Error updating teacher status. Please try again.');
+    }
+  };
+
+  const fetchTeacherDetails = async (teacherId) => {
+    const token = localStorage.getItem('token');
+    const response = await fetch(`${API_BASE_URL}/teachers/${teacherId}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    const data = await response.json();
+    if (!response.ok || !data.success || !data.data?.teacher) {
+      throw new Error(data.message || 'Unable to fetch teacher details');
+    }
+    return data.data.teacher;
+  };
+
+  const openTeacherDetails = async (teacherId) => {
+    setOpenMenuId(null);
+    setIsDetailsModalOpen(true);
+    setIsDetailsLoading(true);
+    setSelectedTeacher(null);
+    try {
+      const teacher = await fetchTeacherDetails(teacherId);
+      setSelectedTeacher(teacher);
+    } catch (error) {
+      console.error('Error fetching teacher details:', error);
+      alert(error.message || 'Error loading teacher details');
+      setIsDetailsModalOpen(false);
+    } finally {
+      setIsDetailsLoading(false);
+    }
+  };
+
+  const openEditTeacher = async (teacherId) => {
+    setOpenMenuId(null);
+    setIsEditModalOpen(true);
+    setIsEditSubmitting(false);
+    setEditError('');
+    setEditingTeacherId(teacherId);
+    try {
+      const teacher = await fetchTeacherDetails(teacherId);
+      setSelectedTeacher(teacher);
+      setEditFormData({
+        fullname: teacher.fullname || '',
+        email: teacher.email || '',
+        gender: teacher.gender || '',
+        description: teacher.description || '',
+      });
+    } catch (error) {
+      console.error('Error loading teacher for edit:', error);
+      alert(error.message || 'Error loading teacher profile');
+      setIsEditModalOpen(false);
+      setEditingTeacherId(null);
+    }
+  };
+
+  const handleEditChange = (e) => {
+    const { name, value } = e.target;
+    setEditFormData((prev) => ({ ...prev, [name]: value }));
+  };
+
+  const handleEditSubmit = async (e) => {
+    e.preventDefault();
+    if (!editingTeacherId) return;
+
+    const fullname = editFormData.fullname.trim();
+    const email = editFormData.email.trim().toLowerCase();
+    if (!fullname || !email) {
+      setEditError('Full name and email are required.');
+      return;
+    }
+
+    setIsEditSubmitting(true);
+    setEditError('');
+    try {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/teachers/${editingTeacherId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          fullname,
+          email,
+          gender: editFormData.gender || null,
+          description: editFormData.description.trim() || null,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        setEditError(data.message || 'Error updating teacher profile');
+        return;
+      }
+
+      setIsEditModalOpen(false);
+      setEditingTeacherId(null);
+      setSelectedTeacher(null);
+      await fetchTeachers();
+    } catch (error) {
+      console.error('Error updating teacher:', error);
+      setEditError('Network error. Please try again.');
+    } finally {
+      setIsEditSubmitting(false);
     }
   };
 
@@ -235,7 +392,50 @@ const Teachers = () => {
                     <div className="animate-spin rounded-full h-10 w-10 sm:h-12 sm:w-12 border-b-2 border-primary-600 mx-auto"></div>
                     <p className="mt-3 sm:mt-4 text-sm sm:text-base text-gray-600">Loading teachers...</p>
                   </div>
-                ) : filteredTeachers.length === 0 ? (
+                ) : (
+                  <>
+                    <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-end gap-3 px-4 py-3 sm:px-6 border-b border-gray-200 bg-gray-50/90">
+                      <div className="flex flex-col min-w-0 flex-1 sm:max-w-md">
+                        <input
+                          id="teachers-search"
+                          type="search"
+                          aria-label="Search teachers"
+                          placeholder="Search by name or email"
+                          value={nameSearch}
+                          onChange={(e) => setNameSearch(e.target.value)}
+                          autoComplete="off"
+                          className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                        />
+                      </div>
+                      <div className="flex flex-col w-full sm:w-auto sm:min-w-[9rem]">
+                        <ResponsiveSelect
+                          id="teachers-gender-filter"
+                          aria-label="Filter teachers by gender"
+                          value={genderFilter}
+                          onChange={(e) => setGenderFilter(e.target.value)}
+                          className="w-full sm:w-auto px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-primary-500 focus:outline-none"
+                        >
+                          <option value="">All genders</option>
+                          <option value="male">Male</option>
+                          <option value="female">Female</option>
+                          <option value="other">Other</option>
+                        </ResponsiveSelect>
+                      </div>
+                      <div className="flex flex-col w-full sm:w-auto sm:min-w-[9rem]">
+                        <ResponsiveSelect
+                          id="teachers-status-filter"
+                          aria-label="Filter teachers by status"
+                          value={statusFilter}
+                          onChange={(e) => setStatusFilter(e.target.value)}
+                          className="w-full sm:w-auto px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-primary-500 focus:outline-none"
+                        >
+                          <option value="">All statuses</option>
+                          <option value="active">Active</option>
+                          <option value="inactive">Inactive</option>
+                        </ResponsiveSelect>
+                      </div>
+                    </div>
+                    {filteredTeachers.length === 0 ? (
                   <div className="p-8 sm:p-10 md:p-12 text-center">
                     <svg
                       className="mx-auto h-12 w-12 sm:h-16 sm:w-16 text-gray-400"
@@ -250,68 +450,52 @@ const Teachers = () => {
                         d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"
                       />
                     </svg>
-                    <h3 className="mt-3 sm:mt-4 text-base sm:text-lg font-medium text-gray-900">No teachers found</h3>
+                    <h3 className="mt-3 sm:mt-4 text-base sm:text-lg font-medium text-gray-900">
+                      {noMatchesWithData
+                        ? 'No matching teachers'
+                        : teachers.length === 0 && (statusFilter || genderFilter)
+                          ? 'No teachers for these filters'
+                          : 'No teachers yet'}
+                    </h3>
                     <p className="mt-1 sm:mt-2 text-sm sm:text-base text-gray-600">
-                      {nameSearch || statusFilter || genderFilter
-                        ? 'Try adjusting your filters'
-                        : 'No teachers registered yet'}
+                      {noMatchesWithData
+                        ? 'Try a different name, email, or clear the search.'
+                        : emptyListNoFilters
+                          ? 'Teachers will appear here once they are registered.'
+                          : teachers.length === 0 && (statusFilter || genderFilter)
+                            ? 'Change gender or status, or clear filters to see all teachers.'
+                            : 'Try adjusting your search or filters.'}
                     </p>
                   </div>
                 ) : (
-                  <div className="overflow-x-auto">
-                    <table className="w-full divide-y divide-gray-200">
+                  <>
+                  <div className="overflow-x-auto rounded-b-xl">
+                    <table className="min-w-[980px] w-full divide-y divide-gray-200">
                       <thead className="bg-gray-50">
                         <tr>
-                          <th className="px-4 md:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                            <div className="flex items-center space-x-2">
-                              <span className="text-xs font-medium text-gray-500 uppercase">Name</span>
-                              <input
-                                type="text"
-                                placeholder="Search..."
-                                value={nameSearch}
-                                onChange={(e) => setNameSearch(e.target.value)}
-                                className="px-2 py-1 text-xs border border-gray-300 rounded focus:ring-1 focus:ring-primary-500 focus:border-primary-500 w-32"
-                              />
-                            </div>
+                          <th className="px-4 md:px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">
+                            Name
                           </th>
-                          <th className="px-4 md:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          <th className="px-4 md:px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">
                             Email
                           </th>
-                          <th className="px-4 md:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden lg:table-cell">
-                            <select
-                              value={genderFilter}
-                              onChange={(e) => setGenderFilter(e.target.value)}
-                              className="text-xs font-medium text-gray-500 bg-transparent border-0 rounded px-2 py-1 focus:ring-1 focus:ring-primary-500 focus:outline-none"
-                            >
-                              <option value="">Gender</option>
-                              <option value="male">Male</option>
-                              <option value="female">Female</option>
-                              <option value="other">Other</option>
-                            </select>
+                          <th className="px-4 md:px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">
+                            Gender
                           </th>
-                          <th className="px-4 md:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden xl:table-cell">
+                          <th className="px-4 md:px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">
                             Media
                           </th>
-                          <th className="px-4 md:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden md:table-cell">
-                            <select
-                              value={statusFilter}
-                              onChange={(e) => setStatusFilter(e.target.value)}
-                              className="text-xs font-medium text-gray-500 bg-transparent border-0 rounded px-2 py-1 focus:ring-1 focus:ring-primary-500 focus:outline-none"
-                            >
-                              <option value="">Status</option>
-                              <option value="active">Active</option>
-                              <option value="pending">Pending</option>
-                              <option value="inactive">Inactive</option>
-                            </select>
+                          <th className="px-4 md:px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">
+                            Status
                           </th>
-                          <th className="px-4 md:px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider hidden md:table-cell">
+                          <th className="sticky right-0 z-10 bg-gray-50 px-4 md:px-6 py-3 text-right text-xs font-medium text-gray-500 tracking-wider shadow-[-2px_0_8px_-2px_rgba(0,0,0,0.08)]">
                             Actions
                           </th>
                         </tr>
                       </thead>
                       <tbody className="bg-white divide-y divide-gray-200">
-                        {filteredTeachers.map((teacher) => (
-                          <tr key={teacher.teacher_id} className="hover:bg-gray-50">
+                        {pagedTeachers.map((teacher) => (
+                          <tr key={teacher.teacher_id} className="group hover:bg-gray-50">
                             <td className="px-4 md:px-6 py-4 whitespace-nowrap">
                               <div className="flex items-center">
                                 {teacher.profile_picture ? (
@@ -337,14 +521,16 @@ const Teachers = () => {
                               </div>
                             </td>
                             <td className="px-4 md:px-6 py-4 whitespace-nowrap">
-                              <div className="text-sm text-gray-900">{teacher.email || 'N/A'}</div>
+                              <div className="max-w-[11rem] text-sm text-gray-900 break-all sm:max-w-none sm:break-normal" title={teacher.email || ''}>
+                                {teacher.email || 'N/A'}
+                              </div>
                             </td>
-                            <td className="px-4 md:px-6 py-4 whitespace-nowrap hidden lg:table-cell">
+                            <td className="px-4 md:px-6 py-4 whitespace-nowrap">
                               <span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-gray-100 text-gray-800">
                                 {formatGender(teacher.gender)}
                               </span>
                             </td>
-                            <td className="px-4 md:px-6 py-4 whitespace-nowrap hidden xl:table-cell">
+                            <td className="px-4 md:px-6 py-4 whitespace-nowrap">
                               <div className="flex items-center space-x-2">
                                 {/* Audio Icon */}
                                 <button
@@ -391,24 +577,24 @@ const Teachers = () => {
                                 )}
                               </div>
                             </td>
-                            <td className="px-4 md:px-6 py-4 whitespace-nowrap hidden md:table-cell">
-                              <select
-                                value={teacher.status || 'pending'}
+                            <td className="px-4 md:px-6 py-4 whitespace-nowrap">
+                              <ResponsiveSelect
+                                value={teacher.status === 'inactive' ? 'inactive' : 'active'}
                                 onChange={(e) => handleStatusChange(teacher.teacher_id, e.target.value)}
                                 className={`text-xs font-semibold rounded-full px-2 py-1 border-0 focus:ring-2 focus:ring-primary-500 ${
                                   teacher.status === 'active'
                                     ? 'bg-green-100 text-green-800'
                                     : teacher.status === 'inactive'
                                     ? 'bg-red-100 text-red-800'
-                                    : 'bg-yellow-100 text-yellow-800'
+                                    : 'bg-green-100 text-green-800'
                                 }`}
+                                aria-label="Teacher status"
                               >
                                 <option value="active">Active</option>
-                                <option value="pending">Pending</option>
                                 <option value="inactive">Inactive</option>
-                              </select>
+                              </ResponsiveSelect>
                             </td>
-                            <td className="px-4 md:px-6 py-4 whitespace-nowrap text-right text-sm font-medium hidden md:table-cell">
+                            <td className="sticky right-0 z-[1] bg-white px-4 md:px-6 py-4 whitespace-nowrap text-right text-sm font-medium shadow-[-2px_0_8px_-2px_rgba(0,0,0,0.06)] group-hover:bg-gray-50">
                               <div className="flex justify-end">
                                 <button
                                   onClick={(e) => handleActionClick(e, teacher.teacher_id)}
@@ -436,6 +622,12 @@ const Teachers = () => {
                       </tbody>
                     </table>
                   </div>
+                  <div className="px-4 py-3 sm:px-6 border-t border-gray-200">
+                    <Pagination totalItems={filteredTeachers.length} pageSize={pageSize} currentPage={page} onPageChange={setPage} />
+                  </div>
+                  </>
+                    )}
+                  </>
                 )}
               </div>
 
@@ -447,9 +639,9 @@ const Teachers = () => {
               )}
 
               {/* Action Menu Dropdown */}
-              {openMenuId && (
+              {openMenuId && createPortal(
                 <div
-                  className="fixed w-40 sm:w-48 bg-white rounded-md shadow-xl z-[9999] border border-gray-200"
+                  className="fixed w-40 sm:w-48 bg-white rounded-md shadow-xl z-[9999] border border-gray-200 action-menu"
                   style={{
                     top: `${menuPosition.top}px`,
                     right: `${menuPosition.right}px`,
@@ -460,11 +652,7 @@ const Teachers = () => {
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        const teacher = filteredTeachers.find(t => t.teacher_id === openMenuId);
-                        if (teacher) {
-                          alert('Edit functionality coming soon');
-                        }
-                        setOpenMenuId(null);
+                        openEditTeacher(openMenuId);
                       }}
                       className="block w-full text-left px-3 sm:px-4 py-2 text-xs sm:text-sm text-gray-700 hover:bg-gray-100"
                     >
@@ -473,18 +661,211 @@ const Teachers = () => {
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        const teacher = filteredTeachers.find(t => t.teacher_id === openMenuId);
-                        if (teacher) {
-                          alert('View details functionality coming soon');
-                        }
-                        setOpenMenuId(null);
+                        openTeacherDetails(openMenuId);
                       }}
                       className="block w-full text-left px-3 sm:px-4 py-2 text-xs sm:text-sm text-gray-700 hover:bg-gray-100"
                     >
                       View Details
                     </button>
                   </div>
-                </div>
+                </div>,
+                document.body
+              )}
+
+              {/* Teacher Details Modal */}
+              {isDetailsModalOpen && createPortal(
+                <div
+                  className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 z-[10000]"
+                  onClick={(e) => {
+                    if (e.target === e.currentTarget) {
+                      setIsDetailsModalOpen(false);
+                      setSelectedTeacher(null);
+                    }
+                  }}
+                >
+                  <div
+                    className="bg-white rounded-lg shadow-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="p-4 sm:p-6 border-b border-gray-200 flex items-center justify-between">
+                      <h2 className="text-lg sm:text-xl font-bold text-gray-900">Teacher Details</h2>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsDetailsModalOpen(false);
+                          setSelectedTeacher(null);
+                        }}
+                        className="text-gray-400 hover:text-gray-600 transition-colors"
+                        aria-label="Close teacher details modal"
+                      >
+                        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
+                    </div>
+                    <div className="p-4 sm:p-6">
+                      {isDetailsLoading ? (
+                        <div className="py-8 text-center text-sm text-gray-600">Loading teacher details...</div>
+                      ) : selectedTeacher ? (
+                        <div className="space-y-4">
+                          <div>
+                            <p className="text-xs uppercase text-gray-500">Full name</p>
+                            <p className="text-sm text-gray-900">{selectedTeacher.fullname || 'N/A'}</p>
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div>
+                              <p className="text-xs uppercase text-gray-500">Email</p>
+                              <p className="text-sm text-gray-900 break-all">{selectedTeacher.email || 'N/A'}</p>
+                            </div>
+                            <div>
+                              <p className="text-xs uppercase text-gray-500">Gender</p>
+                              <p className="text-sm text-gray-900">{formatGender(selectedTeacher.gender)}</p>
+                            </div>
+                            <div>
+                              <p className="text-xs uppercase text-gray-500">Status</p>
+                              <p className="text-sm text-gray-900">{selectedTeacher.status || 'N/A'}</p>
+                            </div>
+                            <div>
+                              <p className="text-xs uppercase text-gray-500">Phone number</p>
+                              <p className="text-sm text-gray-900">{selectedTeacher.phone_number || 'N/A'}</p>
+                            </div>
+                          </div>
+                          <div>
+                            <p className="text-xs uppercase text-gray-500">Description</p>
+                            <p className="text-sm text-gray-900 whitespace-pre-wrap">
+                              {selectedTeacher.description || 'No description provided.'}
+                            </p>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="py-8 text-center text-sm text-gray-600">No teacher details found.</div>
+                      )}
+                    </div>
+                  </div>
+                </div>,
+                document.body
+              )}
+
+              {/* Edit Teacher Modal */}
+              {isEditModalOpen && createPortal(
+                <div
+                  className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 z-[10000]"
+                  onClick={(e) => {
+                    if (e.target === e.currentTarget) {
+                      setIsEditModalOpen(false);
+                      setEditingTeacherId(null);
+                      setEditError('');
+                    }
+                  }}
+                >
+                  <div
+                    className="bg-white rounded-lg shadow-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="p-4 sm:p-6 border-b border-gray-200 flex items-center justify-between">
+                      <h2 className="text-lg sm:text-xl font-bold text-gray-900">Edit Teacher Profile</h2>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsEditModalOpen(false);
+                          setEditingTeacherId(null);
+                          setEditError('');
+                        }}
+                        className="text-gray-400 hover:text-gray-600 transition-colors"
+                        aria-label="Close edit teacher modal"
+                      >
+                        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
+                    </div>
+                    <form onSubmit={handleEditSubmit} className="p-4 sm:p-6 space-y-4">
+                      <div>
+                        <label htmlFor="edit-fullname" className="block text-sm font-medium text-gray-700 mb-1">
+                          Full name
+                        </label>
+                        <input
+                          id="edit-fullname"
+                          name="fullname"
+                          type="text"
+                          value={editFormData.fullname}
+                          onChange={handleEditChange}
+                          className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                          required
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="edit-email" className="block text-sm font-medium text-gray-700 mb-1">
+                          Email
+                        </label>
+                        <input
+                          id="edit-email"
+                          name="email"
+                          type="email"
+                          value={editFormData.email}
+                          onChange={handleEditChange}
+                          className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                          required
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="edit-gender" className="block text-sm font-medium text-gray-700 mb-1">
+                          Gender
+                        </label>
+                        <ResponsiveSelect
+                          id="edit-gender"
+                          name="gender"
+                          value={editFormData.gender}
+                          onChange={handleEditChange}
+                          className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:outline-none"
+                          aria-label="Gender"
+                        >
+                          <option value="">Not specified</option>
+                          <option value="male">Male</option>
+                          <option value="female">Female</option>
+                          <option value="other">Other</option>
+                        </ResponsiveSelect>
+                      </div>
+                      <div>
+                        <label htmlFor="edit-description" className="block text-sm font-medium text-gray-700 mb-1">
+                          Description
+                        </label>
+                        <textarea
+                          id="edit-description"
+                          name="description"
+                          rows={4}
+                          value={editFormData.description}
+                          onChange={handleEditChange}
+                          className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                        />
+                      </div>
+                      {editError && (
+                        <p className="text-sm text-red-600">{editError}</p>
+                      )}
+                      <div className="flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setIsEditModalOpen(false);
+                            setEditingTeacherId(null);
+                            setEditError('');
+                          }}
+                          className="px-4 py-2 text-sm border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={isEditSubmitting}
+                          className="px-4 py-2 text-sm font-medium text-white bg-primary-600 rounded-lg hover:bg-primary-700 disabled:opacity-60 disabled:cursor-not-allowed"
+                        >
+                          {isEditSubmitting ? 'Saving...' : 'Save Changes'}
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+                </div>,
+                document.body
               )}
 
               {/* Media Preview Modal */}

@@ -5,9 +5,31 @@ dotenv.config();
 
 const { Pool } = pkg;
 
+const dbHost = process.env.DB_HOST || 'localhost';
+const isLocalDb =
+  dbHost === 'localhost' ||
+  dbHost === '127.0.0.1' ||
+  dbHost === '::1';
+
+/** Neon / RDS / most cloud Postgres require TLS (sslmode=require). Local dev usually does not. */
+const useSsl =
+  process.env.DB_SSL === 'false' || process.env.DB_SSL === '0'
+    ? false
+    : process.env.DB_SSL === 'true' ||
+      process.env.DB_SSL === '1' ||
+      !isLocalDb;
+
+const sslConfig = useSsl
+  ? {
+      ssl: {
+        rejectUnauthorized: process.env.DB_SSL_REJECT_UNAUTHORIZED !== 'false',
+      },
+    }
+  : {};
+
 // Database connection pool
 const pool = new Pool({
-  host: process.env.DB_HOST || 'localhost',
+  host: dbHost,
   port: process.env.DB_PORT || 5432,
   database: process.env.DB_NAME || 'funtalk_db',
   user: process.env.DB_USER || 'postgres',
@@ -15,18 +37,22 @@ const pool = new Pool({
   max: 20, // Maximum number of clients in the pool
   idleTimeoutMillis: 30000, // Close idle clients after 30 seconds
   connectionTimeoutMillis: 2000, // Return an error after 2 seconds if connection could not be established
+  /** Neon pooler rejects `-c search_path=...` in startup options; set search_path in transactions where needed */
+  ...sslConfig,
 });
 
-// Test database connection
-pool.on('connect', () => {
-  if (process.env.QUIET_STARTUP !== '1') {
-    console.log('✅ Database connected successfully');
-  }
+// Neon pooler rejects `-c search_path=...` in startup options; set per session so
+// unqualified names (e.g. userstbl) resolve to public.
+pool.on('connect', (client) => {
+  client.query('SET search_path TO public, pg_catalog').catch((err) => {
+    console.error('Failed to set search_path on new pool client:', err.message);
+  });
+  console.log('✅ Database connected successfully');
 });
 
 pool.on('error', (err) => {
   console.error('❌ Unexpected error on idle client', err);
-  if (!process.env.FUNTALK_EMBEDDED) process.exit(-1);
+  process.exit(-1);
 });
 
 // Query helper function
@@ -35,9 +61,7 @@ export const query = async (text, params) => {
   try {
     const res = await pool.query(text, params);
     const duration = Date.now() - start;
-    if (process.env.DEBUG_DB_QUERIES === '1') {
-      console.log('Executed query', { text, duration, rows: res.rowCount });
-    }
+    console.log('Executed query', { text, duration, rows: res.rowCount });
     return res;
   } catch (error) {
     console.error('Database query error:', error);

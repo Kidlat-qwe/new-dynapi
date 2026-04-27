@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Area,
   AreaChart,
@@ -16,11 +17,16 @@ import {
 import { apiRequest } from '../../config/api';
 import { useAuth } from '../../contexts/AuthContext';
 import { formatDateManila } from '../../utils/dateUtils';
+import { DashboardStatIcon } from '../../components/dashboard/DashboardStatIcons';
 
 const COLORS = ['#F7C844', '#4F46E5', '#22C55E', '#F97316', '#14B8A6', '#EC4899'];
 
-const StatsCard = ({ title, value, icon, accent, subtitle }) => (
-  <div className="group relative overflow-hidden rounded-2xl bg-white p-6 shadow-sm ring-1 ring-gray-100 transition-all duration-300 hover:shadow-lg hover:ring-gray-200">
+const StatsCard = ({ title, value, iconName, accent, subtitle, onClick }) => (
+  <button
+    type="button"
+    onClick={onClick}
+    className={`group relative w-full overflow-hidden rounded-2xl bg-white p-6 text-left shadow-sm ring-1 ring-gray-100 transition-all duration-300 hover:shadow-lg hover:ring-gray-200 ${onClick ? 'cursor-pointer focus:outline-none focus:ring-2 focus:ring-[#F7C844] focus:ring-offset-2' : 'cursor-default'}`}
+  >
     <div className="flex items-start justify-between">
       <div className="flex-1">
         <p className="text-sm font-medium text-gray-600">{title}</p>
@@ -28,11 +34,11 @@ const StatsCard = ({ title, value, icon, accent, subtitle }) => (
         {subtitle && <p className="mt-2 text-xs font-medium text-gray-500">{subtitle}</p>}
       </div>
       <div className={`ml-4 flex h-14 w-14 items-center justify-center rounded-xl ${accent} shadow-sm transition-transform duration-300 group-hover:scale-110`}>
-        <span className="text-2xl">{icon}</span>
+        <DashboardStatIcon name={iconName} className="h-7 w-7 text-white drop-shadow-sm" />
       </div>
     </div>
     <div className={`absolute inset-x-0 bottom-0 h-1 ${accent.replace('bg-', 'bg-gradient-to-r from-').replace('/80', ' to-transparent')}`} />
-  </div>
+  </button>
 );
 
 const ChartCard = ({ title, subtitle, children, className = '' }) => (
@@ -50,14 +56,17 @@ const formatCurrency = (amount) => {
   if (!Number.isFinite(n)) return '₱0.00';
   return `₱${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 };
+const CURRENT_MONTH = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' }).slice(0, 7);
 
 const AdminFinancialDashboard = () => {
+  const navigate = useNavigate();
   const { userInfo } = useAuth();
   const adminBranchId = userInfo?.branch_id || userInfo?.branchId;
 
   const [metrics, setMetrics] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [selectedMonth, setSelectedMonth] = useState('');
 
   const branchName = useMemo(() => {
     return userInfo?.branch_name || userInfo?.branchName || 'Your Branch';
@@ -70,6 +79,9 @@ const AdminFinancialDashboard = () => {
       setError('');
       const params = new URLSearchParams();
       params.append('branch_id', String(adminBranchId));
+      if (selectedMonth) {
+        params.append('month', selectedMonth);
+      }
       const response = await apiRequest(`/dashboard?${params.toString()}`);
       setMetrics(response.data);
     } catch (err) {
@@ -82,7 +94,7 @@ const AdminFinancialDashboard = () => {
   useEffect(() => {
     fetchDashboardData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [adminBranchId]);
+  }, [adminBranchId, selectedMonth]);
 
   const totals = metrics?.totals || { total_branches: 0, total_students: 0, total_teachers: 0, active_classes: 0 };
 
@@ -99,6 +111,26 @@ const AdminFinancialDashboard = () => {
     () => metrics?.crossing_procedures || { total_violations: 0, violations: [] },
     [metrics]
   );
+  const openArByVerification = (type) => {
+    const params = new URLSearchParams();
+    params.set('page', '1');
+    if (type === 'verified') {
+      params.set('status', 'Verified,Applied');
+    } else {
+      params.set('status', 'Submitted,Pending,Paid');
+    }
+    navigate(`/admin/acknowledgement-receipts?${params.toString()}`);
+  };
+  const arVerification = useMemo(
+    () =>
+      metrics?.ar_verification || {
+        verified_count: 0,
+        verified_amount: 0,
+        unverified_count: 0,
+        unverified_amount: 0,
+      },
+    [metrics]
+  );
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-gray-50">
@@ -109,6 +141,16 @@ const AdminFinancialDashboard = () => {
             <p className="text-sm text-gray-500">Branch overview: {branchName}</p>
           </div>
           <div className="flex flex-wrap items-end gap-4">
+            <label className="inline-flex items-center gap-2 rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700 shadow-sm">
+              <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">Month</span>
+              <input
+                type="month"
+                value={selectedMonth}
+                max={CURRENT_MONTH}
+                onChange={(e) => setSelectedMonth(e.target.value)}
+                className="rounded-md border border-gray-300 px-2 py-1 text-sm text-gray-700 focus:border-[#F7C844] focus:outline-none focus:ring-2 focus:ring-[#F7C844]/40"
+              />
+            </label>
             <button
               type="button"
               onClick={fetchDashboardData}
@@ -139,27 +181,54 @@ const AdminFinancialDashboard = () => {
             title="Students (Branch)"
             value={(totals.total_students || 0).toLocaleString()}
             accent="bg-gradient-to-br from-emerald-400 to-emerald-500"
-            icon="🎓"
+            iconName="users"
           />
           <StatsCard
             title="Teachers (Branch)"
             value={(totals.total_teachers || 0).toLocaleString()}
             accent="bg-gradient-to-br from-indigo-400 to-indigo-500"
-            icon="👩‍🏫"
+            iconName="academicCap"
           />
           <StatsCard
             title="Active Classes"
             value={(totals.active_classes || 0).toLocaleString()}
             accent="bg-gradient-to-br from-orange-400 to-orange-500"
-            icon="📚"
+            iconName="bookOpen"
           />
           <StatsCard
             title="Total Invoice Amount"
             value={formatCurrency(totalInvoiceAmount)}
             subtitle="Sum of invoice totals by status"
             accent="bg-gradient-to-br from-yellow-400 to-yellow-500"
-            icon="💳"
+            iconName="creditCard"
           />
+        </div>
+
+        <div className="space-y-3">
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900">Acknowledgement Receipt verification (Package AR)</h2>
+            <p className="mt-1 text-sm text-gray-500">
+              Verified AR includes Verified/Applied statuses. Unverified AR includes Submitted/Pending statuses awaiting Finance/Superfinance action.
+            </p>
+          </div>
+          <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+            <StatsCard
+              title="Verified AR"
+              value={formatCurrency(arVerification.verified_amount)}
+              subtitle={`${(arVerification.verified_count || 0).toLocaleString()} receipt(s)`}
+              accent="bg-gradient-to-br from-emerald-400 to-emerald-600"
+              iconName="shieldCheck"
+              onClick={() => openArByVerification('verified')}
+            />
+            <StatsCard
+              title="Unverified AR"
+              value={formatCurrency(arVerification.unverified_amount)}
+              subtitle={`${(arVerification.unverified_count || 0).toLocaleString()} receipt(s)`}
+              accent="bg-gradient-to-br from-amber-400 to-amber-600"
+              iconName="clock"
+              onClick={() => openArByVerification('unverified')}
+            />
+          </div>
         </div>
 
         <div className="grid gap-6 lg:grid-cols-2">

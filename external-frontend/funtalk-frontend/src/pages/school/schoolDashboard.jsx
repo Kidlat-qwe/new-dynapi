@@ -2,7 +2,15 @@ import { useEffect, useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import Header from '../../components/Header';
 import Sidebar from '../../components/Sidebar';
-import { fetchFuntalk } from '../../lib/api';
+import { API_BASE_URL } from '@/config/api.js';
+
+const DURATION_MINUTES_TO_CREDITS = { 25: 1, 50: 2, 75: 3, 100: 4 };
+
+const creditsChargedForAppointmentNotes = (notes) => {
+  const m = String(notes ?? '').match(/Duration:\s*(\d+)\s*mins/i);
+  if (!m) return 1;
+  return DURATION_MINUTES_TO_CREDITS[Number(m[1])] ?? 1;
+};
 
 const SchoolDashboard = () => {
   const navigate = useNavigate();
@@ -52,11 +60,22 @@ const SchoolDashboard = () => {
   const fetchDashboardData = async () => {
     setIsFetching(true);
     try {
+      const token = localStorage.getItem('token');
+
+      // Fetch all data in parallel
       const [balanceRes, studentsRes, appointmentsRes, transactionsRes] = await Promise.all([
-        fetchFuntalk('/credits/balance', {}),
-        fetchFuntalk('/students', {}),
-        fetchFuntalk('/appointments', {}),
-        fetchFuntalk('/credits/transactions?limit=5', {}),
+        fetch(`${API_BASE_URL}/credits/balance`, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        }),
+        fetch(`${API_BASE_URL}/students`, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        }),
+        fetch(`${API_BASE_URL}/appointments`, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        }),
+        fetch(`${API_BASE_URL}/credits/transactions?limit=5`, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        }),
       ]);
 
       // Process credit balance
@@ -99,16 +118,22 @@ const SchoolDashboard = () => {
           .slice(0, 5);
         setRecentAppointments(recent);
 
-        // Calculate credits used this month
+        // Credits used this month = sum charged when classes were marked completed (matches backend deduction)
         const currentMonth = new Date().getMonth();
         const currentYear = new Date().getFullYear();
-        const monthDeductions = appointments.filter(apt => {
+        const completedThisMonth = appointments.filter((apt) => {
           const aptDate = new Date(apt.appointment_date);
-          return aptDate.getMonth() === currentMonth && 
-                 aptDate.getFullYear() === currentYear &&
-                 apt.status !== 'cancelled';
+          return (
+            aptDate.getMonth() === currentMonth &&
+            aptDate.getFullYear() === currentYear &&
+            apt.status === 'completed'
+          );
         });
-        setCreditsUsedThisMonth(monthDeductions.length);
+        const creditsUsed = completedThisMonth.reduce(
+          (sum, apt) => sum + creditsChargedForAppointmentNotes(apt.additional_notes),
+          0
+        );
+        setCreditsUsedThisMonth(creditsUsed);
       }
 
       // Process transactions
@@ -157,6 +182,16 @@ const SchoolDashboard = () => {
       no_show: 'bg-gray-100 text-gray-800',
     };
     return colors[status] || 'bg-gray-100 text-gray-800';
+  };
+
+  const canJoinClass = (apt) => apt.status === 'approved' && Boolean(apt.meeting_link);
+
+  const handleStudentJoinClass = (appointment) => {
+    if (appointment.meeting_link) {
+      window.open(appointment.meeting_link, '_blank', 'noopener,noreferrer');
+    } else {
+      alert('Meeting link is not available yet. It appears after the booking is approved.');
+    }
   };
 
   // Format transaction type
@@ -305,9 +340,9 @@ const SchoolDashboard = () => {
                           <div className="space-y-3 sm:space-y-4">
                             {recentAppointments.map((apt) => (
                               <div key={apt.appointment_id} className="border border-gray-200 rounded-lg p-3 sm:p-4">
-                                <div className="flex items-start justify-between">
-                                  <div className="flex-1">
-                                    <div className="flex items-center gap-2 mb-1">
+                                <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+                                  <div className="flex-1 min-w-0">
+                                    <div className="flex items-center gap-2 mb-1 flex-wrap">
                                       <h3 className="text-sm sm:text-base font-semibold text-gray-900">
                                         {apt.student_name || 'N/A'}
                                       </h3>
@@ -316,12 +351,21 @@ const SchoolDashboard = () => {
                                       </span>
                                     </div>
                                     <p className="text-xs sm:text-sm text-gray-600">
-                                      Teacher: {apt.teacher_name || 'N/A'}
+                                      Teacher: {apt.teacher_name || (apt.status === 'pending' ? 'To be assigned' : 'N/A')}
                                     </p>
                                     <p className="text-xs sm:text-sm text-gray-600">
                                       {formatDateTime(apt.appointment_date, apt.appointment_time)}
                                     </p>
                                   </div>
+                                  {canJoinClass(apt) && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleStudentJoinClass(apt)}
+                                      className="shrink-0 self-start sm:self-center px-3 py-1.5 text-xs sm:text-sm font-medium bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors"
+                                    >
+                                      Join class
+                                    </button>
+                                  )}
                                 </div>
                               </div>
                             ))}

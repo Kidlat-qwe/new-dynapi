@@ -3,16 +3,103 @@ import { body, param, query as queryValidator } from 'express-validator';
 import { verifyFirebaseToken, requireRole, requireBranchAccess } from '../middleware/auth.js';
 import { handleValidationErrors } from '../middleware/validation.js';
 import { query, getClient } from '../config/database.js';
-import { sendInvoiceEmail } from '../utils/emailService.js';
-import { generateInvoicePDFBuffer } from '../utils/pdfGenerator.js';
+import {
+  sendSystemNotificationEmail,
+  sendSystemNotificationEmailToEach,
+  normalizeNotificationRecipients,
+} from '../utils/emailService.js';
 import { formatYmdLocal } from '../utils/dateUtils.js';
-import { buildPhaseInstallmentSchedule } from '../utils/phaseInstallmentUtils.js';
+import { buildPhaseInstallmentSchedule, getPhaseDueDateYmd } from '../utils/phaseInstallmentUtils.js';
+import { paymenttblHasActionOwnerUserIdColumn } from '../utils/paymentSchema.js';
+import { sendInvoicePaymentConfirmationByInvoiceId } from '../utils/paymentConfirmationEmailService.js';
+import {
+  computeOriginalInvoiceAmount,
+  computeOriginalAfterDeletingPayment,
+  computeInvoiceOriginalForRecalc,
+  createBalanceInvoiceFromPartial,
+  getCanonicalInstallmentPhaseCounts,
+  getChainRootInvoiceId,
+  removeUnusedBalanceInvoice,
+} from '../utils/balanceInvoice.js';
 
 const router = express.Router();
 
 // All routes require authentication
 router.use(verifyFirebaseToken);
 router.use(requireBranchAccess);
+
+/** Branch-side owner for return fixes: invoice issuer first, then action owner, then payment encoder. */
+const getPaymentReturnOwnerId = (payment, invoiceCreatedBy) =>
+  invoiceCreatedBy ?? payment?.action_owner_user_id ?? payment?.created_by ?? null;
+
+const escapeHtml = (value) =>
+  String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+let announcementTargetUserIdSupportPromise = null;
+const announcementstblHasTargetUserIdColumn = async () => {
+  if (!announcementTargetUserIdSupportPromise) {
+    announcementTargetUserIdSupportPromise = (async () => {
+      try {
+        const res = await query(
+          `SELECT 1
+           FROM information_schema.columns
+           WHERE table_schema = 'public'
+             AND table_name = 'announcementstbl'
+             AND column_name = 'target_user_id'
+           LIMIT 1`
+        );
+        return res.rows.length > 0;
+      } catch (err) {
+        console.error('announcementstblHasTargetUserIdColumn:', err?.message || err);
+        return false;
+      }
+    })();
+  }
+  return announcementTargetUserIdSupportPromise;
+};
+
+/**
+ * Finance/Superfinance may edit returned payments for operational reasons.
+ * Admin must be the assigned owner; Superadmin may override.
+ */
+const assertBranchUserMayEditReturnedPayment = (req, payment) => {
+  if (!payment || payment.approval_status !== 'Returned') {
+    return { ok: true };
+  }
+  const ut = req.user.userType;
+  if (ut === 'Finance' || ut === 'Superfinance') {
+    return { ok: true };
+  }
+  if (ut === 'Superadmin') {
+    return { ok: true };
+  }
+  if (ut !== 'Admin') {
+    return { ok: false, status: 403, message: 'Access denied' };
+  }
+  const ownerId = getPaymentReturnOwnerId(payment);
+  const uid = req.user.userId;
+  if (ownerId == null) {
+    return {
+      ok: false,
+      status: 403,
+      message:
+        'This returned payment has no assigned invoice owner. Please contact a superadmin.',
+    };
+  }
+  if (Number(ownerId) === Number(uid)) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    status: 403,
+    message: 'Only the staff member who issued the invoice may fix this returned payment.',
+  };
+};
 
 const syncInstallmentEnrollmentForPaidInvoice = async ({
   client,
@@ -25,16 +112,11 @@ const syncInstallmentEnrollmentForPaidInvoice = async ({
     return;
   }
 
-  const paidInstallmentCountResult = await client.query(
-    `SELECT COUNT(*) AS paid_count
-     FROM invoicestbl i
-     WHERE i.installmentinvoiceprofiles_id = $1
-       AND i.status = 'Paid'
-       AND ($2::INTEGER IS NULL OR i.invoice_id != $2::INTEGER)`,
-    [profileId, profile.downpayment_invoice_id || null]
+  const { paidPhaseCount: paidInstallmentCount } = await getCanonicalInstallmentPhaseCounts(
+    client,
+    profileId,
+    profile.downpayment_invoice_id || null
   );
-
-  const paidInstallmentCount = parseInt(paidInstallmentCountResult.rows[0]?.paid_count || 0, 10);
   if (paidInstallmentCount <= 0) {
     return;
   }
@@ -50,7 +132,11 @@ const syncInstallmentEnrollmentForPaidInvoice = async ({
   const existingPhaseEnrollment = await client.query(
     `SELECT classstudent_id
      FROM classstudentstbl
-     WHERE student_id = $1 AND class_id = $2 AND phase_number = $3`,
+     WHERE student_id = $1
+       AND class_id = $2
+       AND phase_number = $3
+       AND COALESCE(enrollment_status, 'Active') = 'Active'
+       AND removed_at IS NULL`,
     [studentId, profile.class_id, targetPhase]
   );
 
@@ -80,6 +166,10 @@ const createFirstInstallmentRecordAfterDownpayment = async ({
   paymentIssueDate,
 }) => {
   const paymentDateYmd = paymentIssueDate || formatYmdLocal(new Date());
+  const nonPhaseFirstDueYmd =
+    profile.class_id && (profile.phase_start === null || profile.phase_start === undefined)
+      ? await getPhaseDueDateYmd(client, profile.class_id, 1)
+      : null;
   const phaseSchedule = profile.phase_start != null
     ? await buildPhaseInstallmentSchedule({
         db: client,
@@ -99,6 +189,7 @@ const createFirstInstallmentRecordAfterDownpayment = async ({
   const currentInvoiceMonthYmd = phaseSchedule?.current_invoice_month
     || (profile.next_invoice_due_date ? formatYmdLocal(new Date(profile.next_invoice_due_date)) : paymentDateYmd);
   const scheduledDateYmd = phaseSchedule?.current_due_date
+    || nonPhaseFirstDueYmd
     || profile.bill_invoice_due_date
     || (profile.next_invoice_due_date ? formatYmdLocal(new Date(profile.next_invoice_due_date)) : paymentDateYmd);
 
@@ -129,6 +220,257 @@ const createFirstInstallmentRecordAfterDownpayment = async ({
 };
 
 /**
+ * In-app notifications via announcementstbl (same pattern as merchandise: Active, Medium priority).
+ * Does not throw — logs on failure so payment APIs still succeed.
+ */
+const notifyPaymentReturnedToBranch = async ({
+  paymentId,
+  branchId,
+  invoiceId,
+  reason,
+  returnedByUserId,
+  actionOwnerUserId,
+  invoiceOwnerUserId,
+}) => {
+  try {
+    if (!branchId) return;
+    const hasTargetUserIdColumn = await announcementstblHasTargetUserIdColumn();
+    const [branchRes, userRes, payRes] = await Promise.all([
+      query(
+        `SELECT COALESCE(branch_nickname, branch_name) AS branch_name FROM branchestbl WHERE branch_id = $1`,
+        [branchId]
+      ),
+      query(`SELECT full_name, email FROM userstbl WHERE user_id = $1`, [returnedByUserId]),
+      query(
+        `SELECT COALESCE(u.full_name, u.email, 'Student') AS student_label
+         FROM paymenttbl p
+         LEFT JOIN userstbl u ON p.student_id = u.user_id
+         WHERE p.payment_id = $1`,
+        [paymentId]
+      ),
+    ]);
+    const branchName = branchRes.rows[0]?.branch_name || `Branch ${branchId}`;
+    const returnedBy = userRes.rows[0]?.full_name || userRes.rows[0]?.email || 'Finance';
+    const studentLabel = payRes.rows[0]?.student_label || 'Student';
+    const invLabel = invoiceId != null ? `INV-${invoiceId}` : `Payment #${paymentId}`;
+    const reasonText = reason && String(reason).trim() ? ` Note from Finance: ${String(reason).trim()}` : '';
+    const detailBody = `${returnedBy} returned ${invLabel} (${studentLabel}) at ${branchName} for reference or attachment correction.${reasonText}`;
+
+    if (!hasTargetUserIdColumn) {
+      // Fallback for environments that have not applied target_user_id migration yet.
+      // Admin recipient group is visible to branch admins; superadmin (branch_id NULL) also sees all.
+      await query(
+        `INSERT INTO announcementstbl (title, body, recipient_groups, status, priority, branch_id, created_by, navigation_key, navigation_query)
+         VALUES ($1, $2, $3, 'Active', 'Medium', $4, $5, $6, $7)`,
+        [
+          'Payment returned — action needed',
+          detailBody,
+          ['Admin'],
+          branchId,
+          returnedByUserId,
+          'payment-logs',
+          'notificationTab=return',
+        ]
+      );
+    } else {
+      const ownerTargetIds = Array.from(
+        new Set(
+          [invoiceOwnerUserId, actionOwnerUserId]
+            .map((id) => (id == null ? null : Number(id)))
+            .filter((id) => id != null && !Number.isNaN(id))
+        )
+      );
+
+      if (ownerTargetIds.length > 0) {
+        await Promise.all(
+          ownerTargetIds.map((targetUserId) => {
+            const targetBody =
+              Number(targetUserId) === Number(returnedByUserId)
+                ? `You returned ${invLabel} (${studentLabel}) for correction.${reasonText}`
+                : `${invLabel} (${studentLabel}) was returned by ${returnedBy} for correction.${reasonText}`;
+            return query(
+              `INSERT INTO announcementstbl (title, body, recipient_groups, status, priority, branch_id, created_by, target_user_id, navigation_key, navigation_query)
+               VALUES ($1, $2, $3, 'Active', 'Medium', $4, $5, $6, $7, $8)`,
+              [
+                'Payment returned — action needed',
+                targetBody,
+                ['All'],
+                branchId,
+                returnedByUserId,
+                targetUserId,
+                'payment-logs',
+                'notificationTab=return',
+              ]
+            );
+          })
+        );
+      } else {
+        console.warn(
+          `notifyPaymentReturnedToBranch: skipped in-app announcement for payment_id=${paymentId} because action owner is missing`
+        );
+      }
+
+      // Always notify superadmins for visibility when Finance/Superfinance returns a payment.
+      try {
+        const superadminRes = await query(
+          `SELECT user_id
+           FROM userstbl
+           WHERE LOWER(TRIM(user_type)) = 'superadmin'`
+        );
+        const superadminIds = (superadminRes.rows || [])
+          .map((row) => row.user_id)
+          .filter(
+            (uid) =>
+              uid != null &&
+              Number(uid) !== Number(actionOwnerUserId) &&
+              Number(uid) !== Number(invoiceOwnerUserId)
+          );
+        if (superadminIds.length > 0) {
+          await Promise.all(
+            superadminIds.map((superadminUserId) =>
+              query(
+                `INSERT INTO announcementstbl (title, body, recipient_groups, status, priority, branch_id, created_by, target_user_id, navigation_key, navigation_query)
+                 VALUES ($1, $2, $3, 'Active', 'Medium', $4, $5, $6, $7, $8)`,
+                [
+                  'Payment returned — superadmin review',
+                  detailBody,
+                  ['All'],
+                  branchId,
+                  returnedByUserId,
+                  superadminUserId,
+                  'payment-logs',
+                  'notificationTab=return',
+                ]
+              )
+            )
+          );
+        }
+      } catch (superadminNotifyErr) {
+        console.error(
+          'notifyPaymentReturnedToBranch superadmin notify:',
+          superadminNotifyErr?.message || superadminNotifyErr
+        );
+      }
+    }
+
+    if (
+      actionOwnerUserId &&
+      Number(actionOwnerUserId) !== Number(returnedByUserId)
+    ) {
+      try {
+        const ownerRes = await query(
+          `SELECT full_name, email FROM userstbl WHERE user_id = $1`,
+          [actionOwnerUserId]
+        );
+        const rawEmail = ownerRes.rows[0]?.email;
+        const [to] = normalizeNotificationRecipients([rawEmail]);
+        if (to) {
+          const ownerFirst = ownerRes.rows[0]?.full_name || 'there';
+          const subject = `Payment returned — ${invLabel} (${branchName})`;
+          const html = `
+            <!DOCTYPE html>
+            <html><head><meta charset="UTF-8"></head>
+            <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+              <p>Hi ${escapeHtml(ownerFirst)},</p>
+              <p><strong>${escapeHtml(returnedBy)}</strong> returned <strong>${escapeHtml(invLabel)}</strong> for student <strong>${escapeHtml(studentLabel)}</strong> at <strong>${escapeHtml(branchName)}</strong> so you can fix the reference or attachment.</p>
+              ${reason && String(reason).trim() ? `<p><strong>Note from Finance:</strong> ${escapeHtml(String(reason).trim())}</p>` : ''}
+              <p>Open <strong>Payment Logs</strong> and use the <strong>Return</strong> tab to update this payment.</p>
+              <p style="color:#666;font-size:12px;">This is an automated message from the school management system.</p>
+            </body></html>`;
+          await sendSystemNotificationEmail({ to, subject, html });
+        }
+      } catch (emailErr) {
+        console.error(
+          'notifyPaymentReturnedToBranch email:',
+          emailErr?.message || emailErr
+        );
+      }
+    }
+  } catch (err) {
+    console.error('notifyPaymentReturnedToBranch:', err?.message || err);
+  }
+};
+
+const notifyPaymentResubmittedForVerification = async ({
+  paymentId,
+  branchId,
+  invoiceId,
+  resubmittedByUserId,
+}) => {
+  try {
+    if (!branchId) return;
+    const [branchRes, userRes, payRes] = await Promise.all([
+      query(
+        `SELECT COALESCE(branch_nickname, branch_name) AS branch_name FROM branchestbl WHERE branch_id = $1`,
+        [branchId]
+      ),
+      query(`SELECT full_name, email FROM userstbl WHERE user_id = $1`, [resubmittedByUserId]),
+      query(
+        `SELECT COALESCE(u.full_name, u.email, 'Student') AS student_label
+         FROM paymenttbl p
+         LEFT JOIN userstbl u ON p.student_id = u.user_id
+         WHERE p.payment_id = $1`,
+        [paymentId]
+      ),
+    ]);
+    const branchName = branchRes.rows[0]?.branch_name || `Branch ${branchId}`;
+    const submittedBy = userRes.rows[0]?.full_name || userRes.rows[0]?.email || 'Branch staff';
+    const studentLabel = payRes.rows[0]?.student_label || 'Student';
+    const invLabel = invoiceId != null ? `INV-${invoiceId}` : `Payment #${paymentId}`;
+    const body = `${submittedBy} resubmitted ${invLabel} (${studentLabel}) at ${branchName} for finance verification. Please review it in Payment Logs.`;
+
+    await query(
+      `INSERT INTO announcementstbl (title, body, recipient_groups, status, priority, branch_id, created_by, navigation_key, navigation_query)
+       VALUES ($1, $2, $3, 'Active', 'Medium', $4, $5, $6, $7)`,
+      ['Payment resubmitted for verification', body, ['Finance'], branchId, resubmittedByUserId, 'payment-logs', 'notificationTab=main']
+    );
+
+    try {
+      const financeRecipientsRes = await query(
+        `SELECT DISTINCT TRIM(email) AS email
+         FROM userstbl
+         WHERE COALESCE(TRIM(email), '') <> ''
+           AND (
+             LOWER(TRIM(user_type)) = 'superfinance'
+             OR (
+               LOWER(TRIM(user_type)) = 'finance'
+               AND ($1::int IS NULL OR branch_id = $1)
+             )
+           )`,
+        [branchId ?? null]
+      );
+      const recipients = normalizeNotificationRecipients(
+        (financeRecipientsRes.rows || []).map((r) => r.email)
+      );
+      if (recipients.length > 0) {
+        const subject = `Payment resubmitted for verification — ${invLabel} (${branchName})`;
+        const html = `
+          <!DOCTYPE html>
+          <html><head><meta charset="UTF-8"></head>
+          <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+            <p>Hi Finance Team,</p>
+            <p><strong>${escapeHtml(submittedBy)}</strong> resubmitted <strong>${escapeHtml(invLabel)}</strong> for student <strong>${escapeHtml(studentLabel)}</strong> at <strong>${escapeHtml(branchName)}</strong>.</p>
+            <p>Please review this payment in <strong>Payment Logs</strong> under your main verification queue.</p>
+            <p style="color:#666;font-size:12px;">This is an automated message from the school management system.</p>
+          </body></html>`;
+        await sendSystemNotificationEmailToEach({
+          recipients,
+          subject,
+          html,
+        });
+      }
+    } catch (emailErr) {
+      console.error(
+        'notifyPaymentResubmittedForVerification email:',
+        emailErr?.message || emailErr
+      );
+    }
+  } catch (err) {
+    console.error('notifyPaymentResubmittedForVerification:', err?.message || err);
+  }
+};
+
+/**
  * GET /api/sms/payments
  * Get all payments with optional filters
  * Access: All authenticated users
@@ -145,6 +487,11 @@ router.get(
     queryValidator('status').optional().isString().withMessage('Status must be a string'),
     queryValidator('page').optional().isInt({ min: 1 }).withMessage('Page must be a positive integer'),
     queryValidator('limit').optional().isInt({ min: 1, max: 100 }).withMessage('Limit must be between 1 and 100'),
+    queryValidator('approval_status').optional().isString().withMessage('approval_status must be a string'),
+    queryValidator('exclude_approval_status').optional().isString().withMessage('exclude_approval_status must be a string'),
+    queryValidator('returned_by_me').optional().isString().withMessage('returned_by_me must be a string'),
+    queryValidator('my_return_queue').optional().isString().withMessage('my_return_queue must be a string'),
+    queryValidator('issued_by_me').optional().isString().withMessage('issued_by_me must be a string'),
     handleValidationErrors,
   ],
   async (req, res, next) => {
@@ -157,30 +504,71 @@ router.get(
         issue_date_from: issueDateFrom,
         issue_date_to: issueDateTo,
         status,
+        approval_status: approvalStatus,
+        exclude_approval_status: excludeApprovalStatus,
+        returned_by_me: returnedByMeRaw,
+        my_return_queue: myReturnQueueRaw,
+        issued_by_me: issuedByMeRaw,
         page = 1,
         limit = 20,
       } = req.query;
+      const returnedByMe =
+        returnedByMeRaw === '1' || String(returnedByMeRaw).toLowerCase() === 'true';
+      let myReturnQueue =
+        myReturnQueueRaw === '1' || String(myReturnQueueRaw || '').toLowerCase() === 'true';
+      let issuedByMe =
+        issuedByMeRaw === '1' || String(issuedByMeRaw || '').toLowerCase() === 'true';
+      if (myReturnQueue && !['Superadmin', 'Admin', 'Finance'].includes(req.user.userType)) {
+        myReturnQueue = false;
+      }
+      if (issuedByMe && req.user.userType !== 'Admin') {
+        issuedByMe = false;
+      }
       const pageNum = parseInt(page) || 1;
       const limitNum = parseInt(limit) || 20;
       const offset = (pageNum - 1) * limitNum;
 
+      const hasActionOwnerCol = await paymenttblHasActionOwnerUserIdColumn();
+      const ownerSelectSql = hasActionOwnerCol
+        ? 'p.action_owner_user_id'
+        : 'NULL::integer AS action_owner_user_id';
+
       let sql = `SELECT p.payment_id, p.invoice_id, p.student_id, p.branch_id, 
-                        p.payment_method, p.payment_type, p.payable_amount, 
+                        p.payment_method, p.payment_type, p.payable_amount, COALESCE(p.tip_amount, 0) AS tip_amount,
                         TO_CHAR(p.issue_date, 'YYYY-MM-DD') as issue_date, 
                         p.status, p.reference_number, p.remarks, p.payment_attachment_url, p.created_by,
+                        ${ownerSelectSql},
                         TO_CHAR(p.created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at,
                         p.approval_status, p.approved_by,
                         TO_CHAR(p.approved_at, 'YYYY-MM-DD HH24:MI:SS') as approved_at,
-                        u.full_name as student_name, u.email as student_email,
+                        p.return_reason,
+                        TO_CHAR(p.returned_at, 'YYYY-MM-DD HH24:MI:SS') as returned_at,
+                        p.returned_by,
+                        returner.full_name as returned_by_name,
+                        u.full_name as student_name, u.email as student_email, u.level_tag as student_level_tag,
                         i.invoice_description, i.amount as invoice_amount,
+                        COALESCE(i.amount, 0) + COALESCE((
+                          SELECT SUM(COALESCE(px.tip_amount, 0))
+                          FROM paymenttbl px
+                          WHERE px.invoice_id = p.invoice_id
+                            AND px.status = 'Completed'
+                        ), 0) AS invoice_total_amount,
+                        i.invoice_ar_number AS invoice_ar_number,
                         COALESCE(b.branch_nickname, b.branch_name) AS branch_name,
                         approver.full_name as approved_by_name,
+                        payment_creator.full_name as payment_created_by_name,
+                        payment_creator.email as payment_created_by_email,
+                        invoice_issuer.full_name as invoice_issued_by_name,
+                        invoice_issuer.email as invoice_issued_by_email,
                         ar.prospect_student_name as ar_prospect_student_name
                  FROM paymenttbl p
                  LEFT JOIN userstbl u ON p.student_id = u.user_id
                  LEFT JOIN invoicestbl i ON p.invoice_id = i.invoice_id
+                 LEFT JOIN userstbl payment_creator ON p.created_by = payment_creator.user_id
+                 LEFT JOIN userstbl invoice_issuer ON i.created_by = invoice_issuer.user_id
                  LEFT JOIN branchestbl b ON p.branch_id = b.branch_id
                  LEFT JOIN userstbl approver ON p.approved_by = approver.user_id
+                 LEFT JOIN userstbl returner ON p.returned_by = returner.user_id
                  LEFT JOIN acknowledgement_receiptstbl ar ON ar.payment_id = p.payment_id
                  WHERE 1=1`;
       const params = [];
@@ -242,6 +630,64 @@ router.get(
         params.push(status);
       }
 
+      if (approvalStatus) {
+        const list = String(approvalStatus)
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (list.length === 1) {
+          paramCount++;
+          sql += ` AND p.approval_status = $${paramCount}`;
+          params.push(list[0]);
+        } else if (list.length > 1) {
+          paramCount++;
+          sql += ` AND p.approval_status = ANY($${paramCount}::text[])`;
+          params.push(list);
+        }
+      }
+
+      if (excludeApprovalStatus) {
+        const excl = String(excludeApprovalStatus)
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (excl.length > 0) {
+          paramCount++;
+          sql += ` AND (p.approval_status IS NULL OR NOT (p.approval_status = ANY($${paramCount}::text[])))`;
+          params.push(excl);
+        }
+      }
+
+      if (returnedByMe) {
+        paramCount++;
+        sql += ` AND p.returned_by = $${paramCount}`;
+        params.push(req.user.userId);
+      }
+
+      if (myReturnQueue) {
+        paramCount++;
+        sql += ` AND p.approval_status = 'Returned'`;
+        if (hasActionOwnerCol) {
+          sql += ` AND (
+          p.action_owner_user_id = $${paramCount}
+          OR (p.action_owner_user_id IS NULL AND p.created_by = $${paramCount})
+        )`;
+        } else {
+          sql += ` AND p.created_by = $${paramCount}`;
+        }
+        params.push(req.user.userId);
+      }
+
+      if (issuedByMe) {
+        paramCount++;
+        if (hasActionOwnerCol) {
+          sql += ` AND COALESCE(p.action_owner_user_id, i.created_by, p.created_by) = $${paramCount}`;
+        } else {
+          sql += ` AND COALESCE(i.created_by, p.created_by) = $${paramCount}`;
+        }
+        params.push(req.user.userId);
+      }
+
       sql += ` ORDER BY p.payment_id DESC LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
       params.push(limitNum, offset);
 
@@ -268,7 +714,10 @@ router.get(
       }
 
       // Get total count for pagination
-      let countSql = `SELECT COUNT(*) as total FROM paymenttbl p WHERE 1=1`;
+      let countSql = `SELECT COUNT(*) as total
+                      FROM paymenttbl p
+                      LEFT JOIN invoicestbl i ON p.invoice_id = i.invoice_id
+                      WHERE 1=1`;
       const countParams = [];
       let countParamCount = 0;
 
@@ -317,6 +766,64 @@ router.get(
         countParams.push(status);
       }
 
+      if (approvalStatus) {
+        const list = String(approvalStatus)
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (list.length === 1) {
+          countParamCount++;
+          countSql += ` AND p.approval_status = $${countParamCount}`;
+          countParams.push(list[0]);
+        } else if (list.length > 1) {
+          countParamCount++;
+          countSql += ` AND p.approval_status = ANY($${countParamCount}::text[])`;
+          countParams.push(list);
+        }
+      }
+
+      if (excludeApprovalStatus) {
+        const excl = String(excludeApprovalStatus)
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (excl.length > 0) {
+          countParamCount++;
+          countSql += ` AND (p.approval_status IS NULL OR NOT (p.approval_status = ANY($${countParamCount}::text[])))`;
+          countParams.push(excl);
+        }
+      }
+
+      if (returnedByMe) {
+        countParamCount++;
+        countSql += ` AND p.returned_by = $${countParamCount}`;
+        countParams.push(req.user.userId);
+      }
+
+      if (myReturnQueue) {
+        countParamCount++;
+        countSql += ` AND p.approval_status = 'Returned'`;
+        if (hasActionOwnerCol) {
+          countSql += ` AND (
+          p.action_owner_user_id = $${countParamCount}
+          OR (p.action_owner_user_id IS NULL AND p.created_by = $${countParamCount})
+        )`;
+        } else {
+          countSql += ` AND p.created_by = $${countParamCount}`;
+        }
+        countParams.push(req.user.userId);
+      }
+
+      if (issuedByMe) {
+        countParamCount++;
+        if (hasActionOwnerCol) {
+          countSql += ` AND COALESCE(p.action_owner_user_id, i.created_by, p.created_by) = $${countParamCount}`;
+        } else {
+          countSql += ` AND COALESCE(i.created_by, p.created_by) = $${countParamCount}`;
+        }
+        countParams.push(req.user.userId);
+      }
+
       const countResult = await query(countSql, countParams);
       const total = parseInt(countResult.rows[0].total);
 
@@ -332,6 +839,273 @@ router.get(
       });
     } catch (error) {
       next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/sms/payments/finance-unified
+ * Unified finance/superfinance logs:
+ * - regular payment rows
+ * - unapplied verified package AR rows (no payment_id/invoice_id yet)
+ */
+router.get(
+  '/finance-unified',
+  [
+    queryValidator('branch_id').optional().isInt().withMessage('Branch ID must be an integer'),
+    queryValidator('issue_date').optional().isISO8601().withMessage('issue_date must be YYYY-MM-DD'),
+    queryValidator('issue_date_from').optional().isISO8601().withMessage('issue_date_from must be YYYY-MM-DD'),
+    queryValidator('issue_date_to').optional().isISO8601().withMessage('issue_date_to must be YYYY-MM-DD'),
+    queryValidator('pending_only').optional().isString().withMessage('pending_only must be a string'),
+    queryValidator('page').optional().isInt({ min: 1 }).withMessage('Page must be a positive integer'),
+    queryValidator('limit').optional().isInt({ min: 1, max: 100 }).withMessage('Limit must be between 1 and 100'),
+    handleValidationErrors,
+  ],
+  requireRole('Finance', 'Superfinance'),
+  async (req, res, next) => {
+    try {
+      const {
+        branch_id,
+        issue_date,
+        issue_date_from: issueDateFrom,
+        issue_date_to: issueDateTo,
+        pending_only: pendingOnlyRaw,
+        page = 1,
+        limit = 20,
+      } = req.query;
+
+      const pageNum = parseInt(page, 10) || 1;
+      const limitNum = parseInt(limit, 10) || 20;
+      const offset = (pageNum - 1) * limitNum;
+      const pendingOnly =
+        pendingOnlyRaw === '1' || String(pendingOnlyRaw || '').toLowerCase() === 'true';
+
+      const fromTrim = issueDateFrom ? String(issueDateFrom).trim().slice(0, 10) : '';
+      const toTrim = issueDateTo ? String(issueDateTo).trim().slice(0, 10) : '';
+      const useIssueRange = Boolean(fromTrim || toTrim);
+      if (useIssueRange && fromTrim && toTrim && fromTrim > toTrim) {
+        return res.status(400).json({
+          success: false,
+          message: 'issue_date_from must be on or before issue_date_to',
+        });
+      }
+
+      // ---------- 1) Normal payment rows ----------
+      let paySql = `SELECT p.payment_id, p.invoice_id, p.student_id, p.branch_id,
+                           p.payment_method, p.payment_type, p.payable_amount, COALESCE(p.tip_amount, 0) AS tip_amount,
+                           TO_CHAR(p.issue_date, 'YYYY-MM-DD') as issue_date,
+                           p.status, p.reference_number, p.remarks, p.payment_attachment_url, p.created_by,
+                           TO_CHAR(p.created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at,
+                           p.approval_status, p.approved_by,
+                           TO_CHAR(p.approved_at, 'YYYY-MM-DD HH24:MI:SS') as approved_at,
+                           p.return_reason,
+                           TO_CHAR(p.returned_at, 'YYYY-MM-DD HH24:MI:SS') as returned_at,
+                           p.returned_by,
+                           returner.full_name as returned_by_name,
+                           u.full_name as student_name, u.email as student_email, u.level_tag as student_level_tag,
+                           i.invoice_description, i.amount as invoice_amount,
+                           COALESCE(i.amount, 0) + COALESCE((
+                             SELECT SUM(COALESCE(px.tip_amount, 0))
+                             FROM paymenttbl px
+                             WHERE px.invoice_id = p.invoice_id
+                               AND px.status = 'Completed'
+                           ), 0) AS invoice_total_amount,
+                           i.invoice_ar_number AS invoice_ar_number,
+                           COALESCE(b.branch_nickname, b.branch_name) AS branch_name,
+                           approver.full_name as approved_by_name,
+                           payment_creator.full_name as payment_created_by_name,
+                           payment_creator.email as payment_created_by_email,
+                           invoice_issuer.full_name as invoice_issued_by_name,
+                           invoice_issuer.email as invoice_issued_by_email,
+                           ar.prospect_student_name as ar_prospect_student_name
+                    FROM paymenttbl p
+                    LEFT JOIN userstbl u ON p.student_id = u.user_id
+                    LEFT JOIN invoicestbl i ON p.invoice_id = i.invoice_id
+                    LEFT JOIN userstbl payment_creator ON p.created_by = payment_creator.user_id
+                    LEFT JOIN userstbl invoice_issuer ON i.created_by = invoice_issuer.user_id
+                    LEFT JOIN branchestbl b ON p.branch_id = b.branch_id
+                    LEFT JOIN userstbl approver ON p.approved_by = approver.user_id
+                    LEFT JOIN userstbl returner ON p.returned_by = returner.user_id
+                    LEFT JOIN acknowledgement_receiptstbl ar ON ar.payment_id = p.payment_id
+                    WHERE 1=1`;
+      const payParams = [];
+      let payPc = 0;
+
+      if (req.user.userType !== 'Superfinance' && req.user.branchId) {
+        payPc++;
+        paySql += ` AND p.branch_id = $${payPc}`;
+        payParams.push(req.user.branchId);
+      } else if (branch_id) {
+        payPc++;
+        paySql += ` AND p.branch_id = $${payPc}`;
+        payParams.push(branch_id);
+      }
+
+      if (useIssueRange) {
+        if (fromTrim) {
+          payPc++;
+          paySql += ` AND p.issue_date >= $${payPc}::date`;
+          payParams.push(fromTrim);
+        }
+        if (toTrim) {
+          payPc++;
+          paySql += ` AND p.issue_date <= $${payPc}::date`;
+          payParams.push(toTrim);
+        }
+      } else if (issue_date) {
+        payPc++;
+        paySql += ` AND p.issue_date = $${payPc}::date`;
+        payParams.push(issue_date);
+      }
+
+      if (pendingOnly) {
+        paySql += ` AND p.status = 'Completed'
+                    AND (p.approval_status IS NULL OR p.approval_status NOT IN ('Approved', 'Returned'))`;
+      } else {
+        paySql += ` AND (p.approval_status IS NULL OR p.approval_status <> 'Returned')`;
+      }
+
+      paySql += ` ORDER BY p.issue_date DESC, p.payment_id DESC`;
+
+      const payRes = await query(paySql, payParams);
+      const paymentRows = (payRes.rows || []).map((row) => {
+        let studentName = row.student_name;
+        let studentEmail = row.student_email;
+        const isWalkIn = (studentEmail || '').toLowerCase() === 'walkin@merchandise.psms.internal';
+        if (isWalkIn && row.ar_prospect_student_name) {
+          studentName = row.ar_prospect_student_name;
+          studentEmail = null;
+        }
+        return {
+          ...row,
+          student_name: studentName,
+          student_email: studentEmail,
+          source_type: 'PAYMENT',
+          source_id: `PAY-${row.payment_id}`,
+          sort_id: Number(row.payment_id) || 0,
+        };
+      });
+
+      // ---------- 2) Unapplied verified AR rows ----------
+      let arSql = `SELECT ar.ack_receipt_id,
+                          ar.branch_id,
+                          ar.prospect_student_name,
+                          ar.prospect_student_email,
+                          ar.package_name_snapshot,
+                          ar.payment_amount,
+                          ar.tip_amount,
+                          ar.reference_number,
+                          ar.payment_attachment_url,
+                          ar.level_tag,
+                          ar.status,
+                          TO_CHAR(ar.issue_date, 'YYYY-MM-DD') as issue_date,
+                          ar.ack_receipt_number,
+                          ar.created_by,
+                          creator.full_name AS created_by_name,
+                          creator.email AS created_by_email,
+                          COALESCE(b.branch_nickname, b.branch_name) AS branch_name
+                   FROM acknowledgement_receiptstbl ar
+                   LEFT JOIN userstbl creator ON ar.created_by = creator.user_id
+                   LEFT JOIN branchestbl b ON ar.branch_id = b.branch_id
+                   WHERE ar.ar_type = 'Package'
+                     AND ar.status = 'Verified'
+                     AND ar.payment_id IS NULL
+                     AND ar.invoice_id IS NULL`;
+      const arParams = [];
+      let arPc = 0;
+
+      if (req.user.userType !== 'Superfinance' && req.user.branchId) {
+        arPc++;
+        arSql += ` AND ar.branch_id = $${arPc}`;
+        arParams.push(req.user.branchId);
+      } else if (branch_id) {
+        arPc++;
+        arSql += ` AND ar.branch_id = $${arPc}`;
+        arParams.push(branch_id);
+      }
+
+      if (useIssueRange) {
+        if (fromTrim) {
+          arPc++;
+          arSql += ` AND ar.issue_date >= $${arPc}::date`;
+          arParams.push(fromTrim);
+        }
+        if (toTrim) {
+          arPc++;
+          arSql += ` AND ar.issue_date <= $${arPc}::date`;
+          arParams.push(toTrim);
+        }
+      } else if (issue_date) {
+        arPc++;
+        arSql += ` AND ar.issue_date = $${arPc}::date`;
+        arParams.push(issue_date);
+      }
+
+      arSql += ` ORDER BY ar.issue_date DESC, ar.ack_receipt_id DESC`;
+      const arRes = await query(arSql, arParams);
+      const arRows = (arRes.rows || []).map((row) => ({
+        payment_id: `AR-${row.ack_receipt_id}`,
+        invoice_id: null,
+        student_id: null,
+        branch_id: row.branch_id,
+        payment_method: 'Acknowledgement Receipt',
+        payment_type: 'Unapplied AR',
+        payable_amount: Number(row.payment_amount || 0) + Number(row.tip_amount || 0),
+        issue_date: row.issue_date,
+        status: 'Verified',
+        reference_number: row.reference_number,
+        remarks: 'Awaiting enrollment attachment',
+        payment_attachment_url: row.payment_attachment_url,
+        created_by: row.created_by,
+        created_at: null,
+        approval_status: 'Pending',
+        approved_by: null,
+        approved_at: null,
+        return_reason: null,
+        returned_at: null,
+        returned_by: null,
+        returned_by_name: null,
+        student_name: row.prospect_student_name || 'Walk-in / AR',
+        student_email: row.prospect_student_email || null,
+        student_level_tag: row.level_tag || null,
+        invoice_description: row.package_name_snapshot || 'Acknowledgement Receipt (Unapplied)',
+        invoice_amount: null,
+        invoice_ar_number: row.ack_receipt_number || `AR-${row.ack_receipt_id}`,
+        branch_name: row.branch_name,
+        approved_by_name: null,
+        payment_created_by_name: row.created_by_name || null,
+        payment_created_by_email: row.created_by_email || null,
+        invoice_issued_by_name: null,
+        invoice_issued_by_email: null,
+        ar_prospect_student_name: row.prospect_student_name || null,
+        source_type: 'UNAPPLIED_AR',
+        source_id: `AR-${row.ack_receipt_id}`,
+        sort_id: Number(row.ack_receipt_id) || 0,
+      }));
+
+      // ---------- 3) Merge, sort, paginate ----------
+      const merged = [...paymentRows, ...arRows].sort((a, b) => {
+        const dateA = String(a.issue_date || '');
+        const dateB = String(b.issue_date || '');
+        if (dateA !== dateB) return dateA < dateB ? 1 : -1;
+        return (b.sort_id || 0) - (a.sort_id || 0);
+      });
+
+      const total = merged.length;
+      const pageData = merged.slice(offset, offset + limitNum).map(({ sort_id, ...rest }) => rest);
+
+      return res.json({
+        success: true,
+        data: pageData,
+        pagination: {
+          page: pageNum,
+          limit: limitNum,
+          total,
+          totalPages: Math.ceil(total / limitNum) || 1,
+        },
+      });
+    } catch (error) {
+      return next(error);
     }
   }
 );
@@ -369,6 +1143,13 @@ router.get(
                         TO_CHAR(p.approved_at, 'YYYY-MM-DD HH24:MI:SS') as approved_at,
                         u.full_name as student_name, u.email as student_email,
                         i.invoice_description, i.amount as invoice_amount,
+                        COALESCE(i.amount, 0) + COALESCE((
+                          SELECT SUM(COALESCE(px.tip_amount, 0))
+                          FROM paymenttbl px
+                          WHERE px.invoice_id = p.invoice_id
+                            AND px.status = 'Completed'
+                        ), 0) AS invoice_total_amount,
+                        i.invoice_ar_number AS invoice_ar_number,
                         COALESCE(b.branch_nickname, b.branch_name) AS branch_name,
                         approver.full_name as approved_by_name,
                         ar.prospect_student_name as ar_prospect_student_name
@@ -378,7 +1159,7 @@ router.get(
                  LEFT JOIN branchestbl b ON p.branch_id = b.branch_id
                  LEFT JOIN userstbl approver ON p.approved_by = approver.user_id
                  LEFT JOIN acknowledgement_receiptstbl ar ON ar.payment_id = p.payment_id
-                 WHERE p.payment_method = 'Cash'
+                 WHERE LOWER(TRIM(COALESCE(p.payment_method, ''))) = 'cash'
                    AND p.issue_date >= $1::date AND p.issue_date <= $2::date`;
       const params = [start, end];
       let paramCount = 2;
@@ -463,6 +1244,13 @@ router.get(
                 TO_CHAR(p.created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at,
                 u.full_name as student_name, u.email as student_email,
                 i.invoice_description, i.amount as invoice_amount,
+                COALESCE(i.amount, 0) + COALESCE((
+                  SELECT SUM(COALESCE(px.tip_amount, 0))
+                  FROM paymenttbl px
+                  WHERE px.invoice_id = p.invoice_id
+                    AND px.status = 'Completed'
+                ), 0) AS invoice_total_amount,
+                i.invoice_ar_number AS invoice_ar_number,
                 COALESCE(b.branch_nickname, b.branch_name) AS branch_name
          FROM paymenttbl p
          LEFT JOIN userstbl u ON p.student_id = u.user_id
@@ -519,9 +1307,11 @@ router.get(
                 TO_CHAR(p.issue_date, 'YYYY-MM-DD') as issue_date, 
                 p.status, p.reference_number, p.remarks, p.created_by,
                 TO_CHAR(p.created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at,
-                u.full_name as student_name, u.email as student_email
+                u.full_name as student_name, u.email as student_email,
+                i.invoice_ar_number AS invoice_ar_number
          FROM paymenttbl p
          LEFT JOIN userstbl u ON p.student_id = u.user_id
+         LEFT JOIN invoicestbl i ON p.invoice_id = i.invoice_id
          WHERE p.invoice_id = $1
          ORDER BY p.payment_id DESC`,
         [invoice_id]
@@ -550,6 +1340,7 @@ router.post(
     body('payment_method').notEmpty().isString().withMessage('Payment method is required'),
     body('payment_type').notEmpty().isString().withMessage('Payment type is required'),
     body('payable_amount').isFloat({ min: 0.01 }).withMessage('Payable amount is required and must be greater than 0'),
+    body('tip_amount').optional({ nullable: true }).isFloat({ min: 0 }).withMessage('Tip amount must be 0 or greater'),
     body('issue_date').isISO8601().withMessage('Issue date is required and must be a valid date'),
     body('status').optional().isString().withMessage('Status must be a string'),
     body('reference_number').notEmpty().trim().isString().withMessage('Reference number is required'),
@@ -568,6 +1359,7 @@ router.post(
         payment_method,
         payment_type,
         payable_amount,
+        tip_amount,
         issue_date,
         status = 'Completed',
         reference_number,
@@ -589,6 +1381,36 @@ router.post(
       }
 
       const invoice = invoiceCheck.rows[0];
+
+      if (invoice.status === 'Paid') {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          success: false,
+          message: 'Cannot record payment: this invoice is already fully paid.',
+        });
+      }
+
+      if (invoice.balance_invoice_id) {
+        await client.query('ROLLBACK');
+        const tip = await client.query(
+          `SELECT invoice_description FROM invoicestbl WHERE invoice_id = $1`,
+          [invoice.balance_invoice_id]
+        );
+        const lab = tip.rows[0]?.invoice_description || `INV-${invoice.balance_invoice_id}`;
+        return res.status(400).json({
+          success: false,
+          message: `This invoice is closed for new payments. Record payments on ${lab} (balance invoice).`,
+        });
+      }
+
+      if (invoice.status === 'Balance Invoiced') {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          success: false,
+          message:
+            'This invoice was superseded after a partial payment. Use the new balance invoice to record payments.',
+        });
+      }
 
       // Verify student exists
       const studentCheck = await client.query('SELECT * FROM userstbl WHERE user_id = $1', [student_id]);
@@ -630,156 +1452,185 @@ router.post(
 
       // Get created_by from authenticated user
       const createdBy = req.user.userId || null;
+      const actionOwnerUserId =
+        invoice.created_by != null ? invoice.created_by : createdBy;
+
+      const hasActionOwnerCol = await paymenttblHasActionOwnerUserIdColumn();
 
       // Create payment
-      const paymentResult = await client.query(
-        `INSERT INTO paymenttbl (invoice_id, student_id, branch_id, payment_method, payment_type, 
-                                 payable_amount, issue_date, status, reference_number, remarks, created_by, payment_attachment_url)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      const paymentResult = hasActionOwnerCol
+        ? await client.query(
+            `INSERT INTO paymenttbl (invoice_id, student_id, branch_id, payment_method, payment_type, 
+                                 payable_amount, tip_amount, issue_date, status, reference_number, remarks, created_by, payment_attachment_url, action_owner_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
          RETURNING *`,
-        [
-          invoice_id,
-          student_id,
-          branch_id,
-          payment_method,
-          payment_type,
-          payable_amount,
-          issue_date,
-          status,
-          reference_number || null,
-          remarks || null,
-          createdBy,
-          attachment_url || null,
-        ]
-      );
+            [
+              invoice_id,
+              student_id,
+              branch_id,
+              payment_method,
+              payment_type,
+              payable_amount,
+              tip_amount || 0,
+              issue_date,
+              status,
+              reference_number || null,
+              remarks || null,
+              createdBy,
+              attachment_url || null,
+              actionOwnerUserId,
+            ]
+          )
+        : await client.query(
+            `INSERT INTO paymenttbl (invoice_id, student_id, branch_id, payment_method, payment_type, 
+                                 payable_amount, tip_amount, issue_date, status, reference_number, remarks, created_by, payment_attachment_url)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         RETURNING *`,
+            [
+              invoice_id,
+              student_id,
+              branch_id,
+              payment_method,
+              payment_type,
+              payable_amount,
+              tip_amount || 0,
+              issue_date,
+              status,
+              reference_number || null,
+              remarks || null,
+              createdBy,
+              attachment_url || null,
+            ]
+          );
 
       const newPayment = paymentResult.rows[0];
 
-      // Calculate original invoice amount from invoice items
-      const invoiceItemsResult = await client.query(
-        `SELECT 
-          COALESCE(SUM(amount), 0) as item_amount,
-          COALESCE(SUM(discount_amount), 0) as total_discount,
-          COALESCE(SUM(penalty_amount), 0) as total_penalty,
-          COALESCE(SUM(amount * COALESCE(tax_percentage, 0) / 100), 0) as total_tax
-         FROM invoiceitemstbl 
-         WHERE invoice_id = $1`,
-        [invoice_id]
-      );
-      
-      const itemAmount = parseFloat(invoiceItemsResult.rows[0].item_amount) || 0;
-      const totalDiscount = parseFloat(invoiceItemsResult.rows[0].total_discount) || 0;
-      const totalPenalty = parseFloat(invoiceItemsResult.rows[0].total_penalty) || 0;
-      const totalTax = parseFloat(invoiceItemsResult.rows[0].total_tax) || 0;
-      
-      // Original invoice amount = items - discounts + penalties + tax
-      const originalInvoiceAmount = itemAmount - totalDiscount + totalPenalty + totalTax;
-      
-      // Calculate total payments for this invoice
       const totalPaymentsResult = await client.query(
         'SELECT COALESCE(SUM(payable_amount), 0) as total_paid FROM paymenttbl WHERE invoice_id = $1 AND status = $2',
         [invoice_id, 'Completed']
       );
       const totalPaid = parseFloat(totalPaymentsResult.rows[0].total_paid) || 0;
-      
-      // Calculate remaining balance (original amount - total paid)
-      const remainingBalance = Math.max(0, originalInvoiceAmount - totalPaid);
-      
-      // Update invoice amount to reflect remaining balance
-      await client.query('UPDATE invoicestbl SET amount = $1 WHERE invoice_id = $2', [
-        remainingBalance,
-        invoice_id,
-      ]);
 
-      // Update invoice status based on payment
+      const { originalInvoiceAmount } = await computeOriginalInvoiceAmount(
+        client,
+        invoice_id,
+        invoice,
+        totalPaid,
+        payable_amount
+      );
+
+      const remainingBalance = Math.max(0, originalInvoiceAmount - totalPaid);
+
       let newInvoiceStatus = invoice.status;
-      if (totalPaid >= originalInvoiceAmount) {
-        newInvoiceStatus = 'Paid';
-      } else if (totalPaid > 0) {
-        newInvoiceStatus = 'Partially Paid';
+      let createdBalanceInvoiceId = null;
+
+      const isPartialPaymentType = String(payment_type || '').trim() === 'Partial Payment';
+
+      if (isPartialPaymentType && remainingBalance > 0.01) {
+        const { balance_invoice_id } = await createBalanceInvoiceFromPartial({
+          client,
+          parentInvoice: invoice,
+          remainingBalance,
+          createdBy,
+          issueDateYmd: formatYmdLocal(new Date(issue_date)),
+        });
+        createdBalanceInvoiceId = balance_invoice_id;
+        newInvoiceStatus = 'Balance Invoiced';
       } else {
-        // If payment is removed and invoice becomes unpaid, check if it's a package price invoice
-        // If yes, remove student enrollment
-        if (invoice.status === 'Paid' || invoice.status === 'Partially Paid') {
-          newInvoiceStatus = 'Unpaid';
-          
-          // Check if this is a package price invoice (not an installment invoice, not a reservation fee)
-          // Package price invoices don't have installmentinvoiceprofiles_id
-          if (!invoice.installmentinvoiceprofiles_id && 
-              invoice.invoice_description && 
-              !invoice.invoice_description.includes('Reservation Fee')) {
-            try {
-              // Get student from invoice
-              const invoiceStudentResult = await client.query(
-                `SELECT ist.student_id 
-                 FROM invoicestudentstbl ist
-                 WHERE ist.invoice_id = $1
-                 LIMIT 1`,
-                [invoice_id]
-              );
-              
-              if (invoiceStudentResult.rows.length > 0) {
-                const invoiceStudentId = invoiceStudentResult.rows[0].student_id;
-                
-                // Find enrollments for this student that were created around the same time as the invoice
-                // This helps identify enrollments linked to this package price invoice
-                // We'll check enrollments created within 24 hours of invoice issue date
-                const enrollmentResult = await client.query(
-                  `SELECT cs.classstudent_id, cs.class_id, cs.phase_number, cs.student_id, cs.enrolled_at
-                   FROM classstudentstbl cs
-                   WHERE cs.student_id = $1
-                     AND cs.enrolled_at >= $2::date - INTERVAL '24 hours'
-                     AND cs.enrolled_at <= $2::date + INTERVAL '24 hours'
-                   ORDER BY cs.enrolled_at DESC`,
-                  [invoiceStudentId, invoice.issue_date]
+        await client.query('UPDATE invoicestbl SET amount = $1 WHERE invoice_id = $2', [
+          remainingBalance,
+          invoice_id,
+        ]);
+
+        if (totalPaid >= originalInvoiceAmount) {
+          newInvoiceStatus = 'Paid';
+        } else if (totalPaid > 0) {
+          newInvoiceStatus = 'Partially Paid';
+        } else {
+          if (invoice.status === 'Paid' || invoice.status === 'Partially Paid') {
+            newInvoiceStatus = 'Unpaid';
+
+            if (
+              !invoice.installmentinvoiceprofiles_id &&
+              invoice.invoice_description &&
+              !invoice.invoice_description.includes('Reservation Fee')
+            ) {
+              try {
+                const invoiceStudentResult = await client.query(
+                  `SELECT ist.student_id
+                   FROM invoicestudentstbl ist
+                   WHERE ist.invoice_id = $1
+                   LIMIT 1`,
+                  [invoice_id]
                 );
-                
-                // Remove all enrollments that were created around the same time as the invoice
-                // This handles cases where student was enrolled in multiple phases (fullpayment)
-                for (const enrollment of enrollmentResult.rows) {
-                  await client.query(
-                    `DELETE FROM classstudentstbl WHERE classstudent_id = $1`,
-                    [enrollment.classstudent_id]
+
+                if (invoiceStudentResult.rows.length > 0) {
+                  const invoiceStudentId = invoiceStudentResult.rows[0].student_id;
+
+                  const enrollmentResult = await client.query(
+                    `SELECT cs.classstudent_id, cs.class_id, cs.phase_number, cs.student_id, cs.enrolled_at
+                     FROM classstudentstbl cs
+                     WHERE cs.student_id = $1
+                       AND cs.enrolled_at >= $2::date - INTERVAL '24 hours'
+                       AND cs.enrolled_at <= $2::date + INTERVAL '24 hours'
+                     ORDER BY cs.enrolled_at DESC`,
+                    [invoiceStudentId, invoice.issue_date]
                   );
-                  console.log(`⚠️ Student ${enrollment.student_id} removed from class ${enrollment.class_id}, phase ${enrollment.phase_number} due to unpaid package price invoice`);
+
+                  for (const enrollment of enrollmentResult.rows) {
+                    await client.query(`DELETE FROM classstudentstbl WHERE classstudent_id = $1`, [
+                      enrollment.classstudent_id,
+                    ]);
+                    console.log(
+                      `⚠️ Student ${enrollment.student_id} removed from class ${enrollment.class_id}, phase ${enrollment.phase_number} due to unpaid package price invoice`
+                    );
+                  }
                 }
+              } catch (removalError) {
+                console.error('Error removing student enrollment due to unpaid invoice:', removalError);
               }
-            } catch (removalError) {
-              console.error('Error removing student enrollment due to unpaid invoice:', removalError);
-              // Don't fail the payment update if removal fails
             }
           }
         }
+
+        if (newInvoiceStatus !== invoice.status) {
+          await client.query('UPDATE invoicestbl SET status = $1 WHERE invoice_id = $2', [
+            newInvoiceStatus,
+            invoice_id,
+          ]);
+        }
       }
 
-      if (newInvoiceStatus !== invoice.status) {
-        await client.query('UPDATE invoicestbl SET status = $1 WHERE invoice_id = $2', [
-          newInvoiceStatus,
-          invoice_id,
-        ]);
-      }
-
-      // ── Merchandise AR: deduct stock when invoice is fully paid ───────────
+      // ── AR-linked invoice: finalize AR status when invoice is fully paid ──
       if (newInvoiceStatus === 'Paid' && invoice.ack_receipt_id) {
         try {
           const ackResult = await client.query(
             `SELECT ar_type, merchandise_items_snapshot FROM acknowledgement_receiptstbl WHERE ack_receipt_id = $1`,
             [invoice.ack_receipt_id]
           );
-          if (ackResult.rows.length > 0 && ackResult.rows[0].ar_type === 'Merchandise') {
-            const items = ackResult.rows[0].merchandise_items_snapshot;
-            if (items && Array.isArray(items)) {
-              for (const item of items) {
-                const merchId = item.merchandise_id;
-                const qty = parseInt(item.quantity, 10) || 1;
-                await client.query(
-                  `UPDATE merchandisestbl SET quantity = GREATEST(0, COALESCE(quantity, 0) - $1) WHERE merchandise_id = $2`,
-                  [qty, merchId]
-                );
-                console.log(`✅ Merchandise AR payment: deducted ${qty} from merchandise_id ${merchId}`);
+          if (ackResult.rows.length > 0) {
+            const ackRow = ackResult.rows[0];
+            if (ackRow.ar_type === 'Merchandise') {
+              const items = ackRow.merchandise_items_snapshot;
+              if (items && Array.isArray(items)) {
+                for (const item of items) {
+                  const merchId = item.merchandise_id;
+                  const qty = parseInt(item.quantity, 10) || 1;
+                  await client.query(
+                    `UPDATE merchandisestbl SET quantity = GREATEST(0, COALESCE(quantity, 0) - $1) WHERE merchandise_id = $2`,
+                    [qty, merchId]
+                  );
+                  console.log(`✅ Merchandise AR payment: deducted ${qty} from merchandise_id ${merchId}`);
+                }
               }
               await client.query(
                 `UPDATE acknowledgement_receiptstbl SET status = 'Paid', payment_id = $1 WHERE ack_receipt_id = $2`,
+                [newPayment.payment_id, invoice.ack_receipt_id]
+              );
+            } else {
+              // Package ARs become Applied once converted into an actual invoice payment.
+              await client.query(
+                `UPDATE acknowledgement_receiptstbl SET status = 'Applied', payment_id = $1 WHERE ack_receipt_id = $2`,
                 [newPayment.payment_id, invoice.ack_receipt_id]
               );
             }
@@ -793,11 +1644,12 @@ router.post(
       // If yes, and invoice is now fully paid, update reservation status to "Fee Paid"
       // Note: Student is NOT auto-enrolled here. Enrollment only happens when reservation is upgraded.
       if (newInvoiceStatus === 'Paid') {
+        const reservationChainRootId = await getChainRootInvoiceId(client, invoice_id);
         const reservationCheck = await client.query(
           `SELECT r.reserved_id, r.status, r.student_id, r.class_id, r.phase_number, r.branch_id
            FROM reservedstudentstbl r
-           WHERE r.invoice_id = $1`,
-          [invoice_id]
+           WHERE r.invoice_id = $1 OR r.invoice_id = $2`,
+          [invoice_id, reservationChainRootId]
         );
         
         if (reservationCheck.rows.length > 0) {
@@ -984,7 +1836,10 @@ router.post(
               const existingEnrollmentCheck = await client.query(
                 `SELECT classstudent_id, phase_number 
                  FROM classstudentstbl 
-                 WHERE student_id = $1 AND class_id = $2
+                 WHERE student_id = $1
+                   AND class_id = $2
+                   AND COALESCE(enrollment_status, 'Active') = 'Active'
+                   AND removed_at IS NULL
                  ORDER BY phase_number DESC`,
                 [student_id, classId]
               );
@@ -1042,11 +1897,19 @@ router.post(
       const paymentWithDetails = await query(
         `SELECT p.payment_id, p.invoice_id, p.student_id, p.branch_id, 
                 p.payment_method, p.payment_type, p.payable_amount, 
+                COALESCE(p.tip_amount, 0) AS tip_amount,
                 TO_CHAR(p.issue_date, 'YYYY-MM-DD') as issue_date, 
                 p.status, p.reference_number, p.remarks, p.payment_attachment_url, p.created_by,
                 TO_CHAR(p.created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at,
                 u.full_name as student_name, u.email as student_email,
                 i.invoice_description, i.amount as invoice_amount,
+                COALESCE(i.amount, 0) + COALESCE((
+                  SELECT SUM(COALESCE(px.tip_amount, 0))
+                  FROM paymenttbl px
+                  WHERE px.invoice_id = p.invoice_id
+                    AND px.status = 'Completed'
+                ), 0) AS invoice_total_amount,
+                i.invoice_ar_number AS invoice_ar_number,
                 COALESCE(b.branch_nickname, b.branch_name) AS branch_name
          FROM paymenttbl p
          LEFT JOIN userstbl u ON p.student_id = u.user_id
@@ -1058,38 +1921,33 @@ router.post(
 
       const paymentData = paymentWithDetails.rows[0];
 
-      // Send invoice email to student (non-blocking - don't fail payment if email fails)
-      if (paymentData.student_email) {
-        // Send email asynchronously without blocking the response
+      if (newInvoiceStatus === 'Paid' && !createdBalanceInvoiceId) {
         (async () => {
           try {
-            // Generate PDF buffer
-            const pdfBuffer = await generateInvoicePDFBuffer(invoice_id);
-            
-            // Send email with PDF attachment
-            await sendInvoiceEmail({
-              to: paymentData.student_email,
-              studentName: paymentData.student_name || 'Student',
-              invoiceId: invoice_id,
-              invoiceNumber: `INV-${invoice_id}`,
-              pdfBuffer: pdfBuffer,
-            });
-            
-            console.log(`✅ Invoice email sent successfully to ${paymentData.student_email} for invoice ${invoice_id}`);
+            const emailClient = await getClient();
+            try {
+              const summary = await sendInvoicePaymentConfirmationByInvoiceId(emailClient, invoice_id);
+              console.log(
+                `✅ Invoice payment confirmation email done for invoice ${invoice_id}: ${summary.sent}/${summary.attempted} sent`
+              );
+            } finally {
+              emailClient.release();
+            }
           } catch (emailError) {
-            // Log error but don't fail the payment
-            console.error(`❌ Error sending invoice email to ${paymentData.student_email}:`, emailError.message);
-            // Payment still succeeds even if email fails
+            console.error(`❌ Error sending invoice payment confirmation for invoice ${invoice_id}:`, emailError);
           }
         })();
-      } else {
-        console.warn(`⚠️ No email address found for student ${student_id}, skipping email notification`);
       }
 
       res.status(201).json({
         success: true,
-        message: 'Payment created successfully',
-        data: paymentData,
+        message: createdBalanceInvoiceId
+          ? 'Payment recorded. Remaining balance was moved to a new invoice.'
+          : 'Payment created successfully',
+        data: {
+          ...paymentData,
+          ...(createdBalanceInvoiceId ? { balance_invoice_id: createdBalanceInvoiceId } : {}),
+        },
       });
     } catch (error) {
       await client.query('ROLLBACK');
@@ -1112,6 +1970,7 @@ router.put(
     body('payment_method').optional().isString().withMessage('Payment method must be a string'),
     body('payment_type').optional().isString().withMessage('Payment type must be a string'),
     body('payable_amount').optional().isFloat({ min: 0.01 }).withMessage('Payable amount must be greater than 0'),
+    body('tip_amount').optional({ nullable: true }).isFloat({ min: 0 }).withMessage('Tip amount must be 0 or greater'),
     body('issue_date').optional().isISO8601().withMessage('Issue date must be a valid date'),
     body('status').optional().isString().withMessage('Status must be a string'),
     body('reference_number').optional().isString().withMessage('Reference number must be a string'),
@@ -1125,7 +1984,7 @@ router.put(
       await client.query('BEGIN');
 
       const { id } = req.params;
-      const { payment_method, payment_type, payable_amount, issue_date, status, reference_number, remarks, attachment_url } = req.body;
+      const { payment_method, payment_type, payable_amount, tip_amount, issue_date, status, reference_number, remarks, attachment_url } = req.body;
 
       // Check if payment exists
       const existingPayment = await client.query('SELECT * FROM paymenttbl WHERE payment_id = $1', [id]);
@@ -1148,12 +2007,21 @@ router.put(
         });
       }
 
+      const returnEdit = assertBranchUserMayEditReturnedPayment(req, payment);
+      if (!returnEdit.ok) {
+        await client.query('ROLLBACK');
+        return res.status(returnEdit.status).json({
+          success: false,
+          message: returnEdit.message,
+        });
+      }
+
       // Build update query
       const updates = [];
       const params = [];
       let paramCount = 0;
 
-      const fields = { payment_method, payment_type, payable_amount, issue_date, status, reference_number, remarks };
+      const fields = { payment_method, payment_type, payable_amount, tip_amount, issue_date, status, reference_number, remarks };
       Object.entries(fields).forEach(([key, value]) => {
         if (value !== undefined) {
           paramCount++;
@@ -1189,33 +2057,19 @@ router.put(
         );
         if (invoiceResult.rows.length > 0) {
           const invoice = invoiceResult.rows[0];
-          
-          // Calculate original invoice amount from invoice items
-          const invoiceItemsResult = await client.query(
-            `SELECT 
-              COALESCE(SUM(amount), 0) as item_amount,
-              COALESCE(SUM(discount_amount), 0) as total_discount,
-              COALESCE(SUM(penalty_amount), 0) as total_penalty,
-              COALESCE(SUM(amount * COALESCE(tax_percentage, 0) / 100), 0) as total_tax
-             FROM invoiceitemstbl 
-             WHERE invoice_id = $1`,
-            [payment.invoice_id]
-          );
-          
-          const itemAmount = parseFloat(invoiceItemsResult.rows[0].item_amount) || 0;
-          const totalDiscount = parseFloat(invoiceItemsResult.rows[0].total_discount) || 0;
-          const totalPenalty = parseFloat(invoiceItemsResult.rows[0].total_penalty) || 0;
-          const totalTax = parseFloat(invoiceItemsResult.rows[0].total_tax) || 0;
-          
-          // Original invoice amount = items - discounts + penalties + tax
-          const originalInvoiceAmount = itemAmount - totalDiscount + totalPenalty + totalTax;
-          
+
           const totalPaymentsResult = await client.query(
             'SELECT COALESCE(SUM(payable_amount), 0) as total_paid FROM paymenttbl WHERE invoice_id = $1 AND status = $2',
             [payment.invoice_id, 'Completed']
           );
           const totalPaid = parseFloat(totalPaymentsResult.rows[0].total_paid) || 0;
-          
+
+          const { originalInvoiceAmount } = await computeInvoiceOriginalForRecalc(
+            client,
+            payment.invoice_id,
+            invoice
+          );
+
           // Calculate remaining balance (original amount - total paid)
           const remainingBalance = Math.max(0, originalInvoiceAmount - totalPaid);
           
@@ -1244,16 +2098,16 @@ router.put(
           // Check if this invoice is linked to a reservation
           // If yes, and invoice is now fully paid, update reservation status to "Fee Paid" and auto-enroll student
           if (newInvoiceStatus === 'Paid') {
+            const reservationChainRootId = await getChainRootInvoiceId(client, payment.invoice_id);
             const reservationCheck = await client.query(
               `SELECT r.reserved_id, r.status, r.student_id, r.class_id, r.phase_number, r.branch_id
                FROM reservedstudentstbl r
-               WHERE r.invoice_id = $1`,
-              [payment.invoice_id]
+               WHERE r.invoice_id = $1 OR r.invoice_id = $2`,
+              [payment.invoice_id, reservationChainRootId]
             );
-            
+
             if (reservationCheck.rows.length > 0) {
               const reservation = reservationCheck.rows[0];
-              // Only update if reservation is still in "Reserved" status
               if (reservation.status === 'Reserved') {
                 await client.query(
                   `UPDATE reservedstudentstbl 
@@ -1262,11 +2116,10 @@ router.put(
                   [reservation.reserved_id]
                 );
                 console.log(`✅ Reservation ${reservation.reserved_id} status updated to "Fee Paid" after payment update`);
-                // Note: Student is NOT auto-enrolled here. Enrollment only happens when reservation is upgraded.
               }
             }
           }
-          
+
           // Check if invoice becomes unpaid and is a package price invoice
           // If yes, remove student enrollment
           if (newInvoiceStatus === 'Unpaid' && 
@@ -1370,7 +2223,10 @@ router.put(
                   const existingEnrollmentCheck = await client.query(
                     `SELECT classstudent_id, phase_number 
                      FROM classstudentstbl 
-                     WHERE student_id = $1 AND class_id = $2
+                     WHERE student_id = $1
+                       AND class_id = $2
+                       AND COALESCE(enrollment_status, 'Active') = 'Active'
+                       AND removed_at IS NULL
                      ORDER BY phase_number DESC`,
                     [payment.student_id, classId]
                   );
@@ -1544,6 +2400,13 @@ router.put(
                 TO_CHAR(p.created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at,
                 u.full_name as student_name, u.email as student_email,
                 i.invoice_description, i.amount as invoice_amount,
+                COALESCE(i.amount, 0) + COALESCE((
+                  SELECT SUM(COALESCE(px.tip_amount, 0))
+                  FROM paymenttbl px
+                  WHERE px.invoice_id = p.invoice_id
+                    AND px.status = 'Completed'
+                ), 0) AS invoice_total_amount,
+                i.invoice_ar_number AS invoice_ar_number,
                 COALESCE(b.branch_nickname, b.branch_name) AS branch_name
          FROM paymenttbl p
          LEFT JOIN userstbl u ON p.student_id = u.user_id
@@ -1607,43 +2470,57 @@ router.delete(
         });
       }
 
+      const invoiceForDeleteCheck = await client.query(
+        `SELECT balance_invoice_id, status FROM invoicestbl WHERE invoice_id = $1`,
+        [payment.invoice_id]
+      );
+      const invDel = invoiceForDeleteCheck.rows[0];
+      if (invDel?.balance_invoice_id) {
+        const childPaid = await client.query(
+          `SELECT COALESCE(SUM(payable_amount), 0) AS t FROM paymenttbl WHERE invoice_id = $1 AND status = 'Completed'`,
+          [invDel.balance_invoice_id]
+        );
+        if (parseFloat(childPaid.rows[0]?.t || 0) > 0) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            success: false,
+            message:
+              'Cannot delete this payment because a balance invoice exists and already has payments. Reverse balance payments first.',
+          });
+        }
+        await removeUnusedBalanceInvoice(client, invDel.balance_invoice_id);
+      }
+
+      const invoiceBeforeRow = await client.query(`SELECT * FROM invoicestbl WHERE invoice_id = $1`, [
+        payment.invoice_id,
+      ]);
+      const invoiceSnap = invoiceBeforeRow.rows[0];
+
       // Delete payment
       await client.query('DELETE FROM paymenttbl WHERE payment_id = $1', [id]);
 
       // Recalculate invoice amount and status (include installmentinvoiceprofiles_id for phase tracking)
       const invoiceResult = await client.query(
-        'SELECT *, installmentinvoiceprofiles_id FROM invoicestbl WHERE invoice_id = $1', 
+        'SELECT *, installmentinvoiceprofiles_id FROM invoicestbl WHERE invoice_id = $1',
         [payment.invoice_id]
       );
       if (invoiceResult.rows.length > 0) {
         const invoice = invoiceResult.rows[0];
-        
-        // Calculate original invoice amount from invoice items
-        const invoiceItemsResult = await client.query(
-          `SELECT 
-            COALESCE(SUM(amount), 0) as item_amount,
-            COALESCE(SUM(discount_amount), 0) as total_discount,
-            COALESCE(SUM(penalty_amount), 0) as total_penalty,
-            COALESCE(SUM(amount * COALESCE(tax_percentage, 0) / 100), 0) as total_tax
-           FROM invoiceitemstbl 
-           WHERE invoice_id = $1`,
-          [payment.invoice_id]
-        );
-        
-        const itemAmount = parseFloat(invoiceItemsResult.rows[0].item_amount) || 0;
-        const totalDiscount = parseFloat(invoiceItemsResult.rows[0].total_discount) || 0;
-        const totalPenalty = parseFloat(invoiceItemsResult.rows[0].total_penalty) || 0;
-        const totalTax = parseFloat(invoiceItemsResult.rows[0].total_tax) || 0;
-        
-        // Original invoice amount = items - discounts + penalties + tax
-        const originalInvoiceAmount = itemAmount - totalDiscount + totalPenalty + totalTax;
-        
+
         const totalPaymentsResult = await client.query(
           'SELECT COALESCE(SUM(payable_amount), 0) as total_paid FROM paymenttbl WHERE invoice_id = $1 AND status = $2',
           [payment.invoice_id, 'Completed']
         );
         const totalPaid = parseFloat(totalPaymentsResult.rows[0].total_paid) || 0;
-        
+
+        const { originalInvoiceAmount } = await computeOriginalAfterDeletingPayment(
+          client,
+          payment.invoice_id,
+          invoiceSnap,
+          totalPaid,
+          payment.status === 'Completed' ? payment.payable_amount : 0
+        );
+
         // Calculate remaining balance (original amount - total paid)
         const remainingBalance = Math.max(0, originalInvoiceAmount - totalPaid);
         
@@ -1863,6 +2740,13 @@ router.get(
                 TO_CHAR(p.created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at,
                 u.full_name as student_name, u.email as student_email,
                 i.invoice_description, i.amount as invoice_amount,
+                COALESCE(i.amount, 0) + COALESCE((
+                  SELECT SUM(COALESCE(px.tip_amount, 0))
+                  FROM paymenttbl px
+                  WHERE px.invoice_id = p.invoice_id
+                    AND px.status = 'Completed'
+                ), 0) AS invoice_total_amount,
+                i.invoice_ar_number AS invoice_ar_number,
                 COALESCE(b.branch_nickname, b.branch_name) AS branch_name
          FROM paymenttbl p
          LEFT JOIN userstbl u ON p.student_id = u.user_id
@@ -1894,19 +2778,28 @@ router.put(
   [
     param('id').isInt().withMessage('Payment ID must be an integer'),
     body('approve').isBoolean().withMessage('approve must be a boolean'),
+    body('finance_verified_reference_number')
+      .optional({ nullable: true })
+      .isString()
+      .withMessage('finance_verified_reference_number must be a string'),
     handleValidationErrors,
   ],
   async (req, res, next) => {
     try {
       const { id } = req.params;
       const { approve } = req.body;
+      const financeVerifiedReferenceNumber = String(
+        req.body?.finance_verified_reference_number || ''
+      ).trim();
       const userId = req.user.userId;
       const userType = req.user.userType;
       const userBranchId = req.user.branchId;
 
       // Get payment details including branch
       const paymentCheck = await query(
-        'SELECT payment_id, branch_id FROM paymenttbl WHERE payment_id = $1',
+        `SELECT payment_id, invoice_id, branch_id, approval_status, reference_number
+         FROM paymenttbl
+         WHERE payment_id = $1`,
         [id]
       );
 
@@ -1918,6 +2811,47 @@ router.put(
       }
 
       const payment = paymentCheck.rows[0];
+      let invoiceCreatedBy = null;
+      if (payment.invoice_id != null) {
+        const invoiceOwnerRes = await query(
+          'SELECT created_by FROM invoicestbl WHERE invoice_id = $1',
+          [payment.invoice_id]
+        );
+        invoiceCreatedBy = invoiceOwnerRes.rows[0]?.created_by ?? null;
+      }
+
+      if (approve && payment.approval_status === 'Returned') {
+        return res.status(400).json({
+          success: false,
+          message:
+            'This payment was returned for correction. The branch must update reference/attachment and resubmit for verification before it can be approved.',
+        });
+      }
+
+      if (approve && !financeVerifiedReferenceNumber) {
+        return res.status(400).json({
+          success: false,
+          message: 'Finance/Superfinance reference number is required when approving payment',
+        });
+      }
+
+      if (approve) {
+        const issuedReferenceNumber = String(payment.reference_number || '').trim();
+        if (!issuedReferenceNumber) {
+          return res.status(400).json({
+            success: false,
+            message:
+              'This payment has no issued reference number yet. Please return it to branch and request correction before approval.',
+          });
+        }
+        if (financeVerifiedReferenceNumber !== issuedReferenceNumber) {
+          return res.status(400).json({
+            success: false,
+            message:
+              'Reference number mismatch. Approval is blocked. Please return this payment to branch for correction.',
+          });
+        }
+      }
 
       // Permission check: branch-bound Finance can only approve payments from their own branch
       // Superfinance is represented as Finance with no branch_id and should NOT be restricted here
@@ -1940,25 +2874,204 @@ router.put(
         ? `UPDATE paymenttbl 
            SET approval_status = 'Approved',
                approved_by = $1,
-               approved_at = CURRENT_TIMESTAMP
-           WHERE payment_id = $2
+               approved_at = CURRENT_TIMESTAMP,
+               finance_verified_reference_number = $2
+           WHERE payment_id = $3
            RETURNING payment_id, approval_status, approved_by, 
-                     TO_CHAR(approved_at, 'YYYY-MM-DD HH24:MI:SS') as approved_at`
+                     TO_CHAR(approved_at, 'YYYY-MM-DD HH24:MI:SS') as approved_at,
+                     finance_verified_reference_number`
         : `UPDATE paymenttbl 
            SET approval_status = 'Pending',
                approved_by = NULL,
-               approved_at = NULL
+               approved_at = NULL,
+               finance_verified_reference_number = NULL
            WHERE payment_id = $1
-           RETURNING payment_id, approval_status, approved_by, approved_at`;
+           RETURNING payment_id, approval_status, approved_by, approved_at, finance_verified_reference_number`;
 
       const result = await query(
         updateSql,
-        approve ? [userId, id] : [id]
+        approve ? [userId, financeVerifiedReferenceNumber, id] : [id]
       );
 
       res.json({
         success: true,
         message: approve ? 'Payment approved successfully' : 'Payment approval revoked',
+        data: result.rows[0],
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * PUT /api/sms/payments/:id/return
+ * Finance/Superfinance: send payment back to branch when reference vs attachment does not match.
+ */
+router.put(
+  '/:id/return',
+  requireRole('Finance', 'Superfinance'),
+  [
+    param('id').isInt().withMessage('Payment ID must be an integer'),
+    body('reason')
+      .trim()
+      .notEmpty()
+      .withMessage('Return notes are required')
+      .isString()
+      .withMessage('Return notes must be text'),
+    handleValidationErrors,
+  ],
+  async (req, res, next) => {
+    try {
+      const { id } = req.params;
+      const reason = String(req.body.reason).trim();
+      const userId = req.user.userId;
+      const userType = req.user.userType;
+      const userBranchId = req.user.branchId;
+
+      const paymentCheck = await query('SELECT * FROM paymenttbl WHERE payment_id = $1', [id]);
+
+      if (paymentCheck.rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Payment not found' });
+      }
+
+      const payment = paymentCheck.rows[0];
+      let invoiceCreatedBy = null;
+      if (payment.invoice_id != null) {
+        const invoiceOwnerRes = await query(
+          'SELECT created_by FROM invoicestbl WHERE invoice_id = $1',
+          [payment.invoice_id]
+        );
+        invoiceCreatedBy = invoiceOwnerRes.rows[0]?.created_by ?? null;
+      }
+
+      if (payment.approval_status === 'Returned') {
+        return res.status(400).json({
+          success: false,
+          message: 'This payment is already marked as returned.',
+        });
+      }
+      if (payment.approval_status === 'Approved') {
+        return res.status(400).json({
+          success: false,
+          message: 'Approved payments cannot be returned. Revoke approval first if needed.',
+        });
+      }
+
+      if (
+        userType === 'Finance' &&
+        userBranchId !== null &&
+        userBranchId !== undefined &&
+        payment.branch_id !== userBranchId
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: 'You can only return payments from your assigned branch',
+        });
+      }
+
+      const result = await query(
+        `UPDATE paymenttbl
+         SET approval_status = 'Returned',
+             return_reason = $1,
+             returned_by = $2,
+             returned_at = CURRENT_TIMESTAMP,
+             approved_by = NULL,
+             approved_at = NULL
+         WHERE payment_id = $3
+         RETURNING payment_id, approval_status, return_reason,
+                   TO_CHAR(returned_at, 'YYYY-MM-DD HH24:MI:SS') as returned_at, returned_by`,
+        [reason, userId, id]
+      );
+
+      void notifyPaymentReturnedToBranch({
+        paymentId: parseInt(id, 10),
+        branchId: payment.branch_id,
+        invoiceId: payment.invoice_id,
+        reason,
+        returnedByUserId: userId,
+        actionOwnerUserId: getPaymentReturnOwnerId(payment, invoiceCreatedBy),
+        invoiceOwnerUserId: invoiceCreatedBy,
+      });
+
+      res.json({
+        success: true,
+        message: 'Payment returned to branch for correction.',
+        data: result.rows[0],
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * PUT /api/sms/payments/:id/resubmit-for-verification
+ * Superadmin/Admin: after fixing reference/attachment, send payment back to Finance queue (Pending).
+ */
+router.put(
+  '/:id/resubmit-for-verification',
+  requireRole('Superadmin', 'Admin'),
+  [
+    param('id').isInt().withMessage('Payment ID must be an integer'),
+    handleValidationErrors,
+  ],
+  async (req, res, next) => {
+    try {
+      const { id } = req.params;
+
+      const paymentCheck = await query('SELECT * FROM paymenttbl WHERE payment_id = $1', [id]);
+
+      if (paymentCheck.rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Payment not found' });
+      }
+
+      const payment = paymentCheck.rows[0];
+
+      if (payment.approval_status !== 'Returned') {
+        return res.status(400).json({
+          success: false,
+          message: 'Only payments in Returned status can be resubmitted for verification.',
+        });
+      }
+
+      if (req.user.userType !== 'Superadmin' && req.user.branchId && payment.branch_id !== req.user.branchId) {
+        return res.status(403).json({ success: false, message: 'Access denied' });
+      }
+
+      const resubmitPerm = assertBranchUserMayEditReturnedPayment(req, payment);
+      if (!resubmitPerm.ok) {
+        return res.status(resubmitPerm.status).json({
+          success: false,
+          message: resubmitPerm.message,
+        });
+      }
+
+      const userId = req.user.userId;
+
+      const result = await query(
+        `UPDATE paymenttbl
+         SET approval_status = 'Pending',
+             return_reason = NULL,
+             returned_by = NULL,
+             returned_at = NULL,
+             approved_by = NULL,
+             approved_at = NULL
+         WHERE payment_id = $1
+         RETURNING payment_id, approval_status`,
+        [id]
+      );
+
+      void notifyPaymentResubmittedForVerification({
+        paymentId: parseInt(id, 10),
+        branchId: payment.branch_id,
+        invoiceId: payment.invoice_id,
+        resubmittedByUserId: userId,
+      });
+
+      res.json({
+        success: true,
+        message: 'Payment resubmitted for finance verification.',
         data: result.rows[0],
       });
     } catch (error) {

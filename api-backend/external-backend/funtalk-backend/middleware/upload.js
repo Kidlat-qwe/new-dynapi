@@ -11,6 +11,10 @@ const uploadsDir = path.join(__dirname, '..', 'uploads', 'materials');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
+const receiptsDir = path.join(__dirname, '..', 'uploads', 'receipts');
+if (!fs.existsSync(receiptsDir)) {
+  fs.mkdirSync(receiptsDir, { recursive: true });
+}
 
 // Configure storage
 const storage = multer.diskStorage({
@@ -64,6 +68,44 @@ export const uploadMaterial = multer({
   fileFilter: fileFilter,
   limits: {
     fileSize: 50 * 1024 * 1024, // 50MB max file size
+  },
+});
+
+const receiptStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, receiptsDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const ext = path.extname(file.originalname);
+    const name = path.basename(file.originalname, ext);
+    const sanitizedName = name.replace(/[^a-zA-Z0-9]/g, '_');
+    cb(null, `${sanitizedName}-${uniqueSuffix}${ext}`);
+  },
+});
+
+const receiptFileFilter = (req, file, cb) => {
+  const allowedTypes = [
+    'application/pdf',
+    'image/jpeg',
+    'image/jpg',
+    'image/png',
+    'image/webp',
+    'image/heic',
+    'image/heif',
+  ];
+  if (allowedTypes.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error('Invalid receipt file type. Allowed: PDF, JPG, PNG, WEBP, HEIC, HEIF'), false);
+  }
+};
+
+export const uploadReceipt = multer({
+  storage: receiptStorage,
+  fileFilter: receiptFileFilter,
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB
   },
 });
 

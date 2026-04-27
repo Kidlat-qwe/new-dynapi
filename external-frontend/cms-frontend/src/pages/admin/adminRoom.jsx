@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { apiRequest } from '../../config/api';
 import { useAuth } from '../../contexts/AuthContext';
 import FixedTablePagination from '../../components/table/FixedTablePagination';
+import { appAlert, appConfirm } from '../../utils/appAlert';
 
 const ITEMS_PER_PAGE = 10;
 
@@ -231,11 +232,18 @@ const AdminRoom = () => {
     // Verify room belongs to admin's branch
     const room = rooms.find(r => r.room_id === roomId);
     if (room && room.branch_id !== adminBranchId) {
-      alert('You can only delete rooms from your branch.');
+      appAlert('You can only delete rooms from your branch.');
       return;
     }
     
-    if (!window.confirm('Are you sure you want to delete this room?')) {
+    if (
+      !(await appConfirm({
+        title: 'Delete room',
+        message: 'Are you sure you want to delete this room?',
+        destructive: true,
+        confirmLabel: 'Delete',
+      }))
+    ) {
       return;
     }
 
@@ -245,7 +253,7 @@ const AdminRoom = () => {
       });
       fetchRooms();
     } catch (err) {
-      alert(err.message || 'Failed to delete room');
+      appAlert(err.message || 'Failed to delete room');
     }
   };
 
@@ -276,7 +284,7 @@ const AdminRoom = () => {
     
     // Verify room belongs to admin's branch
     if (room.branch_id !== adminBranchId) {
-      alert('You can only edit rooms from your branch.');
+      appAlert('You can only edit rooms from your branch.');
       return;
     }
     
@@ -445,7 +453,7 @@ const AdminRoom = () => {
       setRoomClassSchedules(summarized);
     } catch (err) {
       console.error('Error fetching room class schedules:', err);
-      alert(err.message || 'Failed to load class schedules');
+      appAlert(err.message || 'Failed to load class schedules');
       setRoomClassSchedules([]);
     } finally {
       setClassSchedulesLoading(false);

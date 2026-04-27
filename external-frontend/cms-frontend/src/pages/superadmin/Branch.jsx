@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { apiRequest } from '../../config/api';
+import { appAlert, appConfirm } from '../../utils/appAlert';
 
 const Branch = () => {
   const [branches, setBranches] = useState([]);
@@ -112,7 +113,14 @@ const Branch = () => {
 
   const handleDelete = async (branchId) => {
     setOpenMenuId(null);
-    if (!window.confirm('Are you sure you want to delete this branch?')) {
+    if (
+      !(await appConfirm({
+        title: 'Delete branch',
+        message: 'Are you sure you want to delete this branch?',
+        destructive: true,
+        confirmLabel: 'Delete',
+      }))
+    ) {
       return;
     }
 
@@ -122,7 +130,7 @@ const Branch = () => {
       });
       fetchBranches(); // Refresh the list
     } catch (err) {
-      alert(err.message || 'Failed to delete branch');
+      appAlert(err.message || 'Failed to delete branch');
     }
   };
 
@@ -202,6 +210,10 @@ const Branch = () => {
     
     if (!formData.branch_name.trim()) {
       errors.branch_name = 'Branch name is required';
+    }
+
+    if (!formData.branch_nickname.trim()) {
+      errors.branch_nickname = 'Branch nickname is required';
     }
 
     if (!formData.branch_email.trim()) {
@@ -451,7 +463,7 @@ const Branch = () => {
 
                     <div>
                       <label htmlFor="branch_nickname" className="label-field">
-                        Nickname
+                        School Nickname <span className="text-red-500">*</span>
                       </label>
                       <input
                         type="text"
@@ -459,9 +471,13 @@ const Branch = () => {
                         name="branch_nickname"
                         value={formData.branch_nickname}
                         onChange={handleInputChange}
-                        className="input-field"
-                        placeholder="Optional short name"
+                        className={`input-field ${formErrors.branch_nickname ? 'border-red-500' : ''}`}
+                        placeholder="Required short name"
+                        required
                       />
+                      {formErrors.branch_nickname && (
+                        <p className="mt-1 text-sm text-red-600">{formErrors.branch_nickname}</p>
+                      )}
                     </div>
 
                     <div>

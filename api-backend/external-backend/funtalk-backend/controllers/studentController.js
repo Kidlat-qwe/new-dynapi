@@ -381,8 +381,8 @@ export const getStudentAppointments = async (req, res) => {
     const sqlQuery = `
       SELECT 
         a.appointment_id,
-        a.appointment_date,
-        a.appointment_time,
+        a.appointment_date::text AS appointment_date,
+        a.appointment_time::text AS appointment_time,
         a.class_type,
         a.status,
         a.student_name,

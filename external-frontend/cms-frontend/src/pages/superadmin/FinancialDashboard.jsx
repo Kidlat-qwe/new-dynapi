@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Area,
   AreaChart,
@@ -16,25 +17,33 @@ import {
 import { apiRequest } from '../../config/api';
 import { useGlobalBranchFilter } from '../../contexts/GlobalBranchFilterContext';
 import { formatDateManila } from '../../utils/dateUtils';
+import { DashboardStatIcon } from '../../components/dashboard/DashboardStatIcons';
 
 const COLORS = ['#F7C844', '#4F46E5', '#22C55E', '#F97316', '#14B8A6', '#EC4899'];
+const CURRENT_MONTH = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' }).slice(0, 7);
 
-const StatsCard = ({ title, value, icon, accent, trend }) => (
-  <div className="group relative overflow-hidden rounded-2xl bg-white p-6 shadow-sm ring-1 ring-gray-100 transition-all duration-300 hover:shadow-lg hover:ring-gray-200">
+const StatsCard = ({ title, value, iconName, accent, trend, trendClassName = 'text-emerald-600', onClick }) => (
+  <button
+    type="button"
+    onClick={onClick}
+    className={`group relative w-full overflow-hidden rounded-2xl bg-white p-6 text-left shadow-sm ring-1 ring-gray-100 transition-all duration-300 hover:shadow-lg hover:ring-gray-200 ${onClick ? 'cursor-pointer focus:outline-none focus:ring-2 focus:ring-[#F7C844] focus:ring-offset-2' : 'cursor-default'}`}
+  >
     <div className="flex items-start justify-between">
       <div className="flex-1">
         <p className="text-sm font-medium text-gray-600">{title}</p>
-        <p className="mt-3 text-3xl font-bold tracking-tight text-gray-900">{value.toLocaleString()}</p>
+        <p className="mt-3 text-3xl font-bold tracking-tight text-gray-900">
+          {typeof value === 'number' ? value.toLocaleString() : value}
+        </p>
         {trend && (
-          <p className="mt-2 text-xs font-medium text-emerald-600">{trend}</p>
+          <p className={`mt-2 text-xs font-medium ${trendClassName}`}>{trend}</p>
         )}
       </div>
       <div className={`ml-4 flex h-14 w-14 items-center justify-center rounded-xl ${accent} shadow-sm transition-transform duration-300 group-hover:scale-110`}>
-        <span className="text-2xl">{icon}</span>
+        <DashboardStatIcon name={iconName} className="h-7 w-7 text-white drop-shadow-sm" />
       </div>
     </div>
     <div className={`absolute inset-x-0 bottom-0 h-1 ${accent.replace('bg-', 'bg-gradient-to-r from-').replace('/80', ' to-transparent')}`} />
-  </div>
+  </button>
 );
 
 const ChartCard = ({ title, subtitle, children, className = '' }) => (
@@ -48,10 +57,12 @@ const ChartCard = ({ title, subtitle, children, className = '' }) => (
 );
 
 const FinancialDashboard = () => {
+  const navigate = useNavigate();
   const { selectedBranchId } = useGlobalBranchFilter();
   const [metrics, setMetrics] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [selectedMonth, setSelectedMonth] = useState('');
 
   const fetchDashboardData = async () => {
     try {
@@ -60,6 +71,9 @@ const FinancialDashboard = () => {
       const params = new URLSearchParams();
       if (selectedBranchId) {
         params.append('branch_id', selectedBranchId);
+      }
+      if (selectedMonth) {
+        params.append('month', selectedMonth);
       }
       const response = await apiRequest(`/dashboard?${params.toString()}`);
       setMetrics(response.data);
@@ -73,7 +87,7 @@ const FinancialDashboard = () => {
   useEffect(() => {
     fetchDashboardData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedBranchId]);
+  }, [selectedBranchId, selectedMonth]);
 
   const studentsByBranch = useMemo(
     () => metrics?.students_by_branch || [],
@@ -92,6 +106,30 @@ const FinancialDashboard = () => {
     [metrics]
   );
 
+  const paymentVerification = useMemo(
+    () =>
+      metrics?.payment_verification || {
+        verified_count: 0,
+        verified_amount: 0,
+        unverified_count: 0,
+        unverified_amount: 0,
+      },
+    [metrics]
+  );
+  const arVerification = useMemo(
+    () =>
+      metrics?.ar_verification || {
+        verified_count: 0,
+        verified_amount: 0,
+        unverified_count: 0,
+        unverified_amount: 0,
+      },
+    [metrics]
+  );
+
+  const formatPeso = (n) =>
+    `₱${(Number(n) || 0).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
   const totals = metrics?.totals || {
     total_branches: 0,
     total_students: 0,
@@ -105,6 +143,23 @@ const FinancialDashboard = () => {
     return branch?.branch_name || 'All Branches';
   }, [selectedBranchId, metrics]);
 
+  const openPaymentLogsByVerification = (type) => {
+    const params = new URLSearchParams();
+    params.set('notificationTab', 'main');
+    params.set('financeApproval', type === 'verified' ? 'approved' : 'pending');
+    navigate(`/superadmin/payment-logs?${params.toString()}`);
+  };
+  const openArByVerification = (type) => {
+    const params = new URLSearchParams();
+    params.set('page', '1');
+    if (type === 'verified') {
+      params.set('status', 'Verified,Applied');
+    } else {
+      params.set('status', 'Submitted,Pending,Paid');
+    }
+    navigate(`/superadmin/acknowledgement-receipts?${params.toString()}`);
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-gray-50">
       <div className="mx-auto max-w-7xl space-y-8 p-6 lg:p-8">
@@ -115,6 +170,16 @@ const FinancialDashboard = () => {
             <p className="text-sm text-gray-500">Real-time overview of your physical school operations</p>
           </div>
           <div className="flex flex-wrap items-end gap-4">
+            <label className="inline-flex items-center gap-2 rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700 shadow-sm">
+              <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">Month</span>
+              <input
+                type="month"
+                value={selectedMonth}
+                max={CURRENT_MONTH}
+                onChange={(e) => setSelectedMonth(e.target.value)}
+                className="rounded-md border border-gray-300 px-2 py-1 text-sm text-gray-700 focus:border-[#F7C844] focus:outline-none focus:ring-2 focus:ring-[#F7C844]/40"
+              />
+            </label>
             <button
               type="button"
               onClick={fetchDashboardData}
@@ -160,26 +225,87 @@ const FinancialDashboard = () => {
             title="Total Branches"
             value={totals.total_branches}
             accent="bg-gradient-to-br from-yellow-400 to-yellow-500"
-            icon="🏢"
+            iconName="building"
           />
           <StatsCard
             title="Total Students"
             value={totals.total_students}
             accent="bg-gradient-to-br from-emerald-400 to-emerald-500"
-            icon="🎓"
+            iconName="users"
           />
           <StatsCard
             title="Total Teachers"
             value={totals.total_teachers}
             accent="bg-gradient-to-br from-indigo-400 to-indigo-500"
-            icon="👩‍🏫"
+            iconName="academicCap"
           />
           <StatsCard
             title="Active Classes"
             value={totals.active_classes}
             accent="bg-gradient-to-br from-orange-400 to-orange-500"
-            icon="📚"
+            iconName="bookOpen"
           />
+        </div>
+
+        {/* Finance / Superfinance payment verification (same approval_status as Payment Logs) */}
+        <div className="space-y-3">
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900">Payment verification (Finance & Superfinance)</h2>
+            <p className="mt-1 text-sm text-gray-500">
+              Completed payments only. <span className="font-medium text-gray-700">Verified</span> means approval status is
+              Approved in Payment Logs (Finance branch users or Superfinance org-wide).{' '}
+              <span className="font-medium text-gray-700">Unverified</span> are still Pending or not yet approved.
+            </p>
+          </div>
+          <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+            <StatsCard
+              title="Verified payments"
+              value={paymentVerification.verified_count}
+              trend={`${formatPeso(paymentVerification.verified_amount)} total amount`}
+              accent="bg-gradient-to-br from-teal-400 to-teal-600"
+              iconName="shieldCheck"
+              onClick={() => openPaymentLogsByVerification('verified')}
+            />
+            <StatsCard
+              title="Unverified payments"
+              value={paymentVerification.unverified_count}
+              trend={`${formatPeso(paymentVerification.unverified_amount)} total amount`}
+              trendClassName="text-amber-800"
+              accent="bg-gradient-to-br from-amber-400 to-amber-600"
+              iconName="clock"
+              onClick={() => openPaymentLogsByVerification('unverified')}
+            />
+          </div>
+        </div>
+
+        {/* Package AR verification lifecycle */}
+        <div className="space-y-3">
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900">Acknowledgement Receipt verification (Package AR)</h2>
+            <p className="mt-1 text-sm text-gray-500">
+              <span className="font-medium text-gray-700">Verified AR</span> includes statuses Verified and Applied.{' '}
+              <span className="font-medium text-gray-700">Unverified AR</span> includes Submitted/Pending AR records awaiting verification.
+            </p>
+          </div>
+          <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+            <StatsCard
+              title="Verified AR"
+              value={arVerification.verified_count}
+              trend={`${formatPeso(arVerification.verified_amount)} total amount`}
+              accent="bg-gradient-to-br from-emerald-400 to-emerald-600"
+              iconName="shieldCheck"
+              onClick={() => openArByVerification('verified')}
+            />
+            <StatsCard
+              title="Unverified AR"
+              value={arVerification.unverified_count}
+              trend={`${formatPeso(arVerification.unverified_amount)} total amount`}
+              trendClassName="text-amber-800"
+              accent="bg-gradient-to-br from-amber-400 to-amber-600"
+              iconName="clock"
+              onClick={() => openArByVerification('unverified')}
+            />
+          </div>
         </div>
 
         {/* Crossing Procedures Alert */}

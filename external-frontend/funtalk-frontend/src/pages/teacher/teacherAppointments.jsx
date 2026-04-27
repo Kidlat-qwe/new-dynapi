@@ -3,8 +3,9 @@ import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import Header from '../../components/Header';
 import Sidebar from '../../components/Sidebar';
-
-import { fetchFuntalk } from '../../lib/api';
+import { API_BASE_URL } from '@/config/api.js';
+import ResponsiveSelect from '../../components/ResponsiveSelect';
+import Pagination from '../../components/Pagination.jsx';
 
 const TeacherAppointments = () => {
   const navigate = useNavigate();
@@ -16,6 +17,7 @@ const TeacherAppointments = () => {
   const [statusFilter, setStatusFilter] = useState('');
   const [dateFilter, setDateFilter] = useState('');
   const [studentSearch, setStudentSearch] = useState('');
+  const [page, setPage] = useState(1);
   const [selectedAppointment, setSelectedAppointment] = useState(null);
   const [isDetailModalOpen, setIsDetailModalOpen] = useState(false);
   const [isFeedbackModalOpen, setIsFeedbackModalOpen] = useState(false);
@@ -56,7 +58,8 @@ const TeacherAppointments = () => {
   const fetchAppointments = async () => {
     setIsFetching(true);
     try {
-      let url = '/appointments';
+      const token = localStorage.getItem('token');
+      let url = `${API_BASE_URL}/appointments`;
       const params = new URLSearchParams();
       
       if (statusFilter) {
@@ -71,7 +74,11 @@ const TeacherAppointments = () => {
         url += `?${params.toString()}`;
       }
 
-      const response = await fetchFuntalk(url, {});
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.appointments) {
@@ -95,6 +102,13 @@ const TeacherAppointments = () => {
       apt.school_name?.toLowerCase().includes(studentSearch.toLowerCase());
     return matchesSearch;
   });
+
+  useEffect(() => {
+    setPage(1);
+  }, [studentSearch, statusFilter, dateFilter]);
+
+  const pageSize = 10;
+  const pagedAppointments = filteredAppointments.slice((page - 1) * pageSize, page * pageSize);
 
   // Format date and time
   const formatDateTime = (date, time) => {
@@ -141,9 +155,17 @@ const TeacherAppointments = () => {
   };
 
   // Handle launch class
+  const normalizeMeetingUrl = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    if (/^https?:\/\//i.test(raw)) return raw;
+    return `https://${raw}`;
+  };
+
   const handleLaunchClass = (appointment) => {
-    if (appointment.meeting_link) {
-      window.open(appointment.meeting_link, '_blank');
+    const meetingUrl = normalizeMeetingUrl(appointment.meeting_link);
+    if (meetingUrl) {
+      window.open(meetingUrl, '_blank', 'noopener,noreferrer');
     } else {
       alert('Meeting link not available yet. Please contact support.');
     }
@@ -152,9 +174,13 @@ const TeacherAppointments = () => {
   // Handle mark status
   const handleMarkStatus = async (appointmentId, newStatus) => {
     try {
-      const response = await fetchFuntalk(`/appointments/${appointmentId}/status`, {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/appointments/${appointmentId}/status`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
         body: JSON.stringify({ status: newStatus }),
       });
 
@@ -188,9 +214,13 @@ const TeacherAppointments = () => {
 
     setIsSubmittingFeedback(true);
     try {
-      const response = await fetchFuntalk(`/appointments/${selectedAppointment.appointment_id}/feedback`, {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/appointments/${selectedAppointment.appointment_id}/feedback`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
         body: JSON.stringify({ feedback: feedbackText.trim() }),
       });
 
@@ -257,10 +287,11 @@ const TeacherAppointments = () => {
                   </div>
                   <div>
                     <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-1">Status</label>
-                    <select
+                    <ResponsiveSelect
                       value={statusFilter}
                       onChange={(e) => setStatusFilter(e.target.value)}
                       className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                      aria-label="Status"
                     >
                       <option value="">All Status</option>
                       <option value="pending">Pending</option>
@@ -268,7 +299,7 @@ const TeacherAppointments = () => {
                       <option value="completed">Completed</option>
                       <option value="cancelled">Cancelled</option>
                       <option value="no_show">No Show</option>
-                    </select>
+                    </ResponsiveSelect>
                   </div>
                   <div>
                     <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-1">Date From</label>
@@ -302,21 +333,22 @@ const TeacherAppointments = () => {
                     </p>
                   </div>
                 ) : (
-                  <div className="overflow-x-auto overflow-hidden">
-                    <table className="w-full divide-y divide-gray-200" style={{ minWidth: '1000px' }}>
+                  <>
+                  <div className="overflow-x-auto rounded-b-xl">
+                    <table className="min-w-[980px] w-full divide-y divide-gray-200">
                       <thead className="bg-gray-50">
                         <tr>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date & Time</th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Student</th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden lg:table-cell">School</th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden md:table-cell">Material</th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
-                          <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Date & Time</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Student</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">School</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Material</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Status</th>
+                          <th className="sticky right-0 z-10 bg-gray-50 px-6 py-3 text-right text-xs font-medium text-gray-500 tracking-wider shadow-[-2px_0_8px_-2px_rgba(0,0,0,0.08)]">Actions</th>
                         </tr>
                       </thead>
                       <tbody className="bg-white divide-y divide-gray-200">
-                        {filteredAppointments.map((appointment) => (
-                          <tr key={appointment.appointment_id} className="hover:bg-gray-50">
+                        {pagedAppointments.map((appointment) => (
+                          <tr key={appointment.appointment_id} className="group hover:bg-gray-50">
                             <td className="px-6 py-4 whitespace-nowrap">
                               <div className="text-sm font-medium text-gray-900">
                                 {formatDateTime(appointment.appointment_date, appointment.appointment_time)}
@@ -328,10 +360,10 @@ const TeacherAppointments = () => {
                                 <div className="text-xs text-gray-500">Level: {appointment.student_level}</div>
                               )}
                             </td>
-                            <td className="px-6 py-4 whitespace-nowrap hidden lg:table-cell">
+                            <td className="px-6 py-4 whitespace-nowrap">
                               <div className="text-sm text-gray-900">{appointment.school_name || 'N/A'}</div>
                             </td>
-                            <td className="px-6 py-4 whitespace-nowrap hidden md:table-cell">
+                            <td className="px-6 py-4 whitespace-nowrap">
                               <div className="text-sm text-gray-500">{appointment.material_name || '-'}</div>
                             </td>
                             <td className="px-6 py-4 whitespace-nowrap">
@@ -339,7 +371,7 @@ const TeacherAppointments = () => {
                                 {formatStatus(appointment.status)}
                               </span>
                             </td>
-                            <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                            <td className="sticky right-0 z-[1] bg-white px-6 py-4 whitespace-nowrap text-right text-sm font-medium shadow-[-2px_0_8px_-2px_rgba(0,0,0,0.06)] group-hover:bg-gray-50">
                               <div className="flex items-center justify-end gap-2">
                                 <button
                                   onClick={() => handleViewDetails(appointment)}
@@ -348,7 +380,7 @@ const TeacherAppointments = () => {
                                 >
                                   View
                                 </button>
-                                {(appointment.status === 'approved' || appointment.status === 'pending') && appointment.meeting_link && (
+                                {appointment.status === 'approved' && appointment.meeting_link && (
                                   <button
                                     onClick={() => handleLaunchClass(appointment)}
                                     className="px-3 py-1 text-xs bg-primary-600 text-white rounded-lg hover:bg-primary-700"
@@ -363,6 +395,10 @@ const TeacherAppointments = () => {
                       </tbody>
                     </table>
                   </div>
+                  <div className="px-4 py-3 sm:px-6 border-t border-gray-200">
+                    <Pagination totalItems={filteredAppointments.length} pageSize={pageSize} currentPage={page} onPageChange={setPage} />
+                  </div>
+                  </>
                 )}
               </div>
 
@@ -380,7 +416,7 @@ const TeacherAppointments = () => {
       {/* Appointment Details Modal */}
       {isDetailModalOpen && selectedAppointment && createPortal(
         <div 
-          className="fixed bg-black bg-opacity-50 flex items-center justify-center p-4" 
+          className="fixed bg-black/40 backdrop-blur-sm flex items-center justify-center p-4" 
           style={{ 
             position: 'fixed', 
             top: 0, 
@@ -400,12 +436,12 @@ const TeacherAppointments = () => {
           }}
         >
           <div 
-            className="bg-white rounded-lg shadow-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto mx-4 sm:mx-0"
+            className="bg-white rounded-lg shadow-xl max-w-3xl w-full mx-4 sm:mx-0"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="p-4 sm:p-5 md:p-6">
-              <div className="flex items-center justify-between mb-4 sm:mb-6">
-                <h2 className="text-xl sm:text-2xl font-bold text-gray-900">Appointment Details</h2>
+            <div className="p-4 sm:p-5">
+              <div className="flex items-center justify-between mb-3 sm:mb-4">
+                <h2 className="text-lg sm:text-xl font-bold text-gray-900">Appointment Details</h2>
                 <button
                   onClick={() => setIsDetailModalOpen(false)}
                   className="text-gray-400 hover:text-gray-600 transition-colors p-1"
@@ -416,34 +452,36 @@ const TeacherAppointments = () => {
                 </button>
               </div>
 
-              <div className="space-y-4">
+              <div className="space-y-3">
                 {/* Student Info */}
-                <div>
-                  <h3 className="text-sm font-medium text-gray-500 mb-2">Student Information</h3>
-                  <div className="bg-gray-50 rounded-lg p-3 space-y-2">
-                    <div><span className="font-medium">Name:</span> {selectedAppointment.student_name || 'N/A'}</div>
-                    {selectedAppointment.student_age && <div><span className="font-medium">Age:</span> {selectedAppointment.student_age}</div>}
-                    {selectedAppointment.student_level && <div><span className="font-medium">Level:</span> {selectedAppointment.student_level}</div>}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <h3 className="text-xs font-medium text-gray-500 mb-1">Student Information</h3>
+                    <div className="bg-gray-50 rounded-lg p-2.5 space-y-1.5 text-sm">
+                      <div><span className="font-medium">Name:</span> {selectedAppointment.student_name || 'N/A'}</div>
+                      {selectedAppointment.student_age && <div><span className="font-medium">Age:</span> {selectedAppointment.student_age}</div>}
+                      {selectedAppointment.student_level && <div><span className="font-medium">Level:</span> {selectedAppointment.student_level}</div>}
+                    </div>
                   </div>
-                </div>
 
-                {/* Class Details */}
-                <div>
-                  <h3 className="text-sm font-medium text-gray-500 mb-2">Class Details</h3>
-                  <div className="bg-gray-50 rounded-lg p-3 space-y-2">
-                    <div><span className="font-medium">Date & Time:</span> {formatDateTime(selectedAppointment.appointment_date, selectedAppointment.appointment_time)}</div>
-                    <div><span className="font-medium">School:</span> {selectedAppointment.school_name || 'N/A'}</div>
-                    {selectedAppointment.material_name && <div><span className="font-medium">Material:</span> {selectedAppointment.material_name}</div>}
-                    {selectedAppointment.class_type && <div><span className="font-medium">Class Type:</span> {selectedAppointment.class_type}</div>}
-                    <div><span className="font-medium">Status:</span> <span className={`px-2 py-1 text-xs font-semibold rounded-full ${getStatusColor(selectedAppointment.status)}`}>{formatStatus(selectedAppointment.status)}</span></div>
+                  {/* Class Details */}
+                  <div>
+                    <h3 className="text-xs font-medium text-gray-500 mb-1">Class Details</h3>
+                    <div className="bg-gray-50 rounded-lg p-2.5 space-y-1.5 text-sm">
+                      <div><span className="font-medium">Date & Time:</span> {formatDateTime(selectedAppointment.appointment_date, selectedAppointment.appointment_time)}</div>
+                      <div><span className="font-medium">School:</span> {selectedAppointment.school_name || 'N/A'}</div>
+                      {selectedAppointment.material_name && <div><span className="font-medium">Material:</span> {selectedAppointment.material_name}</div>}
+                      {selectedAppointment.class_type && <div><span className="font-medium">Class Type:</span> {selectedAppointment.class_type}</div>}
+                      <div><span className="font-medium">Status:</span> <span className={`px-2 py-0.5 text-xs font-semibold rounded-full ${getStatusColor(selectedAppointment.status)}`}>{formatStatus(selectedAppointment.status)}</span></div>
+                    </div>
                   </div>
                 </div>
 
                 {/* Additional Notes */}
                 {selectedAppointment.additional_notes && (
                   <div>
-                    <h3 className="text-sm font-medium text-gray-500 mb-2">Additional Notes</h3>
-                    <div className="bg-gray-50 rounded-lg p-3">
+                    <h3 className="text-xs font-medium text-gray-500 mb-1">Additional Notes</h3>
+                    <div className="bg-gray-50 rounded-lg p-2.5">
                       <p className="text-sm text-gray-700">{selectedAppointment.additional_notes}</p>
                     </div>
                   </div>
@@ -452,10 +490,10 @@ const TeacherAppointments = () => {
                 {/* Meeting Link */}
                 {selectedAppointment.meeting_link && (
                   <div>
-                    <h3 className="text-sm font-medium text-gray-500 mb-2">Meeting Link</h3>
-                    <div className="bg-gray-50 rounded-lg p-3">
+                    <h3 className="text-xs font-medium text-gray-500 mb-1">Meeting Link</h3>
+                    <div className="bg-gray-50 rounded-lg p-2.5">
                       <a
-                        href={selectedAppointment.meeting_link}
+                        href={normalizeMeetingUrl(selectedAppointment.meeting_link)}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="text-primary-600 hover:text-primary-800 underline break-all"
@@ -467,8 +505,8 @@ const TeacherAppointments = () => {
                 )}
 
                 {/* Actions */}
-                <div className="flex flex-wrap gap-2 pt-4 border-t">
-                  {(selectedAppointment.status === 'approved' || selectedAppointment.status === 'pending') && selectedAppointment.meeting_link && (
+                <div className="flex flex-wrap gap-2 pt-3 border-t">
+                  {selectedAppointment.status === 'approved' && selectedAppointment.meeting_link && (
                     <button
                       onClick={() => {
                         handleLaunchClass(selectedAppointment);
@@ -525,7 +563,7 @@ const TeacherAppointments = () => {
       {/* Feedback Modal */}
       {isFeedbackModalOpen && selectedAppointment && createPortal(
         <div 
-          className="fixed bg-black bg-opacity-50 flex items-center justify-center p-4" 
+          className="fixed bg-black/40 backdrop-blur-sm flex items-center justify-center p-4" 
           style={{ 
             position: 'fixed', 
             top: 0, 

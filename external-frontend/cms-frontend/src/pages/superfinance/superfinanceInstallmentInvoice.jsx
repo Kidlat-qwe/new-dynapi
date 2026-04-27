@@ -1,13 +1,18 @@
 import { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
+import { useSearchParams } from 'react-router-dom';
 import { apiRequest } from '../../config/api';
 import { useGlobalBranchFilter } from '../../contexts/GlobalBranchFilterContext';
 import { formatDateManila } from '../../utils/dateUtils';
 import FixedTablePagination from '../../components/table/FixedTablePagination';
+import { appAlert, appConfirm } from '../../utils/appAlert';
 
 const ITEMS_PER_PAGE = 10;
 
 const SuperfinanceInstallmentInvoice = () => {
+  const [searchParams] = useSearchParams();
+  const highlightedProfileId = parseInt(searchParams.get('profile_id') || '', 10) || null;
+  const highlightedStudentName = searchParams.get('student_name') || '';
   const { selectedBranchId: globalBranchId } = useGlobalBranchFilter();
   const [invoices, setInvoices] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -55,10 +60,22 @@ const SuperfinanceInstallmentInvoice = () => {
     return `${year}-${month}-${day}`;
   };
 
+  const addMonths = (date, months) => {
+    const nextDate = new Date(date);
+    nextDate.setMonth(nextDate.getMonth() + months);
+    return nextDate;
+  };
+
   useEffect(() => {
     fetchInvoices();
     fetchBranches();
   }, []);
+
+  useEffect(() => {
+    if (highlightedStudentName) {
+      setNameSearchTerm(highlightedStudentName);
+    }
+  }, [highlightedStudentName]);
 
   useEffect(() => {
     setFilterBranch(globalBranchId || '');
@@ -134,6 +151,16 @@ const SuperfinanceInstallmentInvoice = () => {
     setCurrentPage((prevPage) => Math.min(prevPage, totalPages));
   }, [totalPages]);
 
+  useEffect(() => {
+    if (!highlightedProfileId) return;
+    const targetIndex = filteredInvoices.findIndex(
+      (invoice) => Number(invoice.installmentinvoiceprofiles_id) === highlightedProfileId
+    );
+    if (targetIndex >= 0) {
+      setCurrentPage(Math.floor(targetIndex / ITEMS_PER_PAGE) + 1);
+    }
+  }, [filteredInvoices, highlightedProfileId]);
+
   const handleViewEdit = (invoice) => {
     console.log('View/Edit invoice:', invoice);
     setOpenActionMenu(null);
@@ -144,6 +171,11 @@ const SuperfinanceInstallmentInvoice = () => {
   const handleGenerateInvoice = (invoice) => {
     setOpenActionMenu(null);
     setActionMenuPosition(null);
+
+    if (invoice.profile_is_active === false) {
+      appAlert('This student is already unenrolled. Existing installment invoices stay visible for history, but no new installment invoices can be generated.');
+      return;
+    }
     
     // Check phase limit
     // Note: Phase 1 is already paid via initial package, so we can only generate (total_phases - 1) invoices
@@ -151,7 +183,7 @@ const SuperfinanceInstallmentInvoice = () => {
       const generatedCount = invoice.generated_count || 0;
       const maxInvoices = invoice.total_phases - 1; // Deduct 1 for Phase 1 already paid
       if (generatedCount >= maxInvoices) {
-        alert(`Phase limit reached. Already generated ${generatedCount} of ${maxInvoices} installment invoices (Phase 1 was paid via initial package). Cannot generate more invoices.`);
+        appAlert(`Phase limit reached. Already generated ${generatedCount} of ${maxInvoices} installment invoices (Phase 1 was paid via initial package). Cannot generate more invoices.`);
         return;
       }
     }
@@ -159,53 +191,25 @@ const SuperfinanceInstallmentInvoice = () => {
     setSelectedInvoiceForGeneration(invoice);
     
     const months = getFrequencyMonths(invoice.frequency);
+    const storedGenerationDate = invoice.next_generation_date
+      ? parseYmdLocalNoon(String(invoice.next_generation_date).slice(0, 10))
+      : null;
+    const generationDate = storedGenerationDate || new Date();
+    generationDate.setHours(0, 0, 0, 0);
+    generationDate.setDate(25);
 
-    // Base "current" dates: use row's next_generation_date / next_invoice_month when present (so 2nd+ manual generate shows correct dates)
-    let issueDate, invoiceMonth, generationDate;
-    const hasStoredDates = invoice.next_generation_date && invoice.next_invoice_month;
-    if (hasStoredDates) {
-      const genYmd = String(invoice.next_generation_date).slice(0, 10);
-      const [gy, gm, gd] = genYmd.split('-').map(Number);
-      generationDate = new Date(gy, gm - 1, gd);
-      issueDate = new Date(generationDate);
-      const monthYmd = String(invoice.next_invoice_month).slice(0, 10);
-      const [my, mm] = monthYmd.split('-').map(Number);
-      invoiceMonth = new Date(my, mm - 1, 1);
-    } else {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      issueDate = new Date(today);
-      invoiceMonth = new Date(today.getFullYear(), today.getMonth() + 1, 1);
-      generationDate = new Date(invoiceMonth);
-      generationDate.setDate(25);
-    }
-    // Phase 1: due = class start. Phase 2+: invoice month = class start + generated_count, due = 5th of next month.
-    const generatedCount = invoice.generated_count || 0;
-    const classStartYmd = invoice.class_start_date ? String(invoice.class_start_date).slice(0, 10) : null;
-    let dueDate;
-    if (generatedCount === 0 && classStartYmd) {
-      const [y, m, d] = classStartYmd.split('-').map(Number);
-      dueDate = new Date(y, m - 1, d);
-    } else if (classStartYmd) {
-      const [cy, cm] = classStartYmd.split('-').map(Number);
-      invoiceMonth = new Date(cy, cm - 1 + generatedCount - 1, 1); // Phase 2 = April, Phase 3 = May (due = 5th of next)
-      dueDate = new Date(invoiceMonth);
-      dueDate.setMonth(dueDate.getMonth() + 1);
-      dueDate.setDate(5);
-    } else {
-      dueDate = new Date(invoiceMonth);
-      dueDate.setMonth(dueDate.getMonth() + 1);
-      dueDate.setDate(5);
-    }
+    const issueDate = new Date(generationDate);
+    const invoiceMonth = new Date(issueDate.getFullYear(), issueDate.getMonth() + 1, 1);
+    const dueDate = new Date(invoiceMonth);
+    dueDate.setDate(5);
 
-    // Next Invoice Detail = current invoice month + frequency
+    const nextGenerationDate = addMonths(new Date(generationDate), months);
+    nextGenerationDate.setDate(25);
     const nextInvoiceMonth = new Date(invoiceMonth);
     nextInvoiceMonth.setMonth(nextInvoiceMonth.getMonth() + months);
     nextInvoiceMonth.setDate(1);
-    const nextIssueDate = new Date(nextInvoiceMonth);
-    nextIssueDate.setDate(25);
+    const nextIssueDate = new Date(nextGenerationDate);
     const nextDueDate = new Date(nextInvoiceMonth);
-    nextDueDate.setMonth(nextDueDate.getMonth() + 1);
     nextDueDate.setDate(5);
 
     setGenerateFormData({
@@ -216,7 +220,7 @@ const SuperfinanceInstallmentInvoice = () => {
       next_issue_date: formatYmd(nextIssueDate),
       next_due_date: formatYmd(nextDueDate),
       next_invoice_month: formatYmd(nextInvoiceMonth),
-      next_generation_date: formatYmd(nextIssueDate),
+      next_generation_date: formatYmd(nextGenerationDate),
     });
     
     setIsGenerateModalOpen(true);
@@ -272,7 +276,7 @@ const SuperfinanceInstallmentInvoice = () => {
       
       // Show success message
       setError(''); // Clear any previous errors
-      alert('Invoice generated successfully!');
+      appAlert('Invoice generated successfully!');
     } catch (err) {
       setGenerateFormErrors({ submit: err.message || 'Failed to generate invoice' });
       console.error('Error generating invoice:', err);
@@ -282,22 +286,28 @@ const SuperfinanceInstallmentInvoice = () => {
   };
 
   const handleDelete = async (invoice) => {
-    if (!window.confirm(`Are you sure you want to delete invoice for ${invoice.student_name}?`)) {
+    if (
+      !(await appConfirm({
+        title: 'Delete installment invoice',
+        message: `Are you sure you want to delete invoice for ${invoice.student_name}?`,
+        destructive: true,
+        confirmLabel: 'Delete',
+      }))
+    ) {
       setOpenActionMenu(null);
       setActionMenuPosition(null);
       return;
     }
 
     try {
-      // TODO: Implement delete API call
-      // await apiRequest(`/installment-invoices/invoices/${invoice.installmentinvoicedtl_id}`, {
-      //   method: 'DELETE'
-      // });
-      console.log('Delete invoice:', invoice);
+      await apiRequest(`/installment-invoices/invoices/${invoice.installmentinvoicedtl_id}`, {
+        method: 'DELETE',
+      });
       setOpenActionMenu(null);
       setActionMenuPosition(null);
       // Refresh the list
-      fetchInvoices();
+      await fetchInvoices();
+      appAlert('Installment invoice deleted successfully!');
     } catch (err) {
       setError(err.message || 'Failed to delete invoice');
       console.error('Error deleting invoice:', err);
@@ -424,7 +434,14 @@ const SuperfinanceInstallmentInvoice = () => {
                 </tr>
               ) : (
                 paginatedInvoices.map((invoice) => (
-                  <tr key={invoice.installmentinvoicedtl_id}>
+                  <tr
+                    key={invoice.installmentinvoicedtl_id}
+                    className={
+                      Number(invoice.installmentinvoiceprofiles_id) === highlightedProfileId
+                        ? 'bg-amber-50'
+                        : ''
+                    }
+                  >
                     <td className="px-3 py-4 whitespace-nowrap">
                       <div className="text-sm text-gray-900">
                         {invoice.student_name || '-'}
@@ -472,22 +489,21 @@ const SuperfinanceInstallmentInvoice = () => {
                       {invoice.total_phases !== null && invoice.total_phases !== undefined ? (
                         <div className="flex flex-col">
                           <div className="text-sm text-gray-900 font-medium">
-                            {/* Use paid_phases (actual paid invoices) instead of generated_count */}
-                            {(invoice.paid_phases || 0)} / {invoice.total_phases}
+                            {(invoice.display_phase_progress || 0)} / {invoice.total_phases}
                           </div>
                           <div className="w-full bg-gray-200 rounded-full h-2 mt-1">
                             <div 
                               className={`h-2 rounded-full ${
-                                (invoice.paid_phases || 0) >= invoice.total_phases 
+                                (invoice.display_phase_progress || 0) >= invoice.total_phases 
                                   ? 'bg-green-500' 
                                   : 'bg-blue-500'
                               }`}
                               style={{ 
-                                width: `${Math.min(((invoice.paid_phases || 0) / invoice.total_phases) * 100, 100)}%` 
+                                width: `${Math.min(((invoice.display_phase_progress || 0) / invoice.total_phases) * 100, 100)}%` 
                               }}
                             ></div>
                           </div>
-                          {(invoice.paid_phases || 0) >= invoice.total_phases && (
+                          {(invoice.display_phase_progress || 0) >= invoice.total_phases && (
                             <span className="text-xs text-green-600 font-medium mt-1">Completed</span>
                           )}
                         </div>
@@ -609,15 +625,29 @@ const SuperfinanceInstallmentInvoice = () => {
                         e.stopPropagation();
                         handleGenerateInvoice(invoice);
                       }}
-                      disabled={invoice.total_phases !== null && invoice.total_phases !== undefined && (invoice.generated_count || 0) >= invoice.total_phases}
+                      disabled={
+                        invoice.profile_is_active === false ||
+                        (invoice.total_phases !== null &&
+                          invoice.total_phases !== undefined &&
+                          (invoice.generated_count || 0) >= invoice.total_phases)
+                      }
                       className={`block w-full text-left px-4 py-2 text-sm transition-colors ${
-                        invoice.total_phases !== null && invoice.total_phases !== undefined && (invoice.generated_count || 0) >= invoice.total_phases
+                        invoice.profile_is_active === false ||
+                        (invoice.total_phases !== null &&
+                          invoice.total_phases !== undefined &&
+                          (invoice.generated_count || 0) >= invoice.total_phases)
                           ? 'text-gray-400 cursor-not-allowed'
                           : 'text-gray-700 hover:bg-gray-100'
                       }`}
                     >
                       Generate Invoice
-                      {invoice.total_phases !== null && invoice.total_phases !== undefined && (invoice.generated_count || 0) >= invoice.total_phases && (
+                      {invoice.profile_is_active === false && (
+                        <span className="ml-2 text-xs">(Stopped)</span>
+                      )}
+                      {invoice.profile_is_active !== false &&
+                        invoice.total_phases !== null &&
+                        invoice.total_phases !== undefined &&
+                        (invoice.generated_count || 0) >= invoice.total_phases && (
                         <span className="ml-2 text-xs">(Limit Reached)</span>
                       )}
                     </button>
@@ -690,48 +720,7 @@ const SuperfinanceInstallmentInvoice = () => {
                       <input
                         type="date"
                         value={generateFormData.issue_date}
-                        onChange={(e) => {
-                          const nextIssueYmd = e.target.value;
-                          const issue = parseYmdLocalNoon(nextIssueYmd);
-                          if (!issue) {
-                            setGenerateFormData({ ...generateFormData, issue_date: nextIssueYmd });
-                            return;
-                          }
-
-                          // due = issue month + 1, day 5
-                          const due = new Date(issue);
-                          due.setMonth(due.getMonth() + 1);
-                          due.setDate(5);
-
-                          const invoiceMonth = new Date(issue);
-                          invoiceMonth.setDate(1);
-
-                          const months = getFrequencyMonths(selectedInvoiceForGeneration?.frequency);
-                          const nextInvoiceMonth = new Date(invoiceMonth);
-                          nextInvoiceMonth.setMonth(nextInvoiceMonth.getMonth() + months);
-                          nextInvoiceMonth.setDate(1);
-
-                          // nextIssue = nextInvoiceMonth day 25
-                          const nextIssue = new Date(nextInvoiceMonth);
-                          nextIssue.setDate(25);
-
-                          // nextDue = nextInvoiceMonth + 1 month, day 5
-                          const nextDue = new Date(nextInvoiceMonth);
-                          nextDue.setMonth(nextDue.getMonth() + 1);
-                          nextDue.setDate(5);
-
-                          setGenerateFormData({
-                            ...generateFormData,
-                            issue_date: nextIssueYmd,
-                            due_date: formatYmd(due),
-                            invoice_month: formatYmd(invoiceMonth),
-                            generation_date: formatYmd(issue),
-                            next_issue_date: formatYmd(nextIssue),
-                            next_due_date: formatYmd(nextDue),
-                            next_invoice_month: formatYmd(nextInvoiceMonth),
-                            next_generation_date: formatYmd(nextIssue),
-                          });
-                        }}
+                        readOnly
                         className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500 ${
                           generateFormErrors.issue_date ? 'border-red-500' : 'border-gray-300'
                         }`}
@@ -749,7 +738,7 @@ const SuperfinanceInstallmentInvoice = () => {
                       <input
                         type="date"
                         value={generateFormData.due_date}
-                        onChange={(e) => setGenerateFormData({ ...generateFormData, due_date: e.target.value })}
+                        readOnly
                         className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500 ${
                           generateFormErrors.due_date ? 'border-red-500' : 'border-gray-300'
                         }`}
@@ -767,7 +756,7 @@ const SuperfinanceInstallmentInvoice = () => {
                       <input
                         type="date"
                         value={generateFormData.invoice_month}
-                        onChange={(e) => setGenerateFormData({ ...generateFormData, invoice_month: e.target.value })}
+                        readOnly
                         className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500 ${
                           generateFormErrors.invoice_month ? 'border-red-500' : 'border-gray-300'
                         }`}
@@ -785,7 +774,7 @@ const SuperfinanceInstallmentInvoice = () => {
                       <input
                         type="date"
                         value={generateFormData.generation_date}
-                        onChange={(e) => setGenerateFormData({ ...generateFormData, generation_date: e.target.value })}
+                        readOnly
                         className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500"
                       />
                     </div>
@@ -802,7 +791,7 @@ const SuperfinanceInstallmentInvoice = () => {
                       <input
                         type="date"
                         value={generateFormData.next_issue_date}
-                        onChange={(e) => setGenerateFormData({ ...generateFormData, next_issue_date: e.target.value })}
+                        readOnly
                         className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500 ${
                           generateFormErrors.next_issue_date ? 'border-red-500' : 'border-gray-300'
                         }`}
@@ -820,7 +809,7 @@ const SuperfinanceInstallmentInvoice = () => {
                       <input
                         type="date"
                         value={generateFormData.next_due_date}
-                        onChange={(e) => setGenerateFormData({ ...generateFormData, next_due_date: e.target.value })}
+                        readOnly
                         className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500 ${
                           generateFormErrors.next_due_date ? 'border-red-500' : 'border-gray-300'
                         }`}
@@ -838,33 +827,7 @@ const SuperfinanceInstallmentInvoice = () => {
                       <input
                         type="date"
                         value={generateFormData.next_invoice_month}
-                        onChange={(e) => {
-                          const picked = parseYmdLocalNoon(e.target.value);
-                          if (!picked) {
-                            setGenerateFormData({ ...generateFormData, next_invoice_month: e.target.value });
-                            return;
-                          }
-
-                          const monthFirst = new Date(picked);
-                          monthFirst.setDate(1);
-                          
-                          // nextIssue = picked month day 25
-                          const nextIssue = new Date(monthFirst);
-                          nextIssue.setDate(25);
-                          
-                          // due = picked month day 1 + 1 month, day 5
-                          const due = new Date(monthFirst);
-                          due.setMonth(due.getMonth() + 1);
-                          due.setDate(5);
-
-                          setGenerateFormData({
-                            ...generateFormData,
-                            next_invoice_month: formatYmd(monthFirst),
-                            next_issue_date: formatYmd(nextIssue),
-                            next_due_date: formatYmd(due),
-                            next_generation_date: formatYmd(nextIssue),
-                          });
-                        }}
+                        readOnly
                         className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500 ${
                           generateFormErrors.next_invoice_month ? 'border-red-500' : 'border-gray-300'
                         }`}
@@ -882,7 +845,7 @@ const SuperfinanceInstallmentInvoice = () => {
                       <input
                         type="date"
                         value={generateFormData.next_generation_date}
-                        onChange={(e) => setGenerateFormData({ ...generateFormData, next_generation_date: e.target.value })}
+                        readOnly
                         className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500 ${
                           generateFormErrors.next_generation_date ? 'border-red-500' : 'border-gray-300'
                         }`}

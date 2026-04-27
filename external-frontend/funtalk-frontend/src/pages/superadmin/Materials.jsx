@@ -3,7 +3,36 @@ import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import Header from '../../components/Header';
 import Sidebar from '../../components/Sidebar';
-import { fetchFuntalk, getFuntalkServerOrigin } from '../../lib/api';
+import { API_BASE_URL } from '@/config/api.js';
+import ResponsiveSelect from '../../components/ResponsiveSelect';
+import Pagination from '../../components/Pagination.jsx';
+import { computeFixedActionMenuPosition } from '../../utils/actionMenuPosition.js';
+
+const MATERIAL_TYPE_OPTIONS = [
+  'Lesson Plan',
+  'Worksheet',
+  'Presentation',
+  'Video Lesson',
+  'Audio Lesson',
+  'Reading Material',
+  'Other',
+];
+
+const getMaterialFileHref = (fileUrl) => {
+  if (!fileUrl) return '';
+  return fileUrl.startsWith('http')
+    ? fileUrl
+    : `${API_BASE_URL.replace('/api', '')}${fileUrl}`;
+};
+
+const getPreviewType = (fileUrl) => {
+  const lower = String(fileUrl || '').toLowerCase();
+  if (/\.(png|jpe?g|gif|webp|bmp|svg)(\?.*)?$/.test(lower)) return 'image';
+  if (/\.(mp4|webm|ogg|mov|m4v)(\?.*)?$/.test(lower)) return 'video';
+  if (/\.(mp3|wav|ogg|m4a|aac|flac)(\?.*)?$/.test(lower)) return 'audio';
+  if (/\.pdf(\?.*)?$/.test(lower)) return 'pdf';
+  return 'other';
+};
 
 const Materials = () => {
   const navigate = useNavigate();
@@ -16,8 +45,10 @@ const Materials = () => {
   const [editingMaterial, setEditingMaterial] = useState(null);
   const [nameSearch, setNameSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState('');
+  const [page, setPage] = useState(1);
   const [openMenuId, setOpenMenuId] = useState(null);
   const [menuPosition, setMenuPosition] = useState({ top: 0, right: 0 });
+  const [filePreview, setFilePreview] = useState({ isOpen: false, url: '', type: '' });
   const [formData, setFormData] = useState({
     materialName: '',
     materialType: '',
@@ -76,11 +107,23 @@ const Materials = () => {
   const fetchMaterials = async () => {
     setIsFetching(true);
     try {
+      const token = localStorage.getItem('token');
+      let url = `${API_BASE_URL}/materials`;
       const params = new URLSearchParams();
-      if (typeFilter) params.append('materialType', typeFilter);
-      const qs = params.toString();
-      const path = qs ? `/materials?${qs}` : '/materials';
-      const response = await fetchFuntalk(path, {});
+      
+      if (typeFilter) {
+        params.append('materialType', typeFilter);
+      }
+      
+      if (params.toString()) {
+        url += `?${params.toString()}`;
+      }
+
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.materials) {
@@ -159,6 +202,9 @@ const Materials = () => {
     if (!formData.materialName.trim()) {
       newErrors.materialName = 'Material name is required';
     }
+    if (!formData.materialType || !formData.materialType.trim()) {
+      newErrors.materialType = 'Material type is required';
+    }
 
     // File or URL is optional, but if URL is provided, it should be valid
     if (formData.fileUrl && formData.fileUrl.trim() && !isValidUrl(formData.fileUrl.trim())) {
@@ -173,7 +219,7 @@ const Materials = () => {
     try {
       new URL(string);
       return true;
-    } catch (_) {
+    } catch {
       return false;
     }
   };
@@ -189,23 +235,31 @@ const Materials = () => {
     setFormErrors({});
 
     try {
-      const path = editingMaterial
-        ? `/materials/${editingMaterial.material_id}`
-        : '/materials';
+      const token = localStorage.getItem('token');
+      const url = editingMaterial
+        ? `${API_BASE_URL}/materials/${editingMaterial.material_id}`
+        : `${API_BASE_URL}/materials`;
+      
       const method = editingMaterial ? 'PUT' : 'POST';
+      
+      // Use FormData for file uploads
       const formDataToSend = new FormData();
       formDataToSend.append('materialName', formData.materialName.trim());
-      if (formData.materialType && formData.materialType.trim()) {
-        formDataToSend.append('materialType', formData.materialType.trim());
-      }
+      formDataToSend.append('materialType', formData.materialType.trim());
+      
+      // If a file is selected, append it; otherwise, if URL is provided, append it
       if (formData.file) {
         formDataToSend.append('file', formData.file);
       } else if (formData.fileUrl && formData.fileUrl.trim()) {
         formDataToSend.append('fileUrl', formData.fileUrl.trim());
       }
 
-      const response = await fetchFuntalk(path, {
+      const response = await fetch(url, {
         method,
+        headers: {
+          // Don't set Content-Type header - browser will set it with boundary for FormData
+          'Authorization': `Bearer ${token}`,
+        },
         body: formDataToSend,
       });
 
@@ -249,23 +303,41 @@ const Materials = () => {
     const button = e.currentTarget;
     const rect = button.getBoundingClientRect();
     
-    setMenuPosition({
-      top: rect.bottom + window.scrollY + 1,
-      right: window.innerWidth - rect.right + window.scrollX,
-    });
+    setMenuPosition(
+      computeFixedActionMenuPosition({
+        rect,
+        menuWidth: 192, // w-40 / w-48
+        menuHeight: 170,
+        gap: 6,
+      })
+    );
     
     setOpenMenuId(openMenuId === materialId ? null : materialId);
   };
 
+  const openFilePreview = (fileUrl) => {
+    const resolvedUrl = getMaterialFileHref(fileUrl);
+    setFilePreview({
+      isOpen: true,
+      url: resolvedUrl,
+      type: getPreviewType(resolvedUrl),
+    });
+  };
+
   // Handle delete
   const handleDelete = async (materialId, materialName) => {
-    if (!window.confirm(`Are you sure you want to delete material "${materialName}"?`)) {
+    const ok = await window.appConfirm?.(`Are you sure you want to delete material "${materialName}"?`);
+    if (!ok) {
       return;
     }
 
     try {
-      const response = await fetchFuntalk(`/materials/${materialId}`, {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/materials/${materialId}`, {
         method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
       });
 
       const data = await response.json();
@@ -287,6 +359,13 @@ const Materials = () => {
       m.material_name?.toLowerCase().includes(nameSearch.toLowerCase());
     return matchesName;
   });
+
+  useEffect(() => {
+    setPage(1);
+  }, [nameSearch, typeFilter]);
+
+  const pageSize = 10;
+  const pagedMaterials = filteredMaterials.slice((page - 1) * pageSize, page * pageSize);
 
   // Format date for display
   const formatDate = (dateString) => {
@@ -341,6 +420,37 @@ const Materials = () => {
                 </button>
               </div>
 
+              <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-end gap-3">
+                <div className="min-w-0 flex-1 sm:max-w-md">
+                  <input
+                    id="materials-search"
+                    type="search"
+                    aria-label="Search materials"
+                    placeholder="Search by material name"
+                    value={nameSearch}
+                    onChange={(e) => setNameSearch(e.target.value)}
+                    autoComplete="off"
+                    className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                  />
+                </div>
+                <div className="w-full sm:w-auto sm:min-w-[10rem]">
+                  <ResponsiveSelect
+                    id="materials-type-filter"
+                    aria-label="Filter materials by type"
+                    value={typeFilter}
+                    onChange={(e) => setTypeFilter(e.target.value)}
+                    className="w-full sm:w-auto px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-primary-500 focus:outline-none"
+                  >
+                    <option value="">All types</option>
+                    {materialTypes.map((type) => (
+                      <option key={type} value={type}>
+                        {type}
+                      </option>
+                    ))}
+                  </ResponsiveSelect>
+                </div>
+              </div>
+
               {/* Materials Table */}
               <div className="bg-white rounded-lg shadow">
                 {isFetching ? (
@@ -371,54 +481,35 @@ const Materials = () => {
                     </p>
                   </div>
                 ) : (
-                  <div className="overflow-x-auto overflow-hidden">
-                    <table className="w-full divide-y divide-gray-200" style={{ minWidth: '900px' }}>
+                  <>
+                  <div className="overflow-x-auto rounded-b-xl">
+                    <table className="min-w-[1040px] w-full divide-y divide-gray-200">
                       <thead className="bg-gray-50">
                         <tr>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                            <div className="flex items-center space-x-2">
-                              <span className="text-xs font-medium text-gray-500 uppercase">Material Name</span>
-                              <input
-                                type="text"
-                                placeholder="Search..."
-                                value={nameSearch}
-                                onChange={(e) => setNameSearch(e.target.value)}
-                                className="px-2 py-1 text-xs border border-gray-300 rounded focus:ring-1 focus:ring-primary-500 focus:border-primary-500 w-32"
-                              />
-                            </div>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">
+                            Material name
                           </th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden lg:table-cell">
-                            <select
-                              value={typeFilter}
-                              onChange={(e) => setTypeFilter(e.target.value)}
-                              className="text-xs font-medium text-gray-500 bg-transparent border-0 rounded px-2 py-1 focus:ring-1 focus:ring-primary-500 focus:outline-none"
-                            >
-                              <option value="">Type</option>
-                              {materialTypes.map((type) => (
-                                <option key={type} value={type}>
-                                  {type}
-                                </option>
-                              ))}
-                            </select>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">
+                            Type
                           </th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden xl:table-cell">
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">
                             File URL
                           </th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden md:table-cell">
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">
                             Created At
                           </th>
-                          <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          <th className="sticky right-0 z-10 bg-gray-50 px-6 py-3 text-right text-xs font-medium text-gray-500 tracking-wider shadow-[-2px_0_8px_-2px_rgba(0,0,0,0.08)]">
                             Actions
                           </th>
                         </tr>
                       </thead>
                       <tbody className="bg-white divide-y divide-gray-200">
-                        {filteredMaterials.map((material) => (
-                          <tr key={material.material_id} className="hover:bg-gray-50">
+                        {pagedMaterials.map((material) => (
+                          <tr key={material.material_id} className="group hover:bg-gray-50">
                             <td className="px-6 py-4 whitespace-nowrap">
                               <div className="text-sm font-medium text-gray-900">{material.material_name || 'N/A'}</div>
                             </td>
-                            <td className="px-6 py-4 whitespace-nowrap hidden lg:table-cell">
+                            <td className="px-6 py-4 whitespace-nowrap">
                               {material.material_type ? (
                                 <span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-blue-100 text-blue-800">
                                   {material.material_type}
@@ -427,13 +518,12 @@ const Materials = () => {
                                 <span className="text-sm text-gray-500">-</span>
                               )}
                             </td>
-                            <td className="px-6 py-4 whitespace-nowrap hidden xl:table-cell">
+                            <td className="px-6 py-4 whitespace-nowrap">
                               {material.file_url ? (
-                                <a
-                                  href={material.file_url.startsWith('http') ? material.file_url : `${getFuntalkServerOrigin()}${material.file_url}`}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="text-sm text-primary-600 hover:text-primary-800 hover:underline truncate max-w-xs inline-block"
+                                <button
+                                  type="button"
+                                  onClick={() => openFilePreview(material.file_url)}
+                                  className="text-sm text-primary-600 hover:text-primary-800 hover:underline truncate max-w-[14rem] sm:max-w-xs inline-block text-left"
                                   title={material.file_url}
                                 >
                                   <div className="flex items-center gap-1">
@@ -442,15 +532,15 @@ const Materials = () => {
                                     </svg>
                                     <span className="truncate">View File</span>
                                   </div>
-                                </a>
+                                </button>
                               ) : (
                                 <span className="text-sm text-gray-500">-</span>
                               )}
                             </td>
-                            <td className="px-6 py-4 whitespace-nowrap hidden md:table-cell">
+                            <td className="px-6 py-4 whitespace-nowrap">
                               <div className="text-sm text-gray-500">{formatDate(material.created_at)}</div>
                             </td>
-                            <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                            <td className="sticky right-0 z-[1] bg-white px-6 py-4 whitespace-nowrap text-right text-sm font-medium shadow-[-2px_0_8px_-2px_rgba(0,0,0,0.06)] group-hover:bg-gray-50">
                               <div className="flex justify-end">
                                 <button
                                   onClick={(e) => handleActionClick(e, material.material_id)}
@@ -478,6 +568,10 @@ const Materials = () => {
                       </tbody>
                     </table>
                   </div>
+                  <div className="px-4 py-3 sm:px-6 border-t border-gray-200">
+                    <Pagination totalItems={filteredMaterials.length} pageSize={pageSize} currentPage={page} onPageChange={setPage} />
+                  </div>
+                  </>
                 )}
               </div>
 
@@ -489,9 +583,9 @@ const Materials = () => {
               )}
 
               {/* Action Menu Dropdown */}
-              {openMenuId && (
+              {openMenuId && createPortal(
                 <div
-                  className="fixed w-40 sm:w-48 bg-white rounded-md shadow-xl z-[9999] border border-gray-200"
+                  className="fixed w-40 sm:w-48 bg-white rounded-md shadow-xl z-[9999] border border-gray-200 action-menu"
                   style={{
                     top: `${menuPosition.top}px`,
                     right: `${menuPosition.right}px`,
@@ -526,13 +620,83 @@ const Materials = () => {
                       Delete
                     </button>
                   </div>
-                </div>
+                </div>,
+                document.body
+              )}
+
+              {/* File Preview Modal */}
+              {filePreview.isOpen && createPortal(
+                <div
+                  className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 z-[10000]"
+                  onClick={(e) => {
+                    if (e.target === e.currentTarget) {
+                      setFilePreview({ isOpen: false, url: '', type: '' });
+                    }
+                  }}
+                >
+                  <div
+                    className="bg-white rounded-lg shadow-xl w-full max-w-5xl max-h-[90vh] overflow-y-auto"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="p-4 sm:p-5 border-b border-gray-200 flex items-center justify-between">
+                      <h2 className="text-lg sm:text-xl font-semibold text-gray-900">File Preview</h2>
+                      <button
+                        type="button"
+                        onClick={() => setFilePreview({ isOpen: false, url: '', type: '' })}
+                        className="text-gray-400 hover:text-gray-600 transition-colors p-1"
+                        aria-label="Close file preview modal"
+                      >
+                        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
+                    </div>
+                    <div className="p-4 sm:p-5">
+                      {filePreview.type === 'image' && (
+                        <img
+                          src={filePreview.url}
+                          alt="Material file preview"
+                          className="w-full h-auto max-h-[70vh] object-contain rounded"
+                        />
+                      )}
+                      {filePreview.type === 'video' && (
+                        <video controls className="w-full h-auto max-h-[70vh] rounded" src={filePreview.url} />
+                      )}
+                      {filePreview.type === 'audio' && (
+                        <div className="py-8 flex justify-center">
+                          <audio controls className="w-full max-w-lg" src={filePreview.url} />
+                        </div>
+                      )}
+                      {filePreview.type === 'pdf' && (
+                        <iframe
+                          title="Material PDF Preview"
+                          src={filePreview.url}
+                          className="w-full h-[70vh] rounded border border-gray-200"
+                        />
+                      )}
+                      {filePreview.type === 'other' && (
+                        <div className="py-10 text-center">
+                          <p className="text-sm text-gray-600 mb-3">Preview is not available for this file type.</p>
+                          <a
+                            href={filePreview.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center px-3 py-2 text-sm font-medium text-white bg-primary-600 rounded-lg hover:bg-primary-700"
+                          >
+                            Open file
+                          </a>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>,
+                document.body
               )}
 
               {/* Add/Edit Material Modal - Rendered via Portal to body */}
               {isModalOpen && createPortal(
                 <div 
-                  className="fixed bg-black bg-opacity-50 flex items-center justify-center p-4" 
+                  className="fixed bg-black/40 backdrop-blur-sm flex items-center justify-center p-4" 
                   style={{ 
                     position: 'fixed', 
                     top: 0, 
@@ -607,17 +771,33 @@ const Materials = () => {
                         {/* Material Type */}
                         <div>
                           <label htmlFor="materialType" className="block text-xs sm:text-sm font-medium text-gray-700 mb-1">
-                            Material Type
+                            Material Type <span className="text-red-500">*</span>
                           </label>
-                          <input
+                          <ResponsiveSelect
                             id="materialType"
                             name="materialType"
-                            type="text"
                             value={formData.materialType}
                             onChange={handleFormChange}
-                            className="w-full px-3 sm:px-4 py-2 text-sm sm:text-base border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
-                            placeholder="e.g., PDF, Video, Worksheet (optional)"
-                          />
+                            className={`w-full px-3 sm:px-4 py-2 text-sm sm:text-base border rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 ${
+                              formErrors.materialType ? 'border-red-500' : 'border-gray-300'
+                            }`}
+                          >
+                            <option value="">Select material type</option>
+                            {MATERIAL_TYPE_OPTIONS.map((type) => (
+                              <option key={type} value={type}>
+                                {type}
+                              </option>
+                            ))}
+                            {formData.materialType &&
+                              !MATERIAL_TYPE_OPTIONS.includes(formData.materialType) && (
+                                <option value={formData.materialType}>
+                                  {formData.materialType}
+                                </option>
+                              )}
+                          </ResponsiveSelect>
+                          {formErrors.materialType && (
+                            <p className="mt-1 text-xs sm:text-sm text-red-600">{formErrors.materialType}</p>
+                          )}
                         </div>
 
                         {/* File Upload */}
@@ -722,7 +902,7 @@ const Materials = () => {
                                   <div className="flex-1 min-w-0">
                                     <p className="text-xs text-blue-800 truncate">
                                       Current file: <a 
-                                        href={editingMaterial.file_url.startsWith('http') ? editingMaterial.file_url : `${getFuntalkServerOrigin()}${editingMaterial.file_url}`} 
+                                        href={editingMaterial.file_url.startsWith('http') ? editingMaterial.file_url : `${API_BASE_URL.replace('/api', '')}${editingMaterial.file_url}`} 
                                         target="_blank" 
                                         rel="noopener noreferrer" 
                                         className="underline hover:text-blue-600 font-medium"

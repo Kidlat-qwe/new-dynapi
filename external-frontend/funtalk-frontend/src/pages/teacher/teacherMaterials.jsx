@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import Header from '../../components/Header';
 import Sidebar from '../../components/Sidebar';
-import { fetchFuntalk, getFuntalkServerOrigin } from '../../lib/api';
+import { API_BASE_URL } from '@/config/api.js';
 
 const TeacherMaterials = () => {
   const navigate = useNavigate();
@@ -15,6 +15,10 @@ const TeacherMaterials = () => {
   const [materialTypeFilter, setMaterialTypeFilter] = useState('');
   const [nameSearch, setNameSearch] = useState('');
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [editingMaterial, setEditingMaterial] = useState(null);
+  const [viewMaterial, setViewMaterial] = useState(null);
+  const [deletingMaterialId, setDeletingMaterialId] = useState(null);
+  const [openActionMenuId, setOpenActionMenuId] = useState(null);
   const [formData, setFormData] = useState({
     materialName: '',
     materialType: '',
@@ -58,11 +62,23 @@ const TeacherMaterials = () => {
   const fetchMaterials = async () => {
     setIsFetching(true);
     try {
+      const token = localStorage.getItem('token');
+      let url = `${API_BASE_URL}/materials`;
       const params = new URLSearchParams();
-      if (materialTypeFilter) params.append('materialType', materialTypeFilter);
-      const qs = params.toString();
-      const path = qs ? `/materials?${qs}` : '/materials';
-      const response = await fetchFuntalk(path, {});
+      
+      if (materialTypeFilter) {
+        params.append('materialType', materialTypeFilter);
+      }
+      
+      if (params.toString()) {
+        url += `?${params.toString()}`;
+      }
+
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.materials) {
@@ -105,6 +121,7 @@ const TeacherMaterials = () => {
   // Modal handlers
   const handleModalClose = () => {
     setIsModalOpen(false);
+    setEditingMaterial(null);
     setFormData({
       materialName: '',
       materialType: '',
@@ -112,6 +129,67 @@ const TeacherMaterials = () => {
     });
     setSelectedFileName('');
     setFormErrors({});
+  };
+
+  const getResolvedFileUrl = (material) => {
+    if (!material?.file_url) return '';
+    return material.file_url.startsWith('http')
+      ? material.file_url
+      : `${API_BASE_URL.replace('/api', '')}${material.file_url}`;
+  };
+
+  const openCreateModal = () => {
+    setEditingMaterial(null);
+    setFormData({
+      materialName: '',
+      materialType: '',
+      file: null,
+    });
+    setSelectedFileName('');
+    setFormErrors({});
+    setIsModalOpen(true);
+  };
+
+  const openEditModal = (material) => {
+    setEditingMaterial(material);
+    setFormData({
+      materialName: material.material_name || '',
+      materialType: material.material_type || '',
+      file: null,
+    });
+    setSelectedFileName('');
+    setFormErrors({});
+    setIsModalOpen(true);
+  };
+
+  const handleDeleteMaterial = async (material) => {
+    setOpenActionMenuId(null);
+    const shouldDelete = window.confirm(`Delete "${material.material_name}"?`);
+    if (!shouldDelete) return;
+    setDeletingMaterialId(material.material_id);
+    try {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/materials/${material.material_id}`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        alert(data.message || 'Failed to delete material');
+        return;
+      }
+      if (viewMaterial?.material_id === material.material_id) {
+        setViewMaterial(null);
+      }
+      fetchMaterials();
+    } catch (error) {
+      console.error('Error deleting material:', error);
+      alert('Network error while deleting material.');
+    } finally {
+      setDeletingMaterialId(null);
+    }
   };
 
   const handleFormChange = (e) => {
@@ -162,17 +240,29 @@ const TeacherMaterials = () => {
     setFormErrors({});
 
     try {
+      const token = localStorage.getItem('token');
+      const url = editingMaterial
+        ? `${API_BASE_URL}/materials/${editingMaterial.material_id}`
+        : `${API_BASE_URL}/materials`;
+      const method = editingMaterial ? 'PUT' : 'POST';
+      
+      // Use FormData for file uploads
       const formDataToSend = new FormData();
       formDataToSend.append('materialName', formData.materialName.trim());
+      
       if (formData.materialType && formData.materialType.trim()) {
         formDataToSend.append('materialType', formData.materialType.trim());
       }
+      
       if (formData.file) {
         formDataToSend.append('file', formData.file);
       }
 
-      const response = await fetchFuntalk('/materials', {
-        method: 'POST',
+      const response = await fetch(url, {
+        method,
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
         body: formDataToSend,
       });
 
@@ -197,7 +287,7 @@ const TeacherMaterials = () => {
       }
 
       // Success
-      alert('Material created successfully!');
+      alert(editingMaterial ? 'Material updated successfully!' : 'Material created successfully!');
       handleModalClose();
       fetchMaterials(); // Refresh the list
     } catch (error) {
@@ -242,7 +332,7 @@ const TeacherMaterials = () => {
                   <p className="mt-1 sm:mt-2 text-xs sm:text-sm md:text-base text-gray-600">View and manage teaching materials</p>
                 </div>
                 <button
-                  onClick={() => setIsModalOpen(true)}
+                  onClick={openCreateModal}
                   className="w-full sm:w-auto px-3 sm:px-4 py-2 text-xs sm:text-sm font-medium text-white bg-primary-600 rounded-lg hover:bg-primary-700 transition-colors"
                 >
                   Add New Material
@@ -325,24 +415,61 @@ const TeacherMaterials = () => {
                                 </span>
                               )}
                             </div>
+                            <div className="relative ml-3">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setOpenActionMenuId((prev) =>
+                                    prev === material.material_id ? null : material.material_id
+                                  )
+                                }
+                                className="p-1.5 rounded-md text-gray-500 hover:text-gray-700 hover:bg-gray-100 transition-colors"
+                                aria-label="Open material actions"
+                              >
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 5v.01M12 12v.01M12 19v.01" />
+                                </svg>
+                              </button>
+                              {openActionMenuId === material.material_id && (
+                                <div className="absolute right-0 mt-1 w-32 bg-white border border-gray-200 rounded-lg shadow-lg z-20">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setOpenActionMenuId(null);
+                                      openEditModal(material);
+                                    }}
+                                    className="w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-t-lg"
+                                  >
+                                    Edit
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDeleteMaterial(material)}
+                                    disabled={deletingMaterialId === material.material_id}
+                                    className="w-full text-left px-3 py-2 text-sm text-red-600 hover:bg-red-50 rounded-b-lg disabled:opacity-60 disabled:cursor-not-allowed"
+                                  >
+                                    {deletingMaterialId === material.material_id ? 'Deleting...' : 'Delete'}
+                                  </button>
+                                </div>
+                              )}
+                            </div>
                           </div>
                           
                           {material.file_url && (
                             <div className="mt-3">
-                              <a
-                                href={material.file_url.startsWith('http') ? material.file_url : `${getFuntalkServerOrigin()}${material.file_url}`}
-                                target="_blank"
-                                rel="noopener noreferrer"
+                              <button
+                                type="button"
+                                onClick={() => setViewMaterial(material)}
                                 className="inline-flex items-center gap-2 text-sm text-primary-600 hover:text-primary-800 hover:underline"
                               >
                                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
                                 </svg>
                                 View Material
-                              </a>
+                              </button>
                             </div>
                           )}
-                          
+
                           <div className="mt-3 text-xs text-gray-500">
                             Added {formatDate(material.created_at)}
                           </div>
@@ -363,7 +490,7 @@ const TeacherMaterials = () => {
               {/* Add Material Modal - Rendered via Portal to body */}
               {isModalOpen && createPortal(
                 <div 
-                  className="fixed bg-black bg-opacity-50 flex items-center justify-center p-4" 
+                  className="fixed bg-black/40 backdrop-blur-sm flex items-center justify-center p-4" 
                   style={{ 
                     position: 'fixed', 
                     top: 0, 
@@ -390,7 +517,7 @@ const TeacherMaterials = () => {
                       {/* Modal Header */}
                       <div className="flex items-center justify-between mb-4 sm:mb-6">
                         <h2 className="text-xl sm:text-2xl font-bold text-gray-900">
-                          Add New Material
+                          {editingMaterial ? 'Edit Material' : 'Add New Material'}
                         </h2>
                         <button
                           onClick={handleModalClose}
@@ -563,10 +690,94 @@ const TeacherMaterials = () => {
                             className="w-full sm:w-auto px-4 py-2 text-sm bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                             disabled={isSubmitting}
                           >
-                            {isSubmitting ? 'Creating...' : 'Create Material'}
+                            {isSubmitting ? (editingMaterial ? 'Updating...' : 'Creating...') : (editingMaterial ? 'Update Material' : 'Create Material')}
                           </button>
                         </div>
                       </form>
+                    </div>
+                  </div>
+                </div>,
+                document.body
+              )}
+
+              {/* View Material Modal */}
+              {viewMaterial && createPortal(
+                <div
+                  className="fixed bg-black/40 backdrop-blur-sm flex items-center justify-center p-4"
+                  style={{
+                    position: 'fixed',
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    zIndex: 99999,
+                    width: '100vw',
+                    height: '100vh',
+                    margin: 0,
+                    padding: '1rem',
+                  }}
+                  onClick={(e) => {
+                    if (e.target === e.currentTarget) {
+                      setViewMaterial(null);
+                    }
+                  }}
+                >
+                  <div
+                    className="bg-white rounded-lg shadow-xl max-w-4xl w-full max-h-[90vh] overflow-y-auto"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="p-4 sm:p-6">
+                      <div className="flex items-start justify-between gap-4 mb-4">
+                        <div>
+                          <h2 className="text-lg sm:text-xl font-bold text-gray-900">{viewMaterial.material_name}</h2>
+                          <p className="text-xs sm:text-sm text-gray-500 mt-1">Added {formatDate(viewMaterial.created_at)}</p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setViewMaterial(null)}
+                          className="text-gray-400 hover:text-gray-700 transition-colors"
+                        >
+                          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                          </svg>
+                        </button>
+                      </div>
+
+                      {(() => {
+                        const url = getResolvedFileUrl(viewMaterial);
+                        const lower = url.toLowerCase();
+                        const isImage = /\.(png|jpe?g|gif|webp|svg)$/.test(lower);
+                        const isVideo = /\.(mp4|mov|webm|m4v)$/.test(lower);
+                        const isAudio = /\.(mp3|wav|ogg|m4a)$/.test(lower);
+                        const isPdf = /\.pdf($|\?)/.test(lower);
+
+                        if (isImage) {
+                          return <img src={url} alt={viewMaterial.material_name} className="w-full max-h-[65vh] object-contain rounded border" />;
+                        }
+                        if (isVideo) {
+                          return <video src={url} controls className="w-full rounded border max-h-[65vh]" />;
+                        }
+                        if (isAudio) {
+                          return <audio src={url} controls className="w-full" />;
+                        }
+                        if (isPdf) {
+                          return <iframe src={url} title={viewMaterial.material_name} className="w-full h-[65vh] rounded border" />;
+                        }
+
+                        return (
+                          <div className="border rounded-lg p-6 text-center">
+                            <p className="text-sm text-gray-600 mb-4">Preview not available for this file type.</p>
+                            <a
+                              href={url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center px-4 py-2 text-sm font-medium text-white bg-primary-600 rounded-lg hover:bg-primary-700"
+                            >
+                              Open File
+                            </a>
+                          </div>
+                        );
+                      })()}
                     </div>
                   </div>
                 </div>,

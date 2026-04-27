@@ -1,6 +1,7 @@
 import express from 'express';
 import { body, param, query as queryValidator } from 'express-validator';
 import { getClient, query } from '../config/database.js';
+import { insertInvoiceWithArNumber } from '../utils/invoiceArNumber.js';
 import { verifyFirebaseToken, requireRole, requireBranchAccess } from '../middleware/auth.js';
 import { handleValidationErrors } from '../middleware/validation.js';
 
@@ -539,7 +540,10 @@ router.put(
       // Check if student is already enrolled
       const existingEnrollment = await client.query(
         `SELECT classstudent_id FROM classstudentstbl 
-         WHERE student_id = $1 AND class_id = $2`,
+         WHERE student_id = $1
+           AND class_id = $2
+           AND COALESCE(enrollment_status, 'Active') = 'Active'
+           AND removed_at IS NULL`,
         [reservation.student_id, reservation.class_id]
       );
 
@@ -556,7 +560,11 @@ router.put(
       // the total count (enrolled + reserved) stays the same. But we should still verify capacity.
       if (classData.max_students) {
         const enrolledCount = await client.query(
-          'SELECT COUNT(DISTINCT student_id) as count FROM classstudentstbl WHERE class_id = $1',
+          `SELECT COUNT(DISTINCT student_id) as count
+           FROM classstudentstbl
+           WHERE class_id = $1
+             AND COALESCE(enrollment_status, 'Active') = 'Active'
+             AND removed_at IS NULL`,
           [reservation.class_id]
         );
         const reservedCount = await client.query(
@@ -1148,9 +1156,10 @@ router.put(
         console.log('Column check:', err.message);
       }
 
-      const invoiceResult = await client.query(
-        `INSERT INTO invoicestbl (invoice_description, branch_id, amount, status, issue_date, due_date, created_by, package_id, promo_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      let newInvoice = await insertInvoiceWithArNumber(
+        client,
+        `INSERT INTO invoicestbl (invoice_description, branch_id, amount, status, issue_date, due_date, created_by, package_id, promo_id, invoice_ar_number)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          RETURNING *`,
         [
           invoiceDescription,
@@ -1164,8 +1173,6 @@ router.put(
           promo_id || null,
         ]
       );
-
-      let newInvoice = invoiceResult.rows[0];
       
       // Update invoice amount if promo was applied (to ensure accuracy)
       if (promoApplied && promoDiscount > 0) {

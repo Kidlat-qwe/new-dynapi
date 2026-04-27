@@ -1,13 +1,25 @@
 import { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
-import API_BASE_URL, { apiRequest, getCmsFetchHeaders } from '../../config/api';
+import { useNavigate } from 'react-router-dom';
+import API_BASE_URL, { apiRequest } from '../../config/api';
 import { useGlobalBranchFilter } from '../../contexts/GlobalBranchFilterContext';
+import * as XLSX from 'xlsx';
 import { formatDateManila, todayManilaYMD } from '../../utils/dateUtils';
 import FixedTablePagination from '../../components/table/FixedTablePagination';
+import { appAlert, appConfirm } from '../../utils/appAlert';
 
 const ITEMS_PER_PAGE = 10;
 
+const getInvoiceDisplayAmount = (invoice) => {
+  if (!invoice) return 0;
+  const remainingAmount = Number(invoice.amount ?? 0);
+  const paidAmount = Number(invoice.paid_amount ?? 0);
+  const billedAmount = remainingAmount + paidAmount;
+  return billedAmount > 0 ? billedAmount : remainingAmount;
+};
+
 const Invoice = () => {
+  const navigate = useNavigate();
   const { selectedBranchId: globalBranchId } = useGlobalBranchFilter();
   const [invoices, setInvoices] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -16,6 +28,8 @@ const Invoice = () => {
   const [studentNameSearch, setStudentNameSearch] = useState('');
   const [filterBranch, setFilterBranch] = useState('');
   const [filterStatus, setFilterStatus] = useState('');
+  const [filterIssueDateFrom, setFilterIssueDateFrom] = useState('');
+  const [filterIssueDateTo, setFilterIssueDateTo] = useState('');
   const [openMenuId, setOpenMenuId] = useState(null);
   const [menuPosition, setMenuPosition] = useState({ top: 0, right: 0 });
   const [openBranchDropdown, setOpenBranchDropdown] = useState(false);
@@ -60,6 +74,7 @@ const Invoice = () => {
     payment_method: 'Cash',
     payment_type: '',
     payable_amount: '',
+    tip_amount: '',
     issue_date: todayManilaYMD(),
     reference_number: '',
     remarks: '',
@@ -69,6 +84,11 @@ const Invoice = () => {
   const [submittingPayment, setSubmittingPayment] = useState(false);
   const [paymentAttachmentUploading, setPaymentAttachmentUploading] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [exportDateFrom, setExportDateFrom] = useState('');
+  const [exportDateTo, setExportDateTo] = useState('');
+  const [selectedExportBranches, setSelectedExportBranches] = useState([]);
+  const [exportLoading, setExportLoading] = useState(false);
 
   useEffect(() => {
     fetchInvoices();
@@ -255,7 +275,15 @@ const Invoice = () => {
 
   const handleDelete = async (invoiceId) => {
     setOpenMenuId(null);
-    if (!window.confirm('Are you sure you want to delete this invoice? This will also delete all invoice items and student associations.')) {
+    if (
+      !(await appConfirm({
+        title: 'Delete invoice',
+        message:
+          'Are you sure you want to delete this invoice? This will also delete all invoice items and student associations.',
+        destructive: true,
+        confirmLabel: 'Delete',
+      }))
+    ) {
       return;
     }
 
@@ -265,19 +293,20 @@ const Invoice = () => {
       });
       fetchInvoices();
     } catch (err) {
-      alert(err.message || 'Failed to delete invoice');
+      appAlert(err.message || 'Failed to delete invoice');
     }
   };
 
   const openCreateModal = () => {
     setEditingInvoice(null);
     setError('');
+    const today = todayManilaYMD();
     setFormData({
       branch_id: '',
       amount: '',
       status: 'Draft',
       remarks: '',
-      issue_date: '',
+      issue_date: today,
       due_date: '',
       items: [],
       students: [],
@@ -290,6 +319,7 @@ const Invoice = () => {
     setOpenMenuId(null);
     setEditingInvoice(invoice);
     setError('');
+    const today = todayManilaYMD();
     // Format dates for date input (YYYY-MM-DD format)
     const formatDateForInput = (dateString) => {
       if (!dateString) return '';
@@ -306,7 +336,7 @@ const Invoice = () => {
       amount: invoice.amount?.toString() || '',
       status: invoice.status || 'Draft',
       remarks: invoice.remarks || '',
-      issue_date: formatDateForInput(invoice.issue_date),
+      issue_date: today,
       due_date: formatDateForInput(invoice.due_date),
       items: invoice.items || [],
       students: invoice.students?.map(s => s.student_id) || [],
@@ -338,7 +368,7 @@ const Invoice = () => {
 
   const addItem = () => {
     if (!newItem.description || !newItem.amount) {
-      alert('Please fill in description and amount');
+      appAlert('Please fill in description and amount');
       return;
     }
 
@@ -375,13 +405,13 @@ const Invoice = () => {
 
   const addStudent = () => {
     if (!newStudentId) {
-      alert('Please select a student');
+      appAlert('Please select a student');
       return;
     }
 
     const studentId = parseInt(newStudentId);
     if (formData.students.includes(studentId)) {
-      alert('Student is already added');
+      appAlert('Student is already added');
       return;
     }
 
@@ -425,13 +455,14 @@ const Invoice = () => {
     setSubmitting(true);
     setError('');
     try {
+      const issueDateToday = todayManilaYMD();
       if (editingInvoice) {
         // When editing, only update invoice info (not items/students - they're managed separately)
         const payload = {
           amount: formData.amount && formData.amount !== '' ? parseFloat(formData.amount) : null,
           status: formData.status || 'Draft',
           remarks: formData.remarks?.trim() || null,
-          issue_date: formData.issue_date || null,
+          issue_date: issueDateToday,
           due_date: formData.due_date || null,
         };
         await apiRequest(`/invoices/${editingInvoice.invoice_id}`, {
@@ -445,7 +476,7 @@ const Invoice = () => {
           amount: formData.amount && formData.amount !== '' ? parseFloat(formData.amount) : null,
           status: formData.status || 'Draft',
           remarks: formData.remarks?.trim() || null,
-          issue_date: formData.issue_date || null,
+          issue_date: issueDateToday,
           due_date: formData.due_date || null,
           items: formData.items,
           students: formData.students,
@@ -520,8 +551,11 @@ const Invoice = () => {
   const handleDownloadPDF = async (invoice) => {
     setOpenMenuId(null);
     try {
+      const token = localStorage.getItem('firebase_token');
       const response = await fetch(`${API_BASE_URL}/invoices/${invoice.invoice_id}/pdf`, {
-        headers: getCmsFetchHeaders(),
+        headers: {
+          Authorization: token ? `Bearer ${token}` : '',
+        },
       });
 
       if (!response.ok) {
@@ -536,18 +570,87 @@ const Invoice = () => {
       setTimeout(() => URL.revokeObjectURL(url), 60_000);
     } catch (err) {
       console.error('Download invoice PDF failed:', err);
-      alert(err.message || 'Failed to download invoice PDF');
+      appAlert(err.message || 'Failed to download invoice PDF');
+    }
+  };
+
+  const handleDownloadSOA = async (invoice) => {
+    setOpenMenuId(null);
+    try {
+      const token = localStorage.getItem('firebase_token');
+      const response = await fetch(`${API_BASE_URL}/invoices/${invoice.invoice_id}/pdf?doc_type=soa`, {
+        headers: {
+          Authorization: token ? `Bearer ${token}` : '',
+        },
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(errText || 'Failed to download SOA PDF');
+      }
+
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      window.open(url, '_blank', 'noopener,noreferrer');
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (err) {
+      console.error('Download SOA PDF failed:', err);
+      appAlert(err.message || 'Failed to download SOA PDF');
+    }
+  };
+
+  const handleDownloadAR = async (invoice) => {
+    setOpenMenuId(null);
+    try {
+      const token = localStorage.getItem('firebase_token');
+      const response = await fetch(`${API_BASE_URL}/invoices/${invoice.invoice_id}/pdf?doc_type=ar`, {
+        headers: {
+          Authorization: token ? `Bearer ${token}` : '',
+        },
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(errText || 'Failed to download acknowledgement receipt PDF');
+      }
+
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      window.open(url, '_blank', 'noopener,noreferrer');
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (err) {
+      console.error('Download acknowledgement receipt PDF failed:', err);
+      appAlert(err.message || 'Failed to download acknowledgement receipt PDF');
     }
   };
 
   const handleViewEditReceipt = async (invoice) => {
     setOpenMenuId(null);
-    alert('Receipt management is not yet implemented.');
+    appAlert('Receipt management is not yet implemented.');
   };
 
   const handleDeleteReceipt = async (invoice) => {
     setOpenMenuId(null);
-    alert('Receipt deletion is not yet implemented.');
+    appAlert('Receipt deletion is not yet implemented.');
+  };
+
+  const handleViewInstallmentInvoice = (invoice) => {
+    setOpenMenuId(null);
+    setMenuPosition({ top: 0, right: 0 });
+
+    if (!invoice?.installmentinvoiceprofiles_id) {
+      appAlert('This invoice is not linked to an installment invoice profile.');
+      return;
+    }
+
+    const params = new URLSearchParams();
+    params.set('profile_id', String(invoice.installmentinvoiceprofiles_id));
+    const studentName = invoice.students?.[0]?.full_name || '';
+    if (studentName) {
+      params.set('student_name', studentName);
+    }
+
+    navigate(`/superadmin/installment-invoice?${params.toString()}`);
   };
 
   const handleOpenPaymentModal = async (invoice) => {
@@ -556,7 +659,19 @@ const Invoice = () => {
       // Fetch the latest invoice data with details
       const response = await apiRequest(`/invoices/${invoice.invoice_id}`);
       const invoiceData = response.data;
-      
+
+      if (
+        invoiceData.can_record_payment === false ||
+        invoiceData.balance_invoice_id
+      ) {
+        const tip = invoiceData.continued_to_invoice;
+        const label = tip?.display_description || tip?.invoice_description || (tip?.invoice_id ? `INV-${tip.invoice_id}` : 'the balance invoice');
+        appAlert(
+          `This invoice is not payable after a partial payment. Record payments on ${label} instead.`
+        );
+        return;
+      }
+
       setSelectedInvoiceForPayment(invoiceData);
       
       // Pre-select first student if available
@@ -569,6 +684,7 @@ const Invoice = () => {
         payment_method: 'Cash',
         payment_type: '',
         payable_amount: invoiceData.amount || '',
+        tip_amount: '',
         issue_date: todayManilaYMD(),
         reference_number: '',
         remarks: '',
@@ -577,7 +693,7 @@ const Invoice = () => {
       setShowPaymentModal(true);
     } catch (err) {
       console.error('Error fetching invoice details:', err);
-      alert('Error loading invoice details. Please try again.');
+      appAlert('Error loading invoice details. Please try again.');
     }
   };
 
@@ -597,7 +713,13 @@ const Invoice = () => {
   const handleSendOverdueEmail = async (invoice) => {
     setOpenMenuId(null);
     
-    if (!window.confirm(`Send overdue payment reminder email to student(s) for invoice ${invoice.invoice_description || `INV-${invoice.invoice_id}`}?`)) {
+    if (
+      !(await appConfirm({
+        title: 'Send overdue reminder',
+        message: `Send overdue payment reminder email to student(s) for invoice ${invoice.invoice_description || `INV-${invoice.invoice_id}`}?`,
+        confirmLabel: 'Send',
+      }))
+    ) {
       return;
     }
 
@@ -608,14 +730,14 @@ const Invoice = () => {
       });
       
       if (response.success) {
-        alert(response.message || 'Email sent successfully!');
+        appAlert(response.message || 'Email sent successfully!');
       } else {
-        alert(response.message || 'Failed to send email');
+        appAlert(response.message || 'Failed to send email');
       }
     } catch (err) {
       console.error('Error sending overdue email:', err);
       const errorMessage = err.response?.data?.message || err.message || 'Failed to send email';
-      alert(errorMessage);
+      appAlert(errorMessage);
     } finally {
       setLoading(false);
     }
@@ -629,6 +751,7 @@ const Invoice = () => {
       payment_method: 'Cash',
       payment_type: '',
       payable_amount: '',
+      tip_amount: '',
       issue_date: todayManilaYMD(),
       reference_number: '',
       remarks: '',
@@ -637,25 +760,51 @@ const Invoice = () => {
     setPaymentFormErrors({});
   };
 
+  const getInvoiceBreakdown = (invoice) => {
+    const items = Array.isArray(invoice?.items) ? invoice.items : [];
+    const subtotal = items.reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
+    const discount = items.reduce((sum, item) => sum + (parseFloat(item.discount_amount) || 0), 0);
+    const penalty = items.reduce((sum, item) => sum + (parseFloat(item.penalty_amount) || 0), 0);
+    const tax = items.reduce((sum, item) => {
+      const amount = parseFloat(item.amount) || 0;
+      const taxPercentage = parseFloat(item.tax_percentage) || 0;
+      return sum + (amount * taxPercentage) / 100;
+    }, 0);
+    const totalDue = subtotal - discount + penalty + tax;
+    const remaining = parseFloat(invoice?.amount || 0);
+    const paidAmount = Math.max(0, totalDue - remaining);
+
+    return {
+      subtotal,
+      discount,
+      penalty,
+      tax,
+      totalDue,
+      paidAmount,
+      remaining,
+    };
+  };
+
   const handlePaymentAttachmentChange = async (e) => {
     const file = e.target?.files?.[0];
     if (!file) return;
     const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
     if (!allowed.includes(file.type)) {
-      alert('Please select an image (JPEG, PNG, WebP, or GIF).');
+      appAlert('Please select an image (JPEG, PNG, WebP, or GIF).');
       return;
     }
     if (file.size > 5 * 1024 * 1024) {
-      alert('Image must be 5MB or less.');
+      appAlert('Image must be 5MB or less.');
       return;
     }
     setPaymentAttachmentUploading(true);
     try {
       const formData = new FormData();
       formData.append('image', file);
+      const token = localStorage.getItem('firebase_token');
       const res = await fetch(`${API_BASE_URL}/upload/invoice-payment-image`, {
         method: 'POST',
-        headers: getCmsFetchHeaders(),
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
         body: formData,
       });
       const data = await res.json();
@@ -665,7 +814,7 @@ const Invoice = () => {
       setPaymentFormData((prev) => ({ ...prev, attachment_url: data.imageUrl || '' }));
     } catch (err) {
       console.error('Payment attachment upload error:', err);
-      alert(err.message || 'Failed to upload image. Please try again.');
+      appAlert(err.message || 'Failed to upload image. Please try again.');
     } finally {
       setPaymentAttachmentUploading(false);
       e.target.value = '';
@@ -678,8 +827,35 @@ const Invoice = () => {
 
   const handlePaymentInputChange = (e) => {
     const { name, value } = e.target;
-    setPaymentFormData(prev => {
-      return { ...prev, [name]: value };
+    const invoiceOutstandingAmount = parseFloat(selectedInvoiceForPayment?.amount || 0);
+    setPaymentFormData((prev) => {
+      let nextValue = value;
+
+      if (
+        name === 'payable_amount' &&
+        prev.payment_type === 'Partial Payment' &&
+        invoiceOutstandingAmount > 0 &&
+        Number(value) >= invoiceOutstandingAmount
+      ) {
+        nextValue = prev.payable_amount;
+      }
+
+      if (name === 'payment_type' && value === 'Partial Payment') {
+        const currentAmount = parseFloat(prev.payable_amount || 0);
+        if (invoiceOutstandingAmount > 0 && currentAmount >= invoiceOutstandingAmount) {
+          return { ...prev, [name]: value, payable_amount: '' };
+        }
+      }
+      if (name === 'payment_type' && value === 'Full Payment') {
+        return {
+          ...prev,
+          [name]: value,
+          payable_amount:
+            invoiceOutstandingAmount > 0 ? invoiceOutstandingAmount.toFixed(2) : prev.payable_amount,
+        };
+      }
+
+      return { ...prev, [name]: nextValue };
     });
     // Clear error for this field
     if (paymentFormErrors[name]) {
@@ -704,12 +880,29 @@ const Invoice = () => {
     if (!paymentFormData.payable_amount || parseFloat(paymentFormData.payable_amount) <= 0) {
       errors.payable_amount = 'Payable amount must be greater than 0';
     }
+    const invoiceOutstandingAmount = parseFloat(selectedInvoiceForPayment?.amount || 0);
+    const payableAmount = parseFloat(paymentFormData.payable_amount || 0);
+    const tipAmount = parseFloat(paymentFormData.tip_amount || 0);
+    if (
+      paymentFormData.payment_type === 'Partial Payment' &&
+      invoiceOutstandingAmount > 0 &&
+      payableAmount >= invoiceOutstandingAmount
+    ) {
+      errors.payable_amount = 'For partial payment, amount must be less than the remaining invoice amount.';
+    }
     if (!paymentFormData.issue_date) {
       errors.issue_date = 'Issue date is required';
+    }
+    if (paymentFormData.tip_amount !== '' && (Number.isNaN(tipAmount) || tipAmount < 0)) {
+      errors.tip_amount = 'Tip amount must be 0 or greater';
     }
     const refNum = (paymentFormData.reference_number || '').trim();
     if (!refNum) {
       errors.reference_number = 'Reference number is required';
+    }
+    const attachmentUrl = (paymentFormData.attachment_url || '').trim();
+    if (!attachmentUrl) {
+      errors.attachment_url = 'Attachment is required';
     }
 
     setPaymentFormErrors(errors);
@@ -732,6 +925,7 @@ const Invoice = () => {
         payment_method: paymentFormData.payment_method,
         payment_type: paymentFormData.payment_type,
         payable_amount: parseFloat(paymentFormData.payable_amount),
+        tip_amount: paymentFormData.tip_amount === '' ? 0 : Math.max(0, parseFloat(paymentFormData.tip_amount)),
         issue_date: paymentFormData.issue_date,
         reference_number: (paymentFormData.reference_number || '').trim(),
       };
@@ -748,13 +942,13 @@ const Invoice = () => {
         body: JSON.stringify(payload),
       });
       
-      alert('Payment recorded successfully!');
+      appAlert('Payment recorded successfully!');
       handleClosePaymentModal();
       fetchInvoices(); // Refresh invoice list to show updated status
     } catch (err) {
       console.error('Error submitting payment:', err);
       const errorMessage = err.response?.data?.message || err.message || 'Error recording payment. Please try again.';
-      alert(`Error: ${errorMessage}`);
+      appAlert(`Error: ${errorMessage}`);
     } finally {
       setSubmittingPayment(false);
     }
@@ -799,7 +993,7 @@ const Invoice = () => {
 
       setEditingStatus(false);
     } catch (err) {
-      alert(err.message || 'Failed to update invoice status');
+      appAlert(err.message || 'Failed to update invoice status');
       setTempStatus(selectedInvoiceForDetails.status); // Revert on error
     } finally {
       setUpdatingStatus(false);
@@ -818,7 +1012,7 @@ const Invoice = () => {
 
   const addInvoiceItem = async () => {
     if (!newItem.description || !newItem.amount) {
-      alert('Please fill in description and amount');
+      appAlert('Please fill in description and amount');
       return;
     }
 
@@ -859,12 +1053,19 @@ const Invoice = () => {
       
       setSelectedInvoiceForDetails(invoiceData);
     } catch (err) {
-      alert(err.message || 'Failed to add invoice item');
+      appAlert(err.message || 'Failed to add invoice item');
     }
   };
 
   const removeInvoiceItem = async (itemId) => {
-    if (!window.confirm('Are you sure you want to remove this item?')) {
+    if (
+      !(await appConfirm({
+        title: 'Remove item',
+        message: 'Are you sure you want to remove this item?',
+        destructive: true,
+        confirmLabel: 'Remove',
+      }))
+    ) {
       return;
     }
 
@@ -886,13 +1087,13 @@ const Invoice = () => {
       
       setSelectedInvoiceForDetails(invoiceData);
     } catch (err) {
-      alert(err.message || 'Failed to remove invoice item');
+      appAlert(err.message || 'Failed to remove invoice item');
     }
   };
 
   const addInvoiceStudent = async () => {
     if (!newStudentId) {
-      alert('Please select a student');
+      appAlert('Please select a student');
       return;
     }
 
@@ -909,12 +1110,19 @@ const Invoice = () => {
       const updatedInvoice = await apiRequest(`/invoices/${selectedInvoiceForDetails.invoice_id}`);
       setSelectedInvoiceForDetails(updatedInvoice.data);
     } catch (err) {
-      alert(err.message || 'Failed to add student to invoice');
+      appAlert(err.message || 'Failed to add student to invoice');
     }
   };
 
   const removeInvoiceStudent = async (studentId) => {
-    if (!window.confirm('Are you sure you want to remove this student from the invoice?')) {
+    if (
+      !(await appConfirm({
+        title: 'Remove student',
+        message: 'Are you sure you want to remove this student from the invoice?',
+        destructive: true,
+        confirmLabel: 'Remove',
+      }))
+    ) {
       return;
     }
 
@@ -928,7 +1136,7 @@ const Invoice = () => {
       const updatedInvoice = await apiRequest(`/invoices/${selectedInvoiceForDetails.invoice_id}`);
       setSelectedInvoiceForDetails(updatedInvoice.data);
     } catch (err) {
-      alert(err.message || 'Failed to remove student from invoice');
+      appAlert(err.message || 'Failed to remove student from invoice');
     }
   };
 
@@ -974,6 +1182,7 @@ const Invoice = () => {
 
   const getUniqueBranches = [...new Set(invoices.map(i => i.branch_id).filter(Boolean))];
   const getUniqueStatuses = [...new Set(invoices.map(i => i.status).filter(Boolean))];
+  const normalizeYmd = (value) => (value ? String(value).slice(0, 10) : '');
 
   const filteredInvoices = invoices.filter((invoice) => {
     const invoiceIdStr = `INV-${invoice.invoice_id}`;
@@ -981,7 +1190,8 @@ const Invoice = () => {
     const matchesSearch = !nameSearchTerm ||
       invoiceIdStr.toLowerCase().includes(nameSearchTerm.toLowerCase()) ||
       invoice.invoice_id?.toString().includes(nameSearchTerm) ||
-      invoice.invoice_description?.toLowerCase().includes(nameSearchTerm.toLowerCase()) ||
+      (invoice.display_description || invoice.invoice_description || '').toLowerCase().includes(nameSearchTerm.toLowerCase()) ||
+      invoice.invoice_ar_number?.toLowerCase().includes(nameSearchTerm.toLowerCase()) ||
       getBranchName(invoice.branch_id)?.toLowerCase().includes(nameSearchTerm.toLowerCase()) ||
       studentNames.includes(nameSearchTerm.toLowerCase());
     const matchesStudentName = !studentNameSearch ||
@@ -991,7 +1201,17 @@ const Invoice = () => {
     const matchesStatus = filterStatus
       ? invoice.status === filterStatus
       : true;
-    return matchesSearch && matchesStudentName && matchesBranch && matchesStatus;
+    const issueYmd = normalizeYmd(invoice.issue_date);
+    const matchesIssueDateFrom = !filterIssueDateFrom || (issueYmd && issueYmd >= filterIssueDateFrom);
+    const matchesIssueDateTo = !filterIssueDateTo || (issueYmd && issueYmd <= filterIssueDateTo);
+    return (
+      matchesSearch &&
+      matchesStudentName &&
+      matchesBranch &&
+      matchesStatus &&
+      matchesIssueDateFrom &&
+      matchesIssueDateTo
+    );
   });
   const totalPages = Math.max(Math.ceil(filteredInvoices.length / ITEMS_PER_PAGE), 1);
   const paginatedInvoices = filteredInvoices.slice(
@@ -1001,7 +1221,7 @@ const Invoice = () => {
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [nameSearchTerm, studentNameSearch, filterBranch, filterStatus]);
+  }, [nameSearchTerm, studentNameSearch, filterBranch, filterStatus, filterIssueDateFrom, filterIssueDateTo]);
 
   useEffect(() => {
     setCurrentPage((prevPage) => Math.min(prevPage, totalPages));
@@ -1017,6 +1237,122 @@ const Invoice = () => {
     return subtotal + tax;
   };
 
+  const toggleExportBranch = (branchId) => {
+    const normalized = String(branchId);
+    setSelectedExportBranches((prev) =>
+      prev.includes(normalized)
+        ? prev.filter((id) => id !== normalized)
+        : [...prev, normalized]
+    );
+  };
+
+  const toggleSelectAllExportBranches = () => {
+    const allBranchIds = (branches || []).map((b) => String(b.branch_id));
+    setSelectedExportBranches((prev) =>
+      prev.length === allBranchIds.length ? [] : allBranchIds
+    );
+  };
+
+  const fetchAllInvoicesForExport = async () => {
+    const limit = 100;
+    let page = 1;
+    let total = Infinity;
+    const collected = [];
+
+    while (collected.length < total) {
+      const params = new URLSearchParams({ page: String(page), limit: String(limit) });
+      const response = await apiRequest(`/invoices?${params.toString()}`);
+      const rows = response.data || [];
+      const paginationTotal = response.pagination?.total ?? rows.length;
+      total = Number(paginationTotal) || rows.length;
+      collected.push(...rows);
+      if (rows.length < limit) break;
+      page += 1;
+    }
+
+    return collected;
+  };
+
+  const handleExportToExcel = async () => {
+    if (exportDateFrom && exportDateTo && exportDateFrom > exportDateTo) {
+      appAlert('Export "From" date must be on or before "To" date.');
+      return;
+    }
+    if (selectedExportBranches.length === 0) {
+      appAlert('Please select at least one branch to export.');
+      return;
+    }
+
+    try {
+      setExportLoading(true);
+      const allInvoices = await fetchAllInvoicesForExport();
+      const selectedBranchSet = new Set(selectedExportBranches.map(String));
+      const exportRows = allInvoices
+        .filter((invoice) => {
+          const invoiceBranch = String(invoice.branch_id || '');
+          if (!selectedBranchSet.has(invoiceBranch)) return false;
+          const issueYmd = normalizeYmd(invoice.issue_date);
+          if (!issueYmd) return false;
+          if (exportDateFrom && issueYmd < exportDateFrom) return false;
+          if (exportDateTo && issueYmd > exportDateTo) return false;
+          return true;
+        })
+        .map((invoice) => {
+          const studentNames = (invoice.students || [])
+            .map((s) => s?.full_name)
+            .filter(Boolean)
+            .join(', ');
+          return {
+            'Invoice ID': `INV-${invoice.invoice_id}`,
+            'AR #': invoice.invoice_ar_number || '-',
+            'Student Name(s)': studentNames || '-',
+            Branch: getBranchName(invoice.branch_id) || '-',
+            Status: invoice.status || '-',
+            'Amount (PHP)': Number(getInvoiceDisplayAmount(invoice) || 0).toFixed(2),
+            'Issue Date': invoice.issue_date ? formatDateManila(invoice.issue_date) : '-',
+            'Due Date': invoice.due_date ? formatDateManila(invoice.due_date) : '-',
+          };
+        });
+
+      if (exportRows.length === 0) {
+        appAlert('No invoice records found for the selected date range.');
+        return;
+      }
+
+      const wb = XLSX.utils.book_new();
+      const ws = XLSX.utils.json_to_sheet(exportRows);
+      ws['!cols'] = [
+        { wch: 14 },
+        { wch: 12 },
+        { wch: 34 },
+        { wch: 22 },
+        { wch: 16 },
+        { wch: 14 },
+        { wch: 14 },
+        { wch: 14 },
+      ];
+      XLSX.utils.book_append_sheet(wb, ws, 'Invoices');
+
+      const branchLabel = selectedExportBranches.length === (branches || []).length
+        ? 'all_branches'
+        : `${selectedExportBranches.length}_branches`;
+      const fromLabel = exportDateFrom || 'all';
+      const toLabel = exportDateTo || 'all';
+      XLSX.writeFile(wb, `Invoice_Export_${branchLabel}_${fromLabel}_to_${toLabel}.xlsx`);
+
+      setShowExportModal(false);
+      setExportDateFrom('');
+      setExportDateTo('');
+      setSelectedExportBranches([]);
+      appAlert('Invoice export completed successfully.');
+    } catch (err) {
+      console.error('Error exporting invoices:', err);
+      appAlert('Failed to export invoices. Please try again.');
+    } finally {
+      setExportLoading(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -1030,6 +1366,38 @@ const Invoice = () => {
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <h1 className="text-2xl sm:text-3xl font-bold text-gray-900">Invoices</h1>
+        <button
+          type="button"
+          onClick={() => setShowExportModal(true)}
+          className="inline-flex items-center justify-center gap-2 rounded-lg bg-green-600 px-4 py-2 text-sm font-medium text-white hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2"
+        >
+          <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 16V4m0 12l-4-4m4 4l4-4M4 20h16" />
+          </svg>
+          Export to Excel
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:max-w-xl">
+        <div>
+          <label className="mb-1 block text-xs font-medium text-gray-600">Issue Date From</label>
+          <input
+            type="date"
+            value={filterIssueDateFrom}
+            onChange={(e) => setFilterIssueDateFrom(e.target.value)}
+            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+          />
+        </div>
+        <div>
+          <label className="mb-1 block text-xs font-medium text-gray-600">Issue Date To</label>
+          <input
+            type="date"
+            value={filterIssueDateTo}
+            min={filterIssueDateFrom || undefined}
+            onChange={(e) => setFilterIssueDateTo(e.target.value)}
+            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+          />
+        </div>
       </div>
 
       {/* Error Message */}
@@ -1043,19 +1411,22 @@ const Invoice = () => {
       <div className="bg-white rounded-lg shadow">
           {/* Desktop Table View */}
           <div className="overflow-x-auto rounded-lg" style={{ scrollbarWidth: 'thin', scrollbarColor: '#cbd5e0 #f7fafc', WebkitOverflowScrolling: 'touch' }}>
-            <table className="divide-y divide-gray-200" style={{ width: '100%', minWidth: '1100px', tableLayout: 'fixed' }}>
+            <table className="divide-y divide-gray-200" style={{ width: '100%', minWidth: '1250px', tableLayout: 'fixed' }}>
               <colgroup>
-                <col style={{ width: '200px' }} />
-                <col style={{ width: '200px' }} />
-                <col style={{ width: '160px' }} />
+                <col style={{ width: '170px' }} />
                 <col style={{ width: '120px' }} />
-                <col style={{ width: '120px' }} />
-                <col style={{ width: '140px' }} />
+                <col style={{ width: '170px' }} />
+                <col style={{ width: '130px' }} />
                 <col style={{ width: '100px' }} />
+                <col style={{ width: '110px' }} />
+                <col style={{ width: '120px' }} />
+                <col style={{ width: '120px' }} />
+                <col style={{ width: '120px' }} />
+                <col style={{ width: '90px' }} />
               </colgroup>
               <thead className="bg-white table-header-stable">
                 <tr>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '200px', minWidth: '200px' }}>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '170px', minWidth: '170px' }}>
                     <div className="flex flex-col space-y-2">
                       <div className="flex items-center space-x-1 min-h-[6px]">
                         <span className={`inline-block w-1.5 h-1.5 rounded-full flex-shrink-0 ${nameSearchTerm ? 'bg-primary-600' : 'invisible'}`} aria-hidden />
@@ -1085,7 +1456,10 @@ const Invoice = () => {
                       </div>
                     </div>
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '200px', minWidth: '200px' }}>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '120px', minWidth: '120px' }}>
+                    AR#
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '170px', minWidth: '170px' }}>
                     <div className="flex flex-col space-y-2">
                       <div className="flex items-center space-x-1 min-h-[6px]">
                         <span className={`inline-block w-1.5 h-1.5 rounded-full flex-shrink-0 ${studentNameSearch ? 'bg-primary-600' : 'invisible'}`} aria-hidden />
@@ -1115,10 +1489,10 @@ const Invoice = () => {
                       </div>
                     </div>
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '160px', minWidth: '160px' }}>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '130px', minWidth: '130px' }}>
                     <span>Branch</span>
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '120px', minWidth: '120px' }}>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '100px', minWidth: '100px' }}>
                     <div className="relative status-filter-dropdown">
                       <button
                         onClick={(e) => {
@@ -1139,13 +1513,19 @@ const Invoice = () => {
                       </button>
                     </div>
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '120px', minWidth: '120px' }}>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '110px', minWidth: '110px' }}>
                     Amount
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '140px', minWidth: '140px' }}>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '120px', minWidth: '120px' }}>
+                    Total Amount
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '120px', minWidth: '120px' }}>
+                    Issue Date
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '120px', minWidth: '120px' }}>
                     Due Date
                   </th>
-                  <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '100px', minWidth: '100px' }}>
+                  <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider" style={{ width: '90px', minWidth: '90px' }}>
                     Actions
                   </th>
                 </tr>
@@ -1153,7 +1533,7 @@ const Invoice = () => {
               <tbody className="bg-[#ffffff] divide-y divide-gray-200">
                 {filteredInvoices.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="px-6 py-12 text-center">
+                    <td colSpan={10} className="px-6 py-12 text-center">
                       <p className="text-gray-500">
                         {nameSearchTerm || studentNameSearch || filterBranch || filterStatus
                           ? 'No matching invoices. Try adjusting your search or filters.'
@@ -1173,9 +1553,9 @@ const Invoice = () => {
                           </span>
                         )}
                       </div>
-                      {invoice.invoice_description && (
+                      {(invoice.display_description || invoice.invoice_description) && (
                         <div className="text-xs text-gray-500 mt-1">
-                          {invoice.invoice_description}
+                          {(invoice.display_description || invoice.invoice_description).replace(/\s*-\s*AR\s+[A-Za-z0-9-]+/i, '')}
                         </div>
                       )}
                       {invoice.reservation && (
@@ -1200,6 +1580,11 @@ const Invoice = () => {
                           )}
                         </div>
                       )}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600" style={{ maxWidth: '140px' }}>
+                      <span className="text-sm" title={invoice.invoice_ar_number || ''}>
+                        {invoice.invoice_ar_number || '—'}
+                      </span>
                     </td>
                     <td className="px-6 py-4" style={{ maxWidth: '200px' }}>
                       <div className="text-sm text-gray-900 min-w-0">
@@ -1257,10 +1642,37 @@ const Invoice = () => {
                       </span>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
+                      {invoice.status === 'Balance Invoiced' ? (
+                        <div className="text-xs text-gray-900 space-y-0.5">
+                          <div>
+                            <span className="text-gray-500">Balance invoice:</span>{' '}
+                            <span className="font-medium">
+                              ₱{Number(invoice.balance_invoice_amount ?? invoice.amount ?? 0).toFixed(2)}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-gray-500">Paid amount:</span>{' '}
+                            <span className="font-medium">
+                              ₱{Number(invoice.paid_amount ?? 0).toFixed(2)}
+                            </span>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="text-sm text-gray-900">
+                          {invoice.amount !== null && invoice.amount !== undefined
+                            ? `₱${getInvoiceDisplayAmount(invoice).toFixed(2)}`
+                            : '-'}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <div className="text-sm font-medium text-gray-900">
+                        ₱{Number(invoice.total_received_amount || ((invoice.paid_amount || 0) + (invoice.total_tip_amount || 0))).toFixed(2)}
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
                       <div className="text-sm text-gray-900">
-                        {invoice.amount !== null && invoice.amount !== undefined
-                          ? `₱${parseFloat(invoice.amount).toFixed(2)}`
-                          : '-'}
+                        {invoice.issue_date ? formatDateManila(invoice.issue_date) : '-'}
                       </div>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
@@ -1348,6 +1760,36 @@ const Invoice = () => {
                         e.stopPropagation();
                         setOpenMenuId(null);
                         setMenuPosition({ top: 0, right: 0 });
+                        handleDownloadSOA(selectedInvoice);
+                      }}
+                      className="flex items-center justify-between w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 transition-colors"
+                    >
+                      <span>Download / Print SOA</span>
+                      <svg className="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 9V4h12v5m0 4h2v7H4v-7h2m2 0h8m-8 0v4h8v-4" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setOpenMenuId(null);
+                        setMenuPosition({ top: 0, right: 0 });
+                        handleDownloadAR(selectedInvoice);
+                      }}
+                      className="flex items-center justify-between w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 transition-colors"
+                    >
+                      <span>Download AR</span>
+                      <svg className="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setOpenMenuId(null);
+                        setMenuPosition({ top: 0, right: 0 });
                         handleDelete(openMenuId);
                       }}
                       className="flex items-center justify-between w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors"
@@ -1357,18 +1799,45 @@ const Invoice = () => {
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                       </svg>
                     </button>
+                    {selectedInvoice.installmentinvoiceprofiles_id && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleViewInstallmentInvoice(selectedInvoice);
+                        }}
+                        className="flex items-center justify-between w-full text-left px-4 py-2 text-sm text-indigo-600 hover:bg-indigo-50 transition-colors"
+                      >
+                        <span>View Installment Invoice</span>
+                        <svg className="w-4 h-4 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12H9m12 0A9 9 0 113 12a9 9 0 0118 0z" />
+                        </svg>
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={(e) => {
                         e.stopPropagation();
                         if (selectedInvoice.status === 'Paid') return;
+                        if (
+                          selectedInvoice.balance_invoice_id ||
+                          selectedInvoice.can_record_payment === false
+                        ) {
+                          return;
+                        }
                         setOpenMenuId(null);
                         setMenuPosition({ top: 0, right: 0 });
                         handleOpenPaymentModal(selectedInvoice);
                       }}
-                      disabled={selectedInvoice.status === 'Paid'}
+                      disabled={
+                        selectedInvoice.status === 'Paid' ||
+                        !!selectedInvoice.balance_invoice_id ||
+                        selectedInvoice.can_record_payment === false
+                      }
                       className={`flex items-center justify-between w-full text-left px-4 py-2 text-sm transition-colors ${
-                        selectedInvoice.status === 'Paid'
+                        selectedInvoice.status === 'Paid' ||
+                        !!selectedInvoice.balance_invoice_id ||
+                        selectedInvoice.can_record_payment === false
                           ? 'text-gray-400 cursor-not-allowed opacity-60'
                           : 'text-green-600 hover:bg-green-50'
                       }`}
@@ -1507,6 +1976,119 @@ const Invoice = () => {
         document.body
       )}
 
+      {showExportModal && createPortal(
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-lg rounded-xl bg-white shadow-2xl">
+            <div className="flex items-center justify-between border-b border-gray-100 px-6 py-4">
+              <div>
+                <h2 className="text-lg font-semibold text-gray-900">Export Invoices</h2>
+                <p className="mt-1 text-sm text-gray-500">Select branches and issue date range to export.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (exportLoading) return;
+                  setShowExportModal(false);
+                }}
+                className="text-gray-400 hover:text-gray-600"
+                aria-label="Close export modal"
+              >
+                <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="space-y-4 px-6 py-5">
+              <div>
+                <div className="mb-2 flex items-center justify-between">
+                  <label className="text-sm font-medium text-gray-700">Select Branches to Export</label>
+                  <button
+                    type="button"
+                    onClick={toggleSelectAllExportBranches}
+                    className="rounded-md border border-gray-300 px-2.5 py-1 text-xs font-medium text-gray-700 hover:bg-gray-50"
+                  >
+                    {selectedExportBranches.length === branches.length ? 'Clear All' : 'Select All'}
+                  </button>
+                </div>
+                <div className="max-h-40 overflow-y-auto rounded-lg border border-gray-200 bg-white p-2">
+                  {branches.length === 0 ? (
+                    <p className="px-2 py-1 text-xs text-gray-500">No branches found.</p>
+                  ) : (
+                    branches.map((branch) => {
+                      const branchId = String(branch.branch_id);
+                      const checked = selectedExportBranches.includes(branchId);
+                      return (
+                        <label
+                          key={branchId}
+                          className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-gray-50"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => toggleExportBranch(branchId)}
+                            className="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+                          />
+                          <span className="text-gray-700">{branch.branch_nickname || branch.branch_name}</span>
+                        </label>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-gray-700">Issue Date From</label>
+                  <input
+                    type="date"
+                    value={exportDateFrom}
+                    onChange={(e) => setExportDateFrom(e.target.value)}
+                    className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-gray-700">Issue Date To</label>
+                  <input
+                    type="date"
+                    value={exportDateTo}
+                    onChange={(e) => setExportDateTo(e.target.value)}
+                    className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                  />
+                </div>
+              </div>
+
+              <div className="rounded-md border border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                Selected: <span className="font-semibold">{selectedExportBranches.length}</span> branch(es)
+                {selectedExportBranches.length === 0 ? ' — select at least one to export.' : ''}
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-3 border-t border-gray-100 px-6 py-4">
+              <button
+                type="button"
+                onClick={() => {
+                  if (exportLoading) return;
+                  setShowExportModal(false);
+                }}
+                className="rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleExportToExcel}
+                disabled={exportLoading || selectedExportBranches.length === 0}
+                className="rounded-lg bg-green-600 px-4 py-2 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-60"
+              >
+                {exportLoading ? 'Exporting...' : 'Export to Excel'}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
       {/* Create/Edit Invoice Modal */}
       {isModalOpen && createPortal(
         <div 
@@ -1545,6 +2127,7 @@ const Invoice = () => {
                     {error}
                   </div>
                 )}
+
                 <div className="space-y-6">
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
 
@@ -1615,9 +2198,11 @@ const Invoice = () => {
                         id="issue_date"
                         name="issue_date"
                         value={formData.issue_date}
-                        onChange={handleInputChange}
-                        className="input-field"
+                        readOnly
+                        disabled
+                        className="input-field bg-gray-50 text-gray-500"
                       />
+                      <p className="mt-1 text-xs text-gray-500">Always set to today.</p>
                     </div>
 
                     <div>
@@ -1930,6 +2515,32 @@ const Invoice = () => {
               </button>
             </div>
 
+            {(selectedInvoiceForDetails.balance_invoice_id ||
+              selectedInvoiceForDetails.can_record_payment === false) && (
+              <div className="px-6 pb-2">
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950">
+                  <p className="font-medium">Partial payment applied</p>
+                  <p className="mt-1">
+                    Further payments cannot be recorded on this invoice.
+                    {selectedInvoiceForDetails.continued_to_invoice ? (
+                      <>
+                        {' '}
+                        Record the remaining balance on{' '}
+                        <span className="font-semibold">
+                          {selectedInvoiceForDetails.continued_to_invoice.display_description ||
+                            selectedInvoiceForDetails.continued_to_invoice.invoice_description ||
+                            `INV-${selectedInvoiceForDetails.continued_to_invoice.invoice_id}`}
+                        </span>
+                        .
+                      </>
+                    ) : (
+                      <span> Use the newest balance invoice in this chain from the list.</span>
+                    )}
+                  </p>
+                </div>
+              </div>
+            )}
+
             {/* Modal Body */}
             <div className="p-6 overflow-y-auto flex-1">
               {/* Invoice Details Section */}
@@ -1980,7 +2591,7 @@ const Invoice = () => {
                               : selectedInvoiceForDetails.status === 'Pending'
                               ? 'bg-yellow-100 text-yellow-800'
                               : selectedInvoiceForDetails.status === 'Unpaid'
-                              ? 'bg-orange-100 text-orange-800'
+                              ? 'bg-red-100 text-red-800'
                               : selectedInvoiceForDetails.status === 'Overdue'
                               ? 'bg-red-100 text-red-800'
                               : 'bg-gray-100 text-gray-800'
@@ -2002,7 +2613,7 @@ const Invoice = () => {
                     <span className="text-xs text-gray-500">Total Amount:</span>
                     <p className="text-sm font-medium text-gray-900 mt-1">
                       {selectedInvoiceForDetails.amount !== null && selectedInvoiceForDetails.amount !== undefined
-                        ? `₱${parseFloat(selectedInvoiceForDetails.amount).toFixed(2)}`
+                        ? `₱${getInvoiceDisplayAmount(selectedInvoiceForDetails).toFixed(2)}`
                         : '-'}
                     </p>
                   </div>
@@ -2293,29 +2904,6 @@ const Invoice = () => {
             </div>
 
             <form onSubmit={handleSubmitPayment} className="p-6 space-y-6">
-              {/* Invoice Information */}
-              <div className="bg-gray-50 rounded-lg p-4 space-y-2">
-                <h3 className="text-sm font-semibold text-gray-700 mb-3">Invoice Information</h3>
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="text-xs text-gray-600">Invoice ID</label>
-                    <p className="text-sm font-medium text-gray-900">{selectedInvoiceForPayment.invoice_description || `INV-${selectedInvoiceForPayment.invoice_id}`}</p>
-                  </div>
-                  <div>
-                    <label className="text-xs text-gray-600">Invoice Amount</label>
-                    <p className="text-sm font-medium text-gray-900">₱{parseFloat(selectedInvoiceForPayment.amount || 0).toFixed(2)}</p>
-                  </div>
-                  <div>
-                    <label className="text-xs text-gray-600">Issue Date</label>
-                    <p className="text-sm font-medium text-gray-900">{formatDateManila(selectedInvoiceForPayment.issue_date)}</p>
-                  </div>
-                  <div>
-                    <label className="text-xs text-gray-600">Due Date</label>
-                    <p className="text-sm font-medium text-gray-900">{formatDateManila(selectedInvoiceForPayment.due_date)}</p>
-                  </div>
-                </div>
-              </div>
-
               {/* Payment Form */}
               <div className="space-y-4">
                 <div>
@@ -2394,15 +2982,48 @@ const Invoice = () => {
                       type="number"
                       step="0.01"
                       min="0.01"
+                      max={
+                        paymentFormData.payment_type === 'Partial Payment'
+                          ? Math.max(0, (parseFloat(selectedInvoiceForPayment.amount || 0) || 0) - 0.01).toFixed(2)
+                          : undefined
+                      }
                       name="payable_amount"
                       value={paymentFormData.payable_amount}
                       onChange={handlePaymentInputChange}
-                      className={`input-field text-sm ${paymentFormErrors.payable_amount ? 'border-red-500' : ''}`}
+                      disabled={paymentFormData.payment_type === 'Full Payment'}
+                      className={`input-field text-sm ${
+                        paymentFormData.payment_type === 'Full Payment'
+                          ? 'bg-gray-100 text-gray-600 cursor-not-allowed'
+                          : ''
+                      } ${paymentFormErrors.payable_amount ? 'border-red-500' : ''}`}
                       placeholder="0.00"
                       required
                     />
                     {paymentFormErrors.payable_amount && (
                       <p className="text-xs text-red-500 mt-1">{paymentFormErrors.payable_amount}</p>
+                    )}
+                    {paymentFormData.payment_type === 'Partial Payment' && (
+                      <p className="text-xs text-amber-600 mt-1">
+                        Partial payment must be lower than remaining amount
+                        ({` ₱${parseFloat(selectedInvoiceForPayment.amount || 0).toFixed(2)}`}).
+                      </p>
+                    )}
+                  </div>
+
+                  <div>
+                    <label className="label-field text-xs">Tip / Excess Amount (Optional)</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      name="tip_amount"
+                      value={paymentFormData.tip_amount}
+                      onChange={handlePaymentInputChange}
+                      className={`input-field text-sm ${paymentFormErrors.tip_amount ? 'border-red-500' : ''}`}
+                      placeholder="0.00"
+                    />
+                    {paymentFormErrors.tip_amount && (
+                      <p className="text-xs text-red-500 mt-1">{paymentFormErrors.tip_amount}</p>
                     )}
                   </div>
 
@@ -2425,8 +3046,8 @@ const Invoice = () => {
                 </div>
 
                 <div>
-                  <label className="label-field text-xs">Attachment (image)</label>
-                  <p className="text-xs text-gray-500 mb-1">Optional: upload a receipt or proof of payment (JPEG, PNG, WebP, GIF, max 5MB)</p>
+                  <label className="label-field text-xs">Attachment (image) *</label>
+                  <p className="text-xs text-gray-500 mb-1">Upload a receipt or proof of payment (JPEG, PNG, WebP, GIF, max 5MB)</p>
                   <input
                     type="file"
                     accept="image/jpeg,image/png,image/webp,image/gif"
@@ -2436,6 +3057,9 @@ const Invoice = () => {
                   />
                   {paymentAttachmentUploading && (
                     <p className="text-xs text-amber-600 mt-1">Uploading?</p>
+                  )}
+                  {paymentFormErrors.attachment_url && (
+                    <p className="text-xs text-red-500 mt-1">{paymentFormErrors.attachment_url}</p>
                   )}
                   {paymentFormData.attachment_url && !paymentAttachmentUploading && (
                     <div className="mt-2">
@@ -2491,6 +3115,79 @@ const Invoice = () => {
                     placeholder="Optional remarks or notes"
                   />
                 </div>
+
+                {(() => {
+                  const breakdown = getInvoiceBreakdown(selectedInvoiceForPayment);
+                  const enteredAmount = parseFloat(paymentFormData.payable_amount || 0) || 0;
+                  const payableToApply = Math.max(0, Math.min(enteredAmount, breakdown.remaining));
+                  const projectedRemaining = Math.max(0, breakdown.remaining - payableToApply);
+                  const projectedTotalPaid = breakdown.paidAmount + payableToApply;
+                  return (
+                    <div className="bg-gray-50 rounded-lg p-4 space-y-3">
+                      <h3 className="text-sm font-semibold text-gray-700">Invoice Information</h3>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                        <div>
+                          <p className="text-xs text-gray-600">Invoice ID</p>
+                          <p className="font-medium text-gray-900">
+                            {selectedInvoiceForPayment.display_description ||
+                              selectedInvoiceForPayment.invoice_description ||
+                              `INV-${selectedInvoiceForPayment.invoice_id}`}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-gray-600">Issue Date</p>
+                          <p className="font-medium text-gray-900">{formatDateManila(selectedInvoiceForPayment.issue_date)}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-gray-600">Due Date</p>
+                          <p className="font-medium text-gray-900">{formatDateManila(selectedInvoiceForPayment.due_date)}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-gray-600">Remaining Balance</p>
+                          <p className="font-semibold text-blue-700">₱{breakdown.remaining.toFixed(2)}</p>
+                        </div>
+                      </div>
+                      <div className="border-t border-gray-200 pt-3 space-y-1 text-sm">
+                        <div className="flex justify-between">
+                          <span className="text-gray-600">Subtotal</span>
+                          <span className="text-gray-900">₱{breakdown.subtotal.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-gray-600">Discount</span>
+                          <span className="text-gray-900">- ₱{breakdown.discount.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-gray-600">Penalty</span>
+                          <span className="text-gray-900">₱{breakdown.penalty.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-gray-600">Tax</span>
+                          <span className="text-gray-900">₱{breakdown.tax.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between font-semibold border-t border-gray-200 pt-2 mt-2">
+                          <span className="text-gray-800">Total Invoice Amount</span>
+                          <span className="text-gray-900">₱{breakdown.totalDue.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-gray-600">Total Paid</span>
+                          <span className="text-emerald-700">₱{breakdown.paidAmount.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-gray-600">Payment to Record</span>
+                          <span className="text-gray-900">₱{payableToApply.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-gray-600">Projected Total Paid</span>
+                          <span className="text-emerald-700">₱{projectedTotalPaid.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between font-semibold">
+                          <span className="text-gray-800">Projected Remaining After Payment</span>
+                          <span className="text-blue-700">₱{projectedRemaining.toFixed(2)}</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
 
               {/* Action Buttons */}

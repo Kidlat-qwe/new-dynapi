@@ -1,7 +1,10 @@
 import { query, getClient } from '../config/database.js';
+import { insertInvoiceWithArNumber } from './invoiceArNumber.js';
 import { formatYmdLocal, parseYmdToLocalNoon } from './dateUtils.js';
+import { getCanonicalInstallmentPhaseCounts } from './balanceInvoice.js';
 import {
   buildPhaseInstallmentSchedule,
+  getPhaseDueDateYmd,
   isPhaseInstallmentProfile,
 } from './phaseInstallmentUtils.js';
 
@@ -31,10 +34,12 @@ export const parseFrequency = (frequency) => {
 export const calculateNextGenerationDate = (currentDate, frequency) => {
   const date = new Date(currentDate);
   const months = parseFrequency(frequency);
-  
+
+  // Enforce fixed monthly generation cadence: every 25th.
+  date.setDate(25);
   // Add months to the date
   date.setMonth(date.getMonth() + months);
-  
+
   return date;
 };
 
@@ -54,6 +59,42 @@ export const calculateNextInvoiceMonth = (currentInvoiceMonth, frequency) => {
   date.setMonth(date.getMonth() + months);
   
   return date;
+};
+
+/**
+ * Build fixed installment cycle dates from a generation anchor date.
+ * Rule:
+ * - Generation/issue date: 25th of the current cycle month
+ * - Invoice month: 1st of the next month
+ * - Due date: 5th of the next month
+ */
+const buildFixedInstallmentCycleDates = (generationAnchor, frequency) => {
+  const months = parseFrequency(frequency);
+  const issueDate = new Date(generationAnchor);
+  issueDate.setDate(25);
+
+  const invoiceMonth = new Date(issueDate);
+  invoiceMonth.setDate(1);
+  invoiceMonth.setMonth(invoiceMonth.getMonth() + 1);
+
+  const dueDate = new Date(invoiceMonth);
+  dueDate.setDate(5);
+
+  const nextGenerationDate = new Date(issueDate);
+  nextGenerationDate.setMonth(nextGenerationDate.getMonth() + months);
+  nextGenerationDate.setDate(25);
+
+  const nextInvoiceMonth = new Date(invoiceMonth);
+  nextInvoiceMonth.setDate(1);
+  nextInvoiceMonth.setMonth(nextInvoiceMonth.getMonth() + months);
+
+  return {
+    issueDate,
+    dueDate,
+    invoiceMonth,
+    nextGenerationDate,
+    nextInvoiceMonth,
+  };
 };
 
 /**
@@ -158,55 +199,24 @@ export const generateInvoiceFromInstallment = async (installmentInvoice, profile
         })
       : null;
 
-    // Calculate issue date (use next generation date as issue date).
-    const issueDate = phaseSchedule?.current_issue_date
-      ? parseYmdToLocalNoon(phaseSchedule.current_issue_date)
-      : (
-          typeof installmentInvoice.next_generation_date === 'string'
-            ? parseYmdToLocalNoon(installmentInvoice.next_generation_date)
-            : new Date(installmentInvoice.next_generation_date)
-        );
-    
-    // Calculate due date based on whether this is the first installment or subsequent ones.
-    let dueDate;
-    
-    if (phaseSchedule?.current_due_date) {
-      dueDate = parseYmdToLocalNoon(phaseSchedule.current_due_date);
-    } else {
-      // Check if this is the first installment invoice (generated_count = 0 before this generation)
-      const isFirstInvoice = (profile.generated_count || 0) === 0;
-      
-      if (isFirstInvoice && profile.class_id) {
-        // First installment: due date = class start date
-        const classResult = await client.query(
-          'SELECT start_date FROM classestbl WHERE class_id = $1',
-          [profile.class_id]
-        );
-        
-        if (classResult.rows.length > 0 && classResult.rows[0].start_date) {
-          dueDate = typeof classResult.rows[0].start_date === 'string'
-            ? parseYmdToLocalNoon(classResult.rows[0].start_date)
-            : new Date(classResult.rows[0].start_date);
-        } else {
-          dueDate = new Date(issueDate);
-          dueDate.setMonth(dueDate.getMonth() + 1);
-          dueDate.setDate(5);
-        }
-      } else {
-        dueDate = new Date(issueDate);
-        dueDate.setMonth(dueDate.getMonth() + 1);
-        dueDate.setDate(5);
-      }
-    }
+    // Fixed cadence for all auto-generated installment invoices.
+    const frequency = installmentInvoice.frequency || profile.frequency || '1 month(s)';
+    const generationAnchor = typeof installmentInvoice.next_generation_date === 'string'
+      ? parseYmdToLocalNoon(installmentInvoice.next_generation_date)
+      : new Date(installmentInvoice.next_generation_date || new Date());
+    const cycle = buildFixedInstallmentCycleDates(generationAnchor, frequency);
+    const issueDate = cycle.issueDate;
+    const dueDate = cycle.dueDate;
     
     // Calculate final invoice amount after promo discount
     const baseAmount = installmentInvoice.total_amount_including_tax || profile.amount;
     const finalInvoiceAmount = Math.max(0, baseAmount - promoDiscount);
     
     // Create invoice (link to installment invoice profile for phase tracking)
-    const invoiceResult = await client.query(
-      `INSERT INTO invoicestbl (invoice_description, branch_id, amount, status, remarks, issue_date, due_date, created_by, installmentinvoiceprofiles_id, promo_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    const newInvoice = await insertInvoiceWithArNumber(
+      client,
+      `INSERT INTO invoicestbl (invoice_description, branch_id, amount, status, remarks, issue_date, due_date, created_by, installmentinvoiceprofiles_id, promo_id, invoice_ar_number)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
       [
         'TEMP', // Temporary, will be updated
@@ -223,8 +233,6 @@ export const generateInvoiceFromInstallment = async (installmentInvoice, profile
         shouldApplyPromoToMonthly ? promoId : null, // Link promo if discount applied
       ]
     );
-    
-    const newInvoice = invoiceResult.rows[0];
     
     // Update invoice description
     await client.query(
@@ -301,17 +309,9 @@ export const generateInvoiceFromInstallment = async (installmentInvoice, profile
       [newInvoice.invoice_id, profile.student_id]
     );
     
-    // Calculate next generation date and next invoice month
-    const frequency = installmentInvoice.frequency || profile.frequency || '1 month(s)';
-    const nextGenDate = calculateNextGenerationDate(
-      installmentInvoice.next_generation_date,
-      frequency
-    );
-    
-    const nextInvoiceMonth = calculateNextInvoiceMonth(
-      installmentInvoice.next_invoice_month || installmentInvoice.next_generation_date,
-      frequency
-    );
+    // Calculate next generation date and next invoice month from fixed cadence.
+    const nextGenDate = cycle.nextGenerationDate;
+    const nextInvoiceMonth = cycle.nextInvoiceMonth;
     
     // Check phase limit before generating
     const profileCheck = await client.query(
@@ -328,24 +328,14 @@ export const generateInvoiceFromInstallment = async (installmentInvoice, profile
     const currentCount = profileData.generated_count || 0;
     const maxInvoices = totalPhases !== null ? totalPhases : null; // Max invoices = total_phases (downpayment doesn't count)
     
-    // Calculate how many phases are actually paid (downpayment is NOT counted as a phase)
-    // Only count paid installment invoices, excluding downpayment invoice
-    // Get detailed list for debugging
-    const paidInvoicesDetailResult = await client.query(
-      `SELECT i.invoice_id, i.invoice_description, i.status, i.installmentinvoiceprofiles_id
-       FROM invoicestbl i 
-       WHERE i.installmentinvoiceprofiles_id = $1 
-         AND i.status = 'Paid'
-         AND ($2::INTEGER IS NULL OR i.invoice_id != $2::INTEGER)
-       ORDER BY i.invoice_id`,
-      [profileData.installmentinvoiceprofiles_id, profileData.downpayment_invoice_id || null]
+    const { paidPhaseCount: paidPhases } = await getCanonicalInstallmentPhaseCounts(
+      client,
+      profileData.installmentinvoiceprofiles_id,
+      profileData.downpayment_invoice_id || null
     );
-    
-    const paidPhases = paidInvoicesDetailResult.rows.length;
     
     // Debug logging
     console.log('[Generator] Paid invoices count:', paidPhases);
-    console.log('[Generator] Paid invoices detail:', JSON.stringify(paidInvoicesDetailResult.rows, null, 2));
     console.log('[Generator] Total phases:', totalPhases);
     console.log('[Generator] Downpayment invoice ID:', profileData.downpayment_invoice_id);
     

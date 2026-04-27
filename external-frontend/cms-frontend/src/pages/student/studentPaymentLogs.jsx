@@ -3,6 +3,7 @@ import { apiRequest } from '../../config/api';
 import { useAuth } from '../../contexts/AuthContext';
 import * as XLSX from 'xlsx';
 import FixedTablePagination from '../../components/table/FixedTablePagination';
+import { appAlert } from '../../utils/appAlert';
 
 const StudentPaymentLogs = () => {
   const { userInfo } = useAuth();
@@ -116,6 +117,7 @@ const StudentPaymentLogs = () => {
   const filteredPayments = payments.filter((payment) => {
     const matchesSearch = !searchTerm || 
       payment.invoice_description?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      payment.invoice_ar_number?.toLowerCase().includes(searchTerm.toLowerCase()) ||
       payment.reference_number?.toLowerCase().includes(searchTerm.toLowerCase()) ||
       payment.payment_id?.toString().includes(searchTerm) ||
       `INV-${payment.invoice_id}`.includes(searchTerm);
@@ -143,6 +145,10 @@ const StudentPaymentLogs = () => {
 
     return matchesSearch && matchesStatus && matchesPaymentMethod && matchesIssueRange;
   });
+  const filteredTotalAmount = filteredPayments.reduce(
+    (sum, payment) => sum + (parseFloat(payment.payable_amount) || 0),
+    0
+  );
 
   const itemsPerPage = 10;
   const totalPages = Math.max(Math.ceil(filteredPayments.length / itemsPerPage), 1);
@@ -165,7 +171,7 @@ const StudentPaymentLogs = () => {
       
       // Use current payments data
       if (filteredPayments.length === 0) {
-        alert('No payment records found to export.');
+        appAlert('No payment records found to export.');
         setExportLoading(false);
         return;
       }
@@ -179,6 +185,7 @@ const StudentPaymentLogs = () => {
         'Amount (₱)': payment.payable_amount ? parseFloat(payment.payable_amount).toFixed(2) : '0.00',
         'Status': payment.status || 'N/A',
         'Payment Date': payment.issue_date ? formatDate(payment.issue_date) : '-',
+        'AR#': payment.invoice_ar_number || '-',
         'Reference Number': payment.reference_number || '-',
       }));
 
@@ -195,6 +202,7 @@ const StudentPaymentLogs = () => {
         { wch: 15 },  // Amount
         { wch: 12 },  // Status
         { wch: 15 },  // Payment Date
+        { wch: 10 },  // AR#
         { wch: 20 },  // Reference Number
       ];
 
@@ -213,7 +221,7 @@ const StudentPaymentLogs = () => {
       setExportLoading(false);
     } catch (error) {
       console.error('Export error:', error);
-      alert('Failed to export payment logs. Please try again.');
+      appAlert('Failed to export payment logs. Please try again.');
       setExportLoading(false);
     }
   };
@@ -429,6 +437,11 @@ const StudentPaymentLogs = () => {
 
       {/* Payment Logs List */}
       <div className="bg-white rounded-lg shadow">
+        <div className="px-6 pt-4">
+          <p className="text-sm font-semibold text-gray-700">
+            Total Amount: <span className="text-emerald-700">₱{filteredTotalAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+          </p>
+        </div>
         <div
             className="overflow-x-auto rounded-lg"
             style={{
@@ -439,7 +452,7 @@ const StudentPaymentLogs = () => {
           >
             <table
               className="divide-y divide-gray-200"
-              style={{ width: '100%', minWidth: '1200px' }}
+              style={{ width: '100%', minWidth: '1280px' }}
             >
               <thead className="bg-white">
                 <tr>
@@ -465,6 +478,9 @@ const StudentPaymentLogs = () => {
                     Payment Date
                   </th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    AR#
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                     Reference
                   </th>
                 </tr>
@@ -472,7 +488,7 @@ const StudentPaymentLogs = () => {
               <tbody className="bg-white divide-y divide-gray-200">
                 {filteredPayments.length === 0 ? (
                   <tr>
-                    <td colSpan={8} className="px-6 py-12 text-center">
+                    <td colSpan={9} className="px-6 py-12 text-center">
                       <p className="text-gray-500">
                         {searchTerm || filterStatus || filterPaymentMethod
                           ? 'No matching payments. Try adjusting your search or filters.'
@@ -506,6 +522,11 @@ const StudentPaymentLogs = () => {
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                       {formatDate(payment.issue_date)}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
+                      <span className="truncate block" title={payment.invoice_ar_number || ''}>
+                        {payment.invoice_ar_number || '—'}
+                      </span>
                     </td>
                     <td className="px-6 py-4 text-sm text-gray-500" style={{ maxWidth: '180px' }}>
                       <span className="truncate block" title={payment.reference_number || '-'}>{payment.reference_number || '-'}</span>

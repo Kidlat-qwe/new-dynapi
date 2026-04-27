@@ -3,7 +3,19 @@ import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import Header from '../../components/Header';
 import Sidebar from '../../components/Sidebar';
-import { fetchFuntalk } from '../../lib/api';
+import ResponsiveSelect from '../../components/ResponsiveSelect.jsx';
+import Pagination from '../../components/Pagination.jsx';
+import { API_BASE_URL } from '@/config/api.js';
+import { computeFixedActionMenuPosition } from '../../utils/actionMenuPosition.js';
+
+const CEFR_LEVEL_OPTIONS = [
+  { value: 'A1', label: 'A1' },
+  { value: 'A2', label: 'A2' },
+  { value: 'B1', label: 'B1' },
+  { value: 'B2', label: 'B2' },
+  { value: 'C1', label: 'C1' },
+  { value: 'C2', label: 'C2' },
+];
 
 const SchoolStudents = () => {
   const navigate = useNavigate();
@@ -17,12 +29,12 @@ const SchoolStudents = () => {
   const [nameSearch, setNameSearch] = useState('');
   const [levelFilter, setLevelFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
+  const [page, setPage] = useState(1);
   const [formData, setFormData] = useState({
     studentName: '',
     studentAge: '',
     studentLevel: '',
     studentEmail: '',
-    studentPhone: '',
     parentName: '',
     parentContact: '',
     notes: '',
@@ -30,6 +42,8 @@ const SchoolStudents = () => {
   });
   const [formErrors, setFormErrors] = useState({});
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [openActionMenuId, setOpenActionMenuId] = useState(null);
+  const [menuPosition, setMenuPosition] = useState({ top: 0, right: 0 });
 
   useEffect(() => {
     const token = localStorage.getItem('token');
@@ -65,7 +79,12 @@ const SchoolStudents = () => {
   const fetchStudents = async () => {
     setIsFetching(true);
     try {
-      const response = await fetchFuntalk('/students', {});
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/students`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
       const data = await response.json();
       if (data.success && data.data?.students) {
@@ -90,7 +109,6 @@ const SchoolStudents = () => {
       studentAge: '',
       studentLevel: '',
       studentEmail: '',
-      studentPhone: '',
       parentName: '',
       parentContact: '',
       notes: '',
@@ -106,7 +124,6 @@ const SchoolStudents = () => {
       studentAge: student.student_age || '',
       studentLevel: student.student_level || '',
       studentEmail: student.student_email || '',
-      studentPhone: student.student_phone || '',
       parentName: student.parent_name || '',
       parentContact: student.parent_contact || '',
       notes: student.notes || '',
@@ -137,8 +154,27 @@ const SchoolStudents = () => {
       newErrors.studentName = 'Student name is required';
     }
 
-    if (formData.studentEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(formData.studentEmail)) {
+    if (!String(formData.studentAge || '').trim()) {
+      newErrors.studentAge = 'Age is required';
+    } else {
+      const age = Number(formData.studentAge);
+      if (!Number.isInteger(age) || age < 1 || age > 120) {
+        newErrors.studentAge = 'Age must be a whole number between 1 and 120';
+      }
+    }
+
+    if (!String(formData.studentEmail || '').trim()) {
+      newErrors.studentEmail = 'Email is required';
+    } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(formData.studentEmail)) {
       newErrors.studentEmail = 'Please enter a valid email address';
+    }
+
+    if (!String(formData.parentName || '').trim()) {
+      newErrors.parentName = 'Parent name is required';
+    }
+
+    if (!String(formData.parentContact || '').trim()) {
+      newErrors.parentContact = 'Parent contact is required';
     }
 
     setFormErrors(newErrors);
@@ -156,25 +192,27 @@ const SchoolStudents = () => {
     setFormErrors({});
 
     try {
-      const path = editingStudent
-        ? `/students/${editingStudent.student_id}`
-        : '/students';
+      const token = localStorage.getItem('token');
+      const url = editingStudent
+        ? `${API_BASE_URL}/students/${editingStudent.student_id}`
+        : `${API_BASE_URL}/students`;
+      
       const method = editingStudent ? 'PUT' : 'POST';
 
-      const response = await fetchFuntalk(path, {
+      const response = await fetch(url, {
         method,
         headers: {
           'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
         },
         body: JSON.stringify({
           studentName: formData.studentName.trim(),
-          studentAge: formData.studentAge ? parseInt(formData.studentAge) : null,
-          studentLevel: formData.studentLevel || null,
-          studentEmail: formData.studentEmail || null,
-          studentPhone: formData.studentPhone || null,
-          parentName: formData.parentName || null,
-          parentContact: formData.parentContact || null,
-          notes: formData.notes || null,
+          studentAge: parseInt(formData.studentAge, 10),
+          studentLevel: formData.studentLevel || undefined,
+          studentEmail: formData.studentEmail.trim(),
+          parentName: formData.parentName.trim(),
+          parentContact: formData.parentContact.trim(),
+          notes: formData.notes || undefined,
           isActive: editingStudent ? formData.isActive : true,
         }),
       });
@@ -211,13 +249,18 @@ const SchoolStudents = () => {
   };
 
   const handleDelete = async (studentId, studentName) => {
-    if (!window.confirm(`Are you sure you want to delete student "${studentName}"?`)) {
+    const ok = await window.appConfirm?.(`Are you sure you want to delete student "${studentName}"?`);
+    if (!ok) {
       return;
     }
 
     try {
-      const response = await fetchFuntalk(`/students/${studentId}`, {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_BASE_URL}/students/${studentId}`, {
         method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
       });
 
       const data = await response.json();
@@ -233,6 +276,24 @@ const SchoolStudents = () => {
     }
   };
 
+  useEffect(() => {
+    if (!openActionMenuId) return undefined;
+    const onDocClick = () => setOpenActionMenuId(null);
+    document.addEventListener('click', onDocClick);
+    return () => document.removeEventListener('click', onDocClick);
+  }, [openActionMenuId]);
+
+  useEffect(() => {
+    if (!openActionMenuId) return undefined;
+    const closeMenu = () => setOpenActionMenuId(null);
+    window.addEventListener('scroll', closeMenu, true);
+    window.addEventListener('resize', closeMenu);
+    return () => {
+      window.removeEventListener('scroll', closeMenu, true);
+      window.removeEventListener('resize', closeMenu);
+    };
+  }, [openActionMenuId]);
+
   // Filter students
   const filteredStudents = students.filter((s) => {
     const matchesName = !nameSearch || 
@@ -244,8 +305,19 @@ const SchoolStudents = () => {
     return matchesName && matchesLevel && matchesStatus;
   });
 
-  // Get unique levels
-  const levels = [...new Set(students.map(s => s.student_level).filter(Boolean))];
+  useEffect(() => {
+    setPage(1);
+  }, [nameSearch, levelFilter, statusFilter]);
+
+  const pageSize = 10;
+  const pagedStudents = filteredStudents.slice((page - 1) * pageSize, page * pageSize);
+
+  // Standard level options (CEFR) + keep legacy values visible in filter if data still has them.
+  const levels = [
+    ...CEFR_LEVEL_OPTIONS.map((o) => o.value),
+    ...[...new Set(students.map((s) => s.student_level).filter(Boolean))]
+      .filter((lvl) => !CEFR_LEVEL_OPTIONS.some((o) => o.value === lvl)),
+  ];
 
   // Format date
   const formatDate = (dateString) => {
@@ -327,13 +399,13 @@ const SchoolStudents = () => {
                     </p>
                   </div>
                 ) : (
-                  <div className="overflow-x-auto overflow-hidden">
-                    <table className="w-full divide-y divide-gray-200" style={{ minWidth: '900px' }}>
+                  <>
+                  <div className="overflow-x-auto rounded-b-xl">
+                    <table className="min-w-[1100px] w-full divide-y divide-gray-200">
                       <thead className="bg-gray-50">
                         <tr>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">
                             <div className="flex items-center space-x-2">
-                              <span>Name</span>
                               <input
                                 type="text"
                                 placeholder="Search..."
@@ -344,13 +416,14 @@ const SchoolStudents = () => {
                               />
                             </div>
                           </th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Age</th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                            <select
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Age</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">
+                            <ResponsiveSelect
                               value={levelFilter}
                               onChange={(e) => setLevelFilter(e.target.value)}
-                              className="text-xs font-medium text-gray-500 bg-transparent border-0 rounded px-2 py-1 focus:ring-1 focus:ring-primary-500 focus:outline-none"
+                              className="w-full max-w-[8rem] text-xs font-medium text-gray-500 bg-transparent rounded px-2 py-1 focus:ring-1 focus:ring-primary-500 focus:outline-none border border-gray-200 lg:border-0"
                               onClick={(e) => e.stopPropagation()}
+                              aria-label="Filter by level"
                             >
                               <option value="">Level</option>
                               {levels.map((level) => (
@@ -358,29 +431,33 @@ const SchoolStudents = () => {
                                   {level}
                                 </option>
                               ))}
-                            </select>
+                            </ResponsiveSelect>
                           </th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden lg:table-cell">Email</th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden lg:table-cell">Phone</th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                            <select
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Email</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Parent Name</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Parent Contact</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">
+                            <ResponsiveSelect
                               value={statusFilter}
                               onChange={(e) => setStatusFilter(e.target.value)}
-                              className="text-xs font-medium text-gray-500 bg-transparent border-0 rounded px-2 py-1 focus:ring-1 focus:ring-primary-500 focus:outline-none"
+                              className="w-full max-w-[9rem] text-xs font-medium text-gray-500 bg-transparent rounded px-2 py-1 focus:ring-1 focus:ring-primary-500 focus:outline-none border border-gray-200 lg:border-0"
                               onClick={(e) => e.stopPropagation()}
+                              aria-label="Filter by status"
                             >
                               <option value="">Status</option>
                               <option value="active">Active</option>
                               <option value="inactive">Inactive</option>
-                            </select>
+                            </ResponsiveSelect>
                           </th>
-                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden md:table-cell">Created</th>
-                          <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 tracking-wider">Created</th>
+                          <th className="sticky right-0 z-10 bg-gray-50 px-6 py-3 text-right text-xs font-medium text-gray-500 tracking-wider shadow-[-2px_0_8px_-2px_rgba(0,0,0,0.08)]">
+                            Actions
+                          </th>
                         </tr>
                       </thead>
                       <tbody className="bg-white divide-y divide-gray-200">
-                        {filteredStudents.map((student) => (
-                          <tr key={student.student_id} className="hover:bg-gray-50">
+                        {pagedStudents.map((student) => (
+                          <tr key={student.student_id} className="group hover:bg-gray-50">
                             <td className="px-6 py-4 whitespace-nowrap">
                               <div className="text-sm font-medium text-gray-900">{student.student_name || 'N/A'}</div>
                             </td>
@@ -396,11 +473,16 @@ const SchoolStudents = () => {
                                 <span className="text-sm text-gray-500">-</span>
                               )}
                             </td>
-                            <td className="px-6 py-4 whitespace-nowrap hidden lg:table-cell">
-                              <div className="text-sm text-gray-900">{student.student_email || '-'}</div>
+                            <td className="px-6 py-4 whitespace-nowrap">
+                              <div className="max-w-[11rem] text-sm text-gray-900 break-all sm:max-w-none sm:break-normal" title={student.student_email || ''}>
+                                {student.student_email || '-'}
+                              </div>
                             </td>
-                            <td className="px-6 py-4 whitespace-nowrap hidden lg:table-cell">
-                              <div className="text-sm text-gray-900">{student.student_phone || '-'}</div>
+                            <td className="px-6 py-4 whitespace-nowrap">
+                              <div className="text-sm text-gray-900">{student.parent_name || '-'}</div>
+                            </td>
+                            <td className="px-6 py-4 whitespace-nowrap">
+                              <div className="text-sm text-gray-900">{student.parent_contact || '-'}</div>
                             </td>
                             <td className="px-6 py-4 whitespace-nowrap">
                               {student.is_active ? (
@@ -413,22 +495,36 @@ const SchoolStudents = () => {
                                 </span>
                               )}
                             </td>
-                            <td className="px-6 py-4 whitespace-nowrap hidden md:table-cell">
+                            <td className="px-6 py-4 whitespace-nowrap">
                               <div className="text-sm text-gray-500">{formatDate(student.created_at)}</div>
                             </td>
-                            <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-                              <div className="flex justify-end gap-2">
+                            <td className="sticky right-0 z-[1] bg-white px-6 py-4 whitespace-nowrap text-right text-sm font-medium shadow-[-2px_0_8px_-2px_rgba(0,0,0,0.06)] group-hover:bg-gray-50">
+                              <div className="inline-block text-left">
                                 <button
-                                  onClick={() => handleEditClick(student)}
-                                  className="text-primary-600 hover:text-primary-900"
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (openActionMenuId === student.student_id) {
+                                      setOpenActionMenuId(null);
+                                      return;
+                                    }
+                                    const rect = e.currentTarget.getBoundingClientRect();
+                                    setMenuPosition(
+                                      computeFixedActionMenuPosition({
+                                        rect,
+                                        menuWidth: 112, // w-28
+                                        menuHeight: 120,
+                                        gap: 6,
+                                      })
+                                    );
+                                    setOpenActionMenuId(student.student_id);
+                                  }}
+                                  className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-gray-200 text-gray-600 hover:bg-gray-50 hover:text-gray-900"
+                                  aria-label="Open actions"
                                 >
-                                  Edit
-                                </button>
-                                <button
-                                  onClick={() => handleDelete(student.student_id, student.student_name)}
-                                  className="text-red-600 hover:text-red-900"
-                                >
-                                  Delete
+                                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20" aria-hidden="true">
+                                    <path d="M10 6a1.5 1.5 0 110-3 1.5 1.5 0 010 3zm0 5.5A1.5 1.5 0 1010 8a1.5 1.5 0 000 3.5zM11.5 15a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0z" />
+                                  </svg>
                                 </button>
                               </div>
                             </td>
@@ -437,6 +533,10 @@ const SchoolStudents = () => {
                       </tbody>
                     </table>
                   </div>
+                  <div className="px-4 py-3 sm:px-6 border-t border-gray-200">
+                    <Pagination totalItems={filteredStudents.length} pageSize={pageSize} currentPage={page} onPageChange={setPage} />
+                  </div>
+                  </>
                 )}
               </div>
 
@@ -450,7 +550,7 @@ const SchoolStudents = () => {
               {/* Add/Edit Student Modal */}
               {isModalOpen && createPortal(
                 <div 
-                  className="fixed bg-black bg-opacity-50 flex items-center justify-center p-4" 
+                  className="fixed bg-black/40 backdrop-blur-sm flex items-center justify-center p-4" 
                   style={{ 
                     position: 'fixed', 
                     top: 0, 
@@ -509,7 +609,9 @@ const SchoolStudents = () => {
                           </div>
 
                           <div>
-                            <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-1">Age</label>
+                            <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-1">
+                              Age <span className="text-red-500">*</span>
+                            </label>
                             <input
                               name="studentAge"
                               type="number"
@@ -517,24 +619,36 @@ const SchoolStudents = () => {
                               max="120"
                               value={formData.studentAge}
                               onChange={handleFormChange}
-                              className="w-full px-3 sm:px-4 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500"
+                              className={`w-full px-3 sm:px-4 py-2 text-sm border rounded-lg focus:ring-2 focus:ring-primary-500 ${
+                                formErrors.studentAge ? 'border-red-500' : 'border-gray-300'
+                              }`}
                             />
+                            {formErrors.studentAge && (
+                              <p className="mt-1 text-xs text-red-600">{formErrors.studentAge}</p>
+                            )}
                           </div>
 
                           <div>
                             <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-1">Level</label>
-                            <input
+                            <select
                               name="studentLevel"
-                              type="text"
                               value={formData.studentLevel}
                               onChange={handleFormChange}
                               className="w-full px-3 sm:px-4 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500"
-                              placeholder="e.g., Beginner, Intermediate"
-                            />
+                            >
+                              <option value="">Select level</option>
+                              {CEFR_LEVEL_OPTIONS.map((level) => (
+                                <option key={level.value} value={level.value}>
+                                  {level.label}
+                                </option>
+                              ))}
+                            </select>
                           </div>
 
                           <div>
-                            <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-1">Email</label>
+                            <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-1">
+                              Email <span className="text-red-500">*</span>
+                            </label>
                             <input
                               name="studentEmail"
                               type="email"
@@ -550,36 +664,39 @@ const SchoolStudents = () => {
                           </div>
 
                           <div>
-                            <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-1">Phone</label>
-                            <input
-                              name="studentPhone"
-                              type="tel"
-                              value={formData.studentPhone}
-                              onChange={handleFormChange}
-                              className="w-full px-3 sm:px-4 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500"
-                            />
-                          </div>
-
-                          <div>
-                            <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-1">Parent Name</label>
+                            <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-1">
+                              Parent Name <span className="text-red-500">*</span>
+                            </label>
                             <input
                               name="parentName"
                               type="text"
                               value={formData.parentName}
                               onChange={handleFormChange}
-                              className="w-full px-3 sm:px-4 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500"
+                              className={`w-full px-3 sm:px-4 py-2 text-sm border rounded-lg focus:ring-2 focus:ring-primary-500 ${
+                                formErrors.parentName ? 'border-red-500' : 'border-gray-300'
+                              }`}
                             />
+                            {formErrors.parentName && (
+                              <p className="mt-1 text-xs text-red-600">{formErrors.parentName}</p>
+                            )}
                           </div>
 
                           <div>
-                            <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-1">Parent Contact</label>
+                            <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-1">
+                              Parent Contact <span className="text-red-500">*</span>
+                            </label>
                             <input
                               name="parentContact"
                               type="text"
                               value={formData.parentContact}
                               onChange={handleFormChange}
-                              className="w-full px-3 sm:px-4 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500"
+                              className={`w-full px-3 sm:px-4 py-2 text-sm border rounded-lg focus:ring-2 focus:ring-primary-500 ${
+                                formErrors.parentContact ? 'border-red-500' : 'border-gray-300'
+                              }`}
                             />
+                            {formErrors.parentContact && (
+                              <p className="mt-1 text-xs text-red-600">{formErrors.parentContact}</p>
+                            )}
                           </div>
                         </div>
 
@@ -642,6 +759,41 @@ const SchoolStudents = () => {
           </div>
         </main>
       </div>
+
+      {openActionMenuId &&
+        createPortal(
+          <div
+            className="fixed z-[10020] w-28 origin-top-right rounded-md bg-white shadow-lg ring-1 ring-black ring-opacity-5"
+            style={{ top: `${menuPosition.top}px`, right: `${menuPosition.right}px` }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="py-1">
+              <button
+                type="button"
+                onClick={() => {
+                  const student = filteredStudents.find((s) => s.student_id === openActionMenuId);
+                  setOpenActionMenuId(null);
+                  if (student) handleEditClick(student);
+                }}
+                className="block w-full px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-100"
+              >
+                Edit
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const student = filteredStudents.find((s) => s.student_id === openActionMenuId);
+                  setOpenActionMenuId(null);
+                  if (student) handleDelete(student.student_id, student.student_name);
+                }}
+                className="block w-full px-3 py-2 text-left text-sm text-red-600 hover:bg-gray-100"
+              >
+                Delete
+              </button>
+            </div>
+          </div>,
+          document.body
+        )}
 
       {/* Floating Hamburger Button */}
       <button
