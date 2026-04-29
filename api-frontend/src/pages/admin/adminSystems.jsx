@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { Label } from '@/components/ui/Label';
+import { ConfirmModal } from '@/components/ConfirmModal';
 import { API_BASE } from '@/lib/api';
 
 const DB_TYPES = ['PostgreSQL', 'MySQL', 'MongoDB', 'Other'];
@@ -25,6 +26,7 @@ const emptyForm = () => ({
 });
 
 export default function AdminSystems() {
+  const PAGE_SIZE = 10;
   const navigate = useNavigate();
   const [systems, setSystems] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -33,11 +35,14 @@ export default function AdminSystems() {
   const [form, setForm] = useState(emptyForm);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
-  const [deleteConfirmId, setDeleteConfirmId] = useState(null);
+  const [confirmDeleteSystemId, setConfirmDeleteSystemId] = useState(null);
+  const [deleting, setDeleting] = useState(false);
   const [connectionTestId, setConnectionTestId] = useState(null);
   const [connectionTestResult, setConnectionTestResult] = useState(null);
   const [openMenuId, setOpenMenuId] = useState(null);
   const [menuAnchorRect, setMenuAnchorRect] = useState(null);
+  const [search, setSearch] = useState('');
+  const [page, setPage] = useState(1);
 
   // Close actions menu when clicking outside
   useEffect(() => {
@@ -149,13 +154,16 @@ export default function AdminSystems() {
 
   const handleDelete = async (id) => {
     setError('');
+    setDeleting(true);
     try {
       const res = await fetch(`${API_BASE}/api/systems/${id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Delete failed');
-      setDeleteConfirmId(null);
+      setConfirmDeleteSystemId(null);
       fetchSystems();
     } catch (err) {
       setError(err.message || 'Delete failed');
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -175,6 +183,30 @@ export default function AdminSystems() {
       setConnectionTestId(null);
     }
   };
+  const filteredSystems = systems.filter((s) => {
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
+    return [
+      s.system_id,
+      s.system_name,
+      s.system_description,
+      s.database_type,
+      s.database_host,
+      s.api_path_slug,
+    ].some((v) => String(v ?? '').toLowerCase().includes(q));
+  });
+  const totalPages = Math.max(1, Math.ceil(filteredSystems.length / PAGE_SIZE));
+  const paginatedSystems = filteredSystems.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  useEffect(() => {
+    setPage(1);
+  }, [search, systems.length]);
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [page, totalPages]);
 
   return (
     <div className="space-y-6">
@@ -202,7 +234,7 @@ export default function AdminSystems() {
         <CardContent>
           {loading ? (
             <p className="text-sm text-muted-foreground">Loading...</p>
-          ) : systems.length === 0 ? (
+          ) : filteredSystems.length === 0 ? (
             <p className="text-sm text-muted-foreground">No systems configured yet. Add one to get started.</p>
           ) : (
             <div
@@ -213,6 +245,14 @@ export default function AdminSystems() {
                 WebkitOverflowScrolling: 'touch',
               }}
             >
+              <div className="mb-3">
+                <Input
+                  placeholder="Search systems..."
+                  className="max-w-xs"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+              </div>
               <table style={{ width: '100%', minWidth: '700px' }} className="text-sm">
                 <thead>
                   <tr className="border-b">
@@ -221,42 +261,23 @@ export default function AdminSystems() {
                     <th className="p-2 text-left font-medium">DB type</th>
                     <th className="p-2 text-left font-medium">Host</th>
                     <th className="p-2 text-left font-medium">API path</th>
+                    <th className="p-2 text-left font-medium">Owner</th>
                     <th className="p-2 text-left font-medium">Active</th>
                     <th className="p-2 text-right font-medium">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {systems.map((s) => (
+                  {paginatedSystems.map((s) => (
                     <tr key={s.system_id} className="border-b">
                       <td className="p-2">{s.system_id}</td>
                       <td className="p-2">{s.system_name || '-'}</td>
                       <td className="p-2">{s.database_type || '-'}</td>
                       <td className="p-2">{s.database_host || '-'}</td>
                       <td className="p-2">{s.api_path_slug ? `/api/${s.api_path_slug}/...` : '-'}</td>
+                      <td className="p-2">{s.owner_email || (s.created_by_firebase_uid ? 'user-owned' : 'admin')}</td>
                       <td className="p-2">{s.is_active ? 'Yes' : 'No'}</td>
                       <td className="p-2 text-right">
-                        {deleteConfirmId === s.system_id ? (
-                          <>
-                            <Button
-                              type="button"
-                              variant="destructive"
-                              size="sm"
-                              className="mr-1"
-                              onClick={() => handleDelete(s.system_id)}
-                            >
-                              Confirm
-                            </Button>
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              onClick={() => setDeleteConfirmId(null)}
-                            >
-                              Cancel
-                            </Button>
-                          </>
-                        ) : (
-                          <>
+                        <>
                             <Button
                               type="button"
                               variant="ghost"
@@ -287,8 +308,9 @@ export default function AdminSystems() {
                                 className="min-w-[140px] rounded-md border border-border bg-background py-1 shadow-lg"
                                 style={{
                                   position: 'fixed',
-                                  top: menuAnchorRect.bottom + 4,
+                                  top: (window.innerHeight - menuAnchorRect.bottom < 200) ? menuAnchorRect.top : menuAnchorRect.bottom,
                                   right: window.innerWidth - menuAnchorRect.right,
+                                  transform: (window.innerHeight - menuAnchorRect.bottom < 200) ? 'translateY(-100%)' : 'none',
                                   zIndex: 9999,
                                 }}
                                 onClick={(e) => e.stopPropagation()}
@@ -331,7 +353,7 @@ export default function AdminSystems() {
                                   type="button"
                                   className="block w-full px-3 py-2 text-left text-sm text-destructive hover:bg-muted"
                                   onClick={() => {
-                                    setDeleteConfirmId(s.system_id);
+                                    setConfirmDeleteSystemId(s.system_id);
                                     setOpenMenuId(null);
                                     setMenuAnchorRect(null);
                                   }}
@@ -341,26 +363,52 @@ export default function AdminSystems() {
                               </div>,
                               document.body
                             )}
-                          </>
-                        )}
+                        </>
                       </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+              {filteredSystems.length > 0 && (
+                <div className="mt-4 flex items-center justify-between">
+                  <p className="text-sm text-muted-foreground">
+                    Page {page} of {totalPages} ({filteredSystems.length} items)
+                  </p>
+                  <div className="flex gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={page <= 1}
+                      onClick={() => setPage((p) => Math.max(1, p - 1))}
+                    >
+                      Previous
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={page >= totalPages}
+                      onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                    >
+                      Next
+                    </Button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </CardContent>
       </Card>
 
-      {modalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      {modalOpen && createPortal(
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
           <div
-            className="absolute inset-0 bg-black/50"
+            className="absolute inset-0 bg-black/50 backdrop-blur-sm"
             onClick={closeModal}
             aria-hidden
           />
-          <Card className="relative z-10 max-h-[90vh] w-full max-w-lg overflow-y-auto">
+          <Card className="relative z-10 mx-4 max-h-[90vh] w-full max-w-lg overflow-y-auto">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
               <CardTitle>{editingId ? 'Edit system' : 'Add system'}</CardTitle>
               <Button type="button" variant="ghost" size="sm" onClick={closeModal} aria-label="Close">
@@ -506,8 +554,18 @@ export default function AdminSystems() {
               </form>
             </CardContent>
           </Card>
-        </div>
+        </div>,
+        document.body
       )}
+      <ConfirmModal
+        open={confirmDeleteSystemId != null}
+        title="Delete system"
+        message="Are you sure you want to delete this system?"
+        confirmText="Delete"
+        onCancel={() => setConfirmDeleteSystemId(null)}
+        onConfirm={() => handleDelete(confirmDeleteSystemId)}
+        loading={deleting}
+      />
     </div>
   );
 }

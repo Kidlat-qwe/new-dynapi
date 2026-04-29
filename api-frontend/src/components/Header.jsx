@@ -30,7 +30,7 @@ export function Header() {
   return (
     <header className="shrink-0 border-b bg-background">
       <div className="flex h-14 items-center justify-between px-4 md:px-6">
-        <h1 className="text-lg font-semibold">Multi-System API</h1>
+        <h1 className="text-lg font-semibold">RHET API System</h1>
         {user && (
           <div className="relative" ref={menuRef}>
             <button
@@ -44,7 +44,12 @@ export function Header() {
               aria-haspopup="menu"
               aria-label="Account menu"
             >
-              <span className="max-w-[200px] truncate font-medium text-foreground">{fullName}</span>
+              <span className="max-w-[200px] text-left leading-tight">
+                <span className="block truncate font-medium text-foreground">{fullName}</span>
+                <span className="block truncate text-[11px] uppercase tracking-wide text-muted-foreground">
+                  {user.role || 'user'}
+                </span>
+              </span>
               <svg
                 className={cn('h-4 w-4 shrink-0 transition-transform', open && 'rotate-180')}
                 fill="none"

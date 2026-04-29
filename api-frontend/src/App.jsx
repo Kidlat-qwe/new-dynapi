@@ -9,8 +9,11 @@ import AdminApiTokens from '@/pages/admin/adminApiTokens';
 import AdminSystemRoutes from '@/pages/admin/AdminSystemRoutes';
 import AdminHealthMonitoring from '@/pages/admin/adminHealthMonitoring';
 import AdminSystemLogs from '@/pages/admin/adminSystemLogs';
+import AdminSecrets from '@/pages/admin/adminSecrets';
 import UserDashboard from '@/pages/user/userDashboard';
 import UserSystems from '@/pages/user/userSystems';
+import UserSecrets from '@/pages/user/userSecrets';
+import UserApiTokens from '@/pages/user/userApiTokens';
 
 function ProtectedRoute({ children, allowedRoles }) {
   const { isAuthenticated, user, loading } = useAuth();
@@ -46,6 +49,7 @@ function AppRoutes() {
         <Route path="health" element={<AdminHealthMonitoring />} />
         <Route path="users" element={<AdminUsers />} />
         <Route path="api-tokens" element={<AdminApiTokens />} />
+        <Route path="secrets" element={<AdminSecrets />} />
         <Route path="system-logs" element={<AdminSystemLogs />} />
       </Route>
       <Route
@@ -58,6 +62,8 @@ function AppRoutes() {
       >
         <Route index element={<UserDashboard />} />
         <Route path="systems" element={<UserSystems />} />
+        <Route path="secrets" element={<UserSecrets />} />
+        <Route path="api-tokens" element={<UserApiTokens />} />
       </Route>
       <Route path="/" element={<Navigate to="/login" replace />} />
       <Route path="*" element={<Navigate to="/login" replace />} />

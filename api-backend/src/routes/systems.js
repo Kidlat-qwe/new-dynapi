@@ -4,10 +4,11 @@
  */
 
 import { Router } from 'express';
-import { getPool, ensureSystemsConfigTable, ensureSystemRoutesTable, ensureSystemMonitoringConfigTable, ensureUsersTable } from '../config/db.js';
+import { getPool, ensureSystemsConfigTable, ensureSystemRoutesTable, ensureSystemMonitoringConfigTable, ensureUsersTable, ensureUserSystemPermissionsTable } from '../config/db.js';
 import { testSystemConnection, testSystemConnectionWithLatency, closeSystemPool } from '../config/systemPools.js';
 import { verifyIdToken } from '../config/firebaseAdmin.js';
 import { sendWebhookNotification, testWebhook } from '../services/notificationService.js';
+import { upsertSystemConfigSecrets } from './secrets.js';
 
 const router = Router();
 
@@ -31,6 +32,38 @@ async function checkIsAdmin(req) {
   } catch {
     return false;
   }
+}
+
+async function getRequestAuth(req) {
+  const idToken = getIdToken(req);
+  if (!idToken) return { authenticated: false, isAdmin: false, firebaseUid: null };
+  const verifyResult = await verifyIdToken(idToken);
+  if (verifyResult.notConfigured || verifyResult.invalid || !verifyResult.decoded) {
+    return { authenticated: false, isAdmin: false, firebaseUid: null };
+  }
+  try {
+    await ensureUsersTable();
+    const pool = getPool();
+    const r = await pool.query('SELECT role FROM users WHERE firebase_uid = $1', [verifyResult.decoded.uid]);
+    const isAdmin = r.rows[0]?.role === 'admin';
+    return { authenticated: true, isAdmin, firebaseUid: verifyResult.decoded.uid };
+  } catch {
+    return { authenticated: false, isAdmin: false, firebaseUid: null };
+  }
+}
+
+async function hasUserSystemAccess(pool, systemId, firebaseUid) {
+  const r = await pool.query(
+    `SELECT 1
+     FROM systems_config s
+     LEFT JOIN users u ON u.firebase_uid = $2
+     LEFT JOIN user_system_permissions usp ON usp.user_id = u.user_id AND usp.system_id = s.system_id
+     WHERE s.system_id = $1
+       AND (s.created_by_firebase_uid = $2 OR usp.permission_id IS NOT NULL)
+     LIMIT 1`,
+    [systemId, firebaseUid]
+  );
+  return Boolean(r.rows[0]);
 }
 
 /** Redact password in responses unless includePassword (e.g. for admin). */
@@ -284,12 +317,30 @@ router.post('/:id/test-webhook', async (req, res) => {
 router.get('/', async (req, res) => {
   try {
     await ensureSystemsConfigTable();
+    await ensureUserSystemPermissionsTable();
+    const auth = await getRequestAuth(req);
     const pool = getPool();
-    const result = await pool.query(
-      'SELECT system_id, system_name, system_description, database_type, database_host, database_port, database_name, database_user, database_password, database_ssl, is_active, external_base_url, api_path_slug, health_webhook_url, created_at FROM systems_config ORDER BY system_id'
-    );
-    const isAdmin = await checkIsAdmin(req);
-    const list = result.rows.map((row) => toSystemResponse(row, isAdmin));
+    const result = auth.authenticated && !auth.isAdmin
+      ? await pool.query(
+        `SELECT DISTINCT s.system_id, s.system_name, s.system_description, s.database_type, s.database_host, s.database_port,
+                s.database_name, s.database_user, s.database_password, s.database_ssl, s.is_active, s.external_base_url,
+                s.api_path_slug, s.health_webhook_url, s.created_by_firebase_uid, s.created_at
+         FROM systems_config s
+         LEFT JOIN users u ON u.firebase_uid = $1
+         LEFT JOIN user_system_permissions usp ON usp.user_id = u.user_id AND usp.system_id = s.system_id
+         WHERE s.created_by_firebase_uid = $1 OR usp.permission_id IS NOT NULL
+         ORDER BY s.system_id`,
+        [auth.firebaseUid]
+      )
+      : await pool.query(
+        `SELECT s.system_id, s.system_name, s.system_description, s.database_type, s.database_host, s.database_port,
+                s.database_name, s.database_user, s.database_password, s.database_ssl, s.is_active, s.external_base_url,
+                s.api_path_slug, s.health_webhook_url, s.created_by_firebase_uid, s.created_at, u.email AS owner_email
+         FROM systems_config s
+         LEFT JOIN users u ON u.firebase_uid = s.created_by_firebase_uid
+         ORDER BY s.system_id`
+      );
+    const list = result.rows.map((row) => toSystemResponse(row, auth.isAdmin));
     res.json({ systems: list });
   } catch (err) {
     console.error('GET /api/systems', err);
@@ -304,6 +355,11 @@ router.get('/:id/connection-test', async (req, res) => {
     return res.status(400).json({ error: 'Invalid system id' });
   }
   try {
+    const auth = await getRequestAuth(req);
+    if (auth.authenticated && !auth.isAdmin) {
+      const pool = getPool();
+      if (!(await hasUserSystemAccess(pool, id, auth.firebaseUid))) return res.status(403).json({ error: 'Not allowed for this system' });
+    }
     const result = await testSystemConnection(id);
     if (result.ok) {
       res.json({ connected: true, message: 'Database connection successful' });
@@ -323,9 +379,13 @@ router.get('/:id/routes', async (req, res) => {
     return res.status(400).json({ error: 'Invalid system id' });
   }
   try {
+    const auth = await getRequestAuth(req);
     await ensureSystemsConfigTable();
     await ensureSystemRoutesTable();
     const pool = getPool();
+    if (auth.authenticated && !auth.isAdmin) {
+      if (!(await hasUserSystemAccess(pool, id, auth.firebaseUid))) return res.status(403).json({ error: 'Not allowed for this system' });
+    }
     const result = await pool.query(
       'SELECT route_id, system_id, method, path_pattern, description, is_active, created_at FROM system_routes WHERE system_id = $1 ORDER BY path_pattern, method',
       [id]
@@ -344,18 +404,21 @@ router.get('/:id', async (req, res) => {
     return res.status(400).json({ error: 'Invalid system id' });
   }
   try {
+    const auth = await getRequestAuth(req);
     await ensureSystemsConfigTable();
     const pool = getPool();
     const result = await pool.query(
-      'SELECT system_id, system_name, system_description, database_type, database_host, database_port, database_name, database_user, database_password, database_ssl, is_active, external_base_url, api_path_slug, health_webhook_url, created_at FROM systems_config WHERE system_id = $1',
+      'SELECT system_id, system_name, system_description, database_type, database_host, database_port, database_name, database_user, database_password, database_ssl, is_active, external_base_url, api_path_slug, health_webhook_url, created_by_firebase_uid, created_at FROM systems_config WHERE system_id = $1',
       [id]
     );
     const system = result.rows[0];
     if (!system) {
       return res.status(404).json({ error: 'System not found' });
     }
-    const isAdmin = await checkIsAdmin(req);
-    res.json(toSystemResponse(system, isAdmin));
+    if (auth.authenticated && !auth.isAdmin && !(await hasUserSystemAccess(pool, id, auth.firebaseUid))) {
+      return res.status(403).json({ error: 'Not allowed for this system' });
+    }
+    res.json(toSystemResponse(system, auth.isAdmin));
   } catch (err) {
     console.error('GET /api/systems/:id', err);
     res.status(500).json({ error: 'Failed to get system' });
@@ -366,14 +429,16 @@ router.get('/:id', async (req, res) => {
 router.post('/', async (req, res) => {
   const body = req.body || {};
   try {
+    const auth = await getRequestAuth(req);
+    if (!auth.authenticated) return res.status(401).json({ error: 'Authentication required' });
     await ensureSystemsConfigTable();
     const pool = getPool();
     const result = await pool.query(
       `INSERT INTO systems_config (
         system_name, system_description, database_type, database_host, database_port,
-        database_name, database_user, database_password, database_ssl, is_active, external_base_url, api_path_slug
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-      RETURNING system_id, system_name, system_description, database_type, database_host, database_port, database_name, database_user, database_password, database_ssl, is_active, external_base_url, api_path_slug, created_at`,
+        database_name, database_user, database_password, database_ssl, is_active, external_base_url, api_path_slug, created_by_firebase_uid
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      RETURNING system_id, system_name, system_description, database_type, database_host, database_port, database_name, database_user, database_password, database_ssl, is_active, external_base_url, api_path_slug, created_by_firebase_uid, created_at`,
       [
         body.system_name ?? null,
         body.system_description ?? null,
@@ -387,9 +452,11 @@ router.post('/', async (req, res) => {
         body.is_active !== false,
         body.external_base_url ?? null,
         body.api_path_slug ?? null,
+        auth.firebaseUid,
       ]
     );
     const row = result.rows[0];
+    await upsertSystemConfigSecrets(row.system_id);
     res.status(201).json(toSystemResponse(row));
   } catch (err) {
     console.error('POST /api/systems', err);
@@ -405,8 +472,13 @@ router.put('/:id', async (req, res) => {
   }
   const body = req.body || {};
   try {
+    const auth = await getRequestAuth(req);
+    if (!auth.authenticated) return res.status(401).json({ error: 'Authentication required' });
     await ensureSystemsConfigTable();
     const pool = getPool();
+    if (!auth.isAdmin) {
+      if (!(await hasUserSystemAccess(pool, id, auth.firebaseUid))) return res.status(403).json({ error: 'Not allowed for this system' });
+    }
     const updates = [];
     const values = [];
     let i = 1;
@@ -448,13 +520,14 @@ router.put('/:id', async (req, res) => {
     values.push(id);
     const result = await pool.query(
       `UPDATE systems_config SET ${updates.join(', ')} WHERE system_id = $${i}
-       RETURNING system_id, system_name, system_description, database_type, database_host, database_port, database_name, database_user, database_password, database_ssl, is_active, external_base_url, api_path_slug, health_webhook_url, created_at`,
+       RETURNING system_id, system_name, system_description, database_type, database_host, database_port, database_name, database_user, database_password, database_ssl, is_active, external_base_url, api_path_slug, health_webhook_url, created_by_firebase_uid, created_at`,
       values
     );
     const row = result.rows[0];
     if (!row) {
       return res.status(404).json({ error: 'System not found' });
     }
+    await upsertSystemConfigSecrets(id);
     await closeSystemPool(id);
     res.json(toSystemResponse(row));
   } catch (err) {
@@ -470,9 +543,16 @@ router.delete('/:id', async (req, res) => {
     return res.status(400).json({ error: 'Invalid system id' });
   }
   try {
+    const auth = await getRequestAuth(req);
+    if (!auth.authenticated) return res.status(401).json({ error: 'Authentication required' });
     await ensureSystemsConfigTable();
     const pool = getPool();
-    const result = await pool.query('DELETE FROM systems_config WHERE system_id = $1 RETURNING system_id', [id]);
+    if (!auth.isAdmin && !(await hasUserSystemAccess(pool, id, auth.firebaseUid))) {
+      return res.status(403).json({ error: 'Not allowed for this system' });
+    }
+    const result = auth.isAdmin
+      ? await pool.query('DELETE FROM systems_config WHERE system_id = $1 RETURNING system_id', [id])
+      : await pool.query('DELETE FROM systems_config WHERE system_id = $1 RETURNING system_id', [id]);
     if (result.rowCount === 0) {
       return res.status(404).json({ error: 'System not found' });
     }

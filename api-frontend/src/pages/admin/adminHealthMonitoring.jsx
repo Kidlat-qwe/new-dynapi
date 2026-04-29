@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { Link } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
@@ -67,6 +68,7 @@ function BellIcon({ className = 'h-5 w-5 text-blue-600' }) {
 }
 
 export default function AdminHealthMonitoring() {
+  const PAGE_SIZE = 10;
   const { getToken } = useAuth();
   const [systems, setSystems] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -84,6 +86,10 @@ export default function AdminHealthMonitoring() {
   const [testingWebhook, setTestingWebhook] = useState(false);
   const [configError, setConfigError] = useState('');
   const [configSuccess, setConfigSuccess] = useState('');
+  const [openMenuId, setOpenMenuId] = useState(null);
+  const [menuAnchorRect, setMenuAnchorRect] = useState(null);
+  const [search, setSearch] = useState('');
+  const [page, setPage] = useState(1);
 
   /** @param {boolean} [background] When true, skip loading spinner and error banner (polling / post-save refresh). */
   const fetchHealth = useCallback(async (background = false) => {
@@ -109,6 +115,19 @@ export default function AdminHealthMonitoring() {
     const tid = setInterval(() => fetchHealth(true), HEALTH_AUTO_REFRESH_MS);
     return () => clearInterval(tid);
   }, [fetchHealth]);
+
+  useEffect(() => {
+    if (openMenuId === null) return;
+    const close = () => {
+      setOpenMenuId(null);
+      setMenuAnchorRect(null);
+    };
+    const t = setTimeout(() => document.addEventListener('click', close), 0);
+    return () => {
+      clearTimeout(t);
+      document.removeEventListener('click', close);
+    };
+  }, [openMenuId]);
 
   const openConfig = useCallback(async (system) => {
     setConfigSystem(system);
@@ -213,6 +232,30 @@ export default function AdminHealthMonitoring() {
       return iso;
     }
   };
+  const filteredSystems = systems.filter((s) => {
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
+    return [
+      s.system_id,
+      s.system_name,
+      s.api_path_slug,
+      s.endpoint,
+      s.status,
+      s.criticality,
+    ].some((v) => String(v ?? '').toLowerCase().includes(q));
+  });
+  const totalPages = Math.max(1, Math.ceil(filteredSystems.length / PAGE_SIZE));
+  const paginatedSystems = filteredSystems.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  useEffect(() => {
+    setPage(1);
+  }, [search, systems.length]);
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [page, totalPages]);
 
   return (
     <div className="space-y-6">
@@ -294,12 +337,20 @@ export default function AdminHealthMonitoring() {
         <CardContent>
           {loading ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
-          ) : systems.length === 0 ? (
+          ) : filteredSystems.length === 0 ? (
             <p className="text-sm text-muted-foreground">
               No systems configured. Add systems in <Link to="/admin/systems" className="text-primary underline">Systems</Link>.
             </p>
           ) : (
             <div className="overflow-x-auto rounded-lg border">
+              <div className="p-3">
+                <Input
+                  placeholder="Search systems..."
+                  className="max-w-xs"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+              </div>
               <table className="w-full text-sm" style={{ minWidth: '700px' }}>
                 <thead>
                   <tr className="border-b bg-muted/50">
@@ -312,7 +363,7 @@ export default function AdminHealthMonitoring() {
                   </tr>
                 </thead>
                 <tbody>
-                  {systems.map((s) => (
+                  {paginatedSystems.map((s) => (
                     <tr key={s.system_id} className="border-b hover:bg-muted/30">
                       <td className="p-3">
                         <div className="flex items-center gap-2">
@@ -340,35 +391,99 @@ export default function AdminHealthMonitoring() {
                       <td className="p-3 capitalize">{s.criticality || 'medium'}</td>
                       <td className="p-3 text-muted-foreground">{formatLastCheck(s.last_checked_at)}</td>
                       <td className="p-3 text-right">
-                        <div className="flex items-center justify-end gap-1">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-8 w-8 p-0"
-                            onClick={() => openConfig(s)}
-                            aria-label="Configure"
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-8 w-8 p-0"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const rect = e.currentTarget.getBoundingClientRect();
+                            if (openMenuId === s.system_id) {
+                              setOpenMenuId(null);
+                              setMenuAnchorRect(null);
+                            } else {
+                              setMenuAnchorRect(rect);
+                              setOpenMenuId(s.system_id);
+                            }
+                          }}
+                          aria-label="Actions"
+                          aria-expanded={openMenuId === s.system_id}
+                        >
+                          <svg className="h-5 w-5" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                            <circle cx="12" cy="6" r="1.5" />
+                            <circle cx="12" cy="12" r="1.5" />
+                            <circle cx="12" cy="18" r="1.5" />
+                          </svg>
+                        </Button>
+                        {openMenuId === s.system_id && menuAnchorRect && createPortal(
+                          <div
+                            className="min-w-[140px] rounded-md border border-border bg-background py-1 shadow-lg"
+                            style={{
+                              position: 'fixed',
+                              top: (window.innerHeight - menuAnchorRect.bottom < 180) ? menuAnchorRect.top : menuAnchorRect.bottom,
+                              right: window.innerWidth - menuAnchorRect.right,
+                              transform: (window.innerHeight - menuAnchorRect.bottom < 180) ? 'translateY(-100%)' : 'none',
+                              zIndex: 9999,
+                            }}
+                            onClick={(e) => e.stopPropagation()}
                           >
-                            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                            </svg>
-                          </Button>
-                        </div>
+                            <button
+                              type="button"
+                              className="block w-full px-3 py-2 text-left text-sm hover:bg-muted"
+                              onClick={() => {
+                                openConfig(s);
+                                setOpenMenuId(null);
+                                setMenuAnchorRect(null);
+                              }}
+                            >
+                              Configure
+                            </button>
+                          </div>,
+                          document.body
+                        )}
                       </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+              {filteredSystems.length > 0 && (
+                <div className="flex items-center justify-between p-3">
+                  <p className="text-sm text-muted-foreground">
+                    Page {page} of {totalPages} ({filteredSystems.length} items)
+                  </p>
+                  <div className="flex gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={page <= 1}
+                      onClick={() => setPage((p) => Math.max(1, p - 1))}
+                    >
+                      Previous
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={page >= totalPages}
+                      onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                    >
+                      Next
+                    </Button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </CardContent>
       </Card>
 
       {/* Monitoring configuration modal */}
-      {configModalOpen && configSystem && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-black/50" onClick={closeConfig} aria-hidden />
-          <Card className="relative z-10 w-full max-w-md">
+      {configModalOpen && configSystem && createPortal(
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={closeConfig} aria-hidden />
+          <Card className="relative z-10 mx-4 w-full max-w-md">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
               <CardTitle>Monitoring configuration</CardTitle>
               <Button type="button" variant="ghost" size="sm" onClick={closeConfig} aria-label="Close">
@@ -456,7 +571,8 @@ export default function AdminHealthMonitoring() {
               </form>
             </CardContent>
           </Card>
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   );

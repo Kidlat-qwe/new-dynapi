@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -6,7 +7,7 @@ import { Input } from '@/components/ui/Input';
 import { Label } from '@/components/ui/Label';
 import { fetchWithToken } from '@/lib/api';
 
-const PAGE_SIZE = 20;
+const PAGE_SIZE = 10;
 
 function formatTimestamp(ts) {
   if (!ts) return '—';
@@ -65,6 +66,9 @@ export default function AdminSystemLogs() {
   const [userEmail, setUserEmail] = useState('');
   const [systems, setSystems] = useState([]);
   const [detailLog, setDetailLog] = useState(null);
+  const [openMenuId, setOpenMenuId] = useState(null);
+  const [menuAnchorRect, setMenuAnchorRect] = useState(null);
+  const [search, setSearch] = useState('');
 
   const fetchLogs = useCallback(async () => {
     setLoading(true);
@@ -101,7 +105,32 @@ export default function AdminSystemLogs() {
     return () => { cancelled = true; };
   }, [getToken]);
 
+  useEffect(() => {
+    if (openMenuId === null) return;
+    const close = () => {
+      setOpenMenuId(null);
+      setMenuAnchorRect(null);
+    };
+    const t = setTimeout(() => document.addEventListener('click', close), 0);
+    return () => {
+      clearTimeout(t);
+      document.removeEventListener('click', close);
+    };
+  }, [openMenuId]);
+
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const filteredLogs = logs.filter((log) => {
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
+    return [
+      log.user_email,
+      log.system_name,
+      log.system_slug,
+      log.route,
+      log.method,
+      log.status_code,
+    ].some((v) => String(v ?? '').toLowerCase().includes(q));
+  });
 
   return (
     <div className="space-y-6">
@@ -147,6 +176,17 @@ export default function AdminSystemLogs() {
                 onChange={(e) => { setUserEmail(e.target.value); setPage(1); }}
               />
             </div>
+            <div className="flex items-center gap-2">
+              <Label htmlFor="filter-search" className="text-xs whitespace-nowrap">Search</Label>
+              <Input
+                id="filter-search"
+                type="text"
+                placeholder="Search logs"
+                className="h-9 w-40"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+              />
+            </div>
             <Button variant="outline" size="sm" onClick={() => fetchLogs()} disabled={loading}>
               Apply
             </Button>
@@ -155,7 +195,7 @@ export default function AdminSystemLogs() {
         <CardContent>
           {loading ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
-          ) : logs.length === 0 ? (
+          ) : filteredLogs.length === 0 ? (
             <p className="text-sm text-muted-foreground">No log entries yet. Use an external frontend with an API token to generate logs.</p>
           ) : (
             <>
@@ -174,7 +214,7 @@ export default function AdminSystemLogs() {
                     </tr>
                   </thead>
                   <tbody>
-                    {logs.map((log) => (
+                    {filteredLogs.map((log) => (
                       <tr key={log.log_id} className="border-b hover:bg-muted/30">
                         <td className="p-3 text-muted-foreground">{log.user_email || '—'}</td>
                         <td className="p-3">{log.system_name || log.system_slug || '—'}</td>
@@ -198,10 +238,53 @@ export default function AdminSystemLogs() {
                             type="button"
                             variant="ghost"
                             size="sm"
-                            onClick={() => setDetailLog(log)}
+                            className="h-8 w-8 p-0"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const rect = e.currentTarget.getBoundingClientRect();
+                              if (openMenuId === log.log_id) {
+                                setOpenMenuId(null);
+                                setMenuAnchorRect(null);
+                              } else {
+                                setMenuAnchorRect(rect);
+                                setOpenMenuId(log.log_id);
+                              }
+                            }}
+                            aria-label="Actions"
+                            aria-expanded={openMenuId === log.log_id}
                           >
-                            View details
+                            <svg className="h-5 w-5" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                              <circle cx="12" cy="6" r="1.5" />
+                              <circle cx="12" cy="12" r="1.5" />
+                              <circle cx="12" cy="18" r="1.5" />
+                            </svg>
                           </Button>
+                          {openMenuId === log.log_id && menuAnchorRect && createPortal(
+                            <div
+                              className="min-w-[140px] rounded-md border border-border bg-background py-1 shadow-lg"
+                              style={{
+                                position: 'fixed',
+                                top: (window.innerHeight - menuAnchorRect.bottom < 180) ? menuAnchorRect.top : menuAnchorRect.bottom,
+                                right: window.innerWidth - menuAnchorRect.right,
+                                transform: (window.innerHeight - menuAnchorRect.bottom < 180) ? 'translateY(-100%)' : 'none',
+                                zIndex: 9999,
+                              }}
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <button
+                                type="button"
+                                className="block w-full px-3 py-2 text-left text-sm hover:bg-muted"
+                                onClick={() => {
+                                  setDetailLog(log);
+                                  setOpenMenuId(null);
+                                  setMenuAnchorRect(null);
+                                }}
+                              >
+                                View details
+                              </button>
+                            </div>,
+                            document.body
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -238,10 +321,10 @@ export default function AdminSystemLogs() {
         </CardContent>
       </Card>
 
-      {detailLog && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-black/50" onClick={() => setDetailLog(null)} aria-hidden />
-          <Card className="relative z-10 w-full max-w-lg">
+      {detailLog && createPortal(
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={() => setDetailLog(null)} aria-hidden />
+          <Card className="relative z-10 mx-4 w-full max-w-lg">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
               <CardTitle>Log details</CardTitle>
               <Button type="button" variant="ghost" size="sm" onClick={() => setDetailLog(null)} aria-label="Close">
@@ -261,7 +344,8 @@ export default function AdminSystemLogs() {
               )}
             </CardContent>
           </Card>
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   );

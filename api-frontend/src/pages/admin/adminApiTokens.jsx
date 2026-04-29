@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { Label } from '@/components/ui/Label';
+import { ConfirmModal } from '@/components/ConfirmModal';
 import { API_BASE, fetchWithToken } from '@/lib/api';
 
 function KeyIcon({ className = 'h-5 w-5 text-blue-600' }) {
@@ -39,6 +41,7 @@ function ClockIcon({ className = 'h-5 w-5 text-orange-600' }) {
 }
 
 export default function AdminApiTokens() {
+  const PAGE_SIZE = 10;
   const { user, getToken } = useAuth();
   const [tokens, setTokens] = useState([]);
   const [systems, setSystems] = useState([]);
@@ -56,7 +59,12 @@ export default function AdminApiTokens() {
   const [form, setForm] = useState({ token_name: '', system_id: '', expiration: '' });
   const [submitting, setSubmitting] = useState(false);
   const [createdToken, setCreatedToken] = useState(null);
-  const [revokeConfirmId, setRevokeConfirmId] = useState(null);
+  const [confirmAction, setConfirmAction] = useState(null);
+  const [confirmLoading, setConfirmLoading] = useState(false);
+  const [openMenuId, setOpenMenuId] = useState(null);
+  const [menuAnchorRect, setMenuAnchorRect] = useState(null);
+  const [search, setSearch] = useState('');
+  const [page, setPage] = useState(1);
 
   const fetchTokens = useCallback(async () => {
     const idToken = await getToken(true);
@@ -93,6 +101,19 @@ export default function AdminApiTokens() {
     setError('');
     Promise.all([fetchTokens(), fetchStats()]).finally(() => setLoading(false));
   }, [user, fetchTokens, fetchStats]);
+
+  useEffect(() => {
+    if (openMenuId === null) return;
+    const close = () => {
+      setOpenMenuId(null);
+      setMenuAnchorRect(null);
+    };
+    const t = setTimeout(() => document.addEventListener('click', close), 0);
+    return () => {
+      clearTimeout(t);
+      document.removeEventListener('click', close);
+    };
+  }, [openMenuId]);
 
   const openAdd = () => {
     setForm({ token_name: '', system_id: systems[0]?.system_id ?? '', expiration: '7d' });
@@ -138,15 +159,35 @@ export default function AdminApiTokens() {
 
   const handleRevoke = async (id) => {
     setError('');
+    setConfirmLoading(true);
     try {
       const idToken = await getToken(true);
       if (!idToken) throw new Error('Not signed in');
       await fetchWithToken(`/api/admin/api-tokens/${id}`, { method: 'PATCH' }, idToken);
-      setRevokeConfirmId(null);
+      setConfirmAction(null);
       fetchTokens();
       fetchStats();
     } catch (err) {
       setError(err.message || 'Revoke failed');
+    } finally {
+      setConfirmLoading(false);
+    }
+  };
+
+  const handleDelete = async (id) => {
+    setError('');
+    setConfirmLoading(true);
+    try {
+      const idToken = await getToken(true);
+      if (!idToken) throw new Error('Not signed in');
+      await fetchWithToken(`/api/admin/api-tokens/${id}`, { method: 'DELETE' }, idToken);
+      setConfirmAction(null);
+      fetchTokens();
+      fetchStats();
+    } catch (err) {
+      setError(err.message || 'Delete failed');
+    } finally {
+      setConfirmLoading(false);
     }
   };
 
@@ -163,10 +204,39 @@ export default function AdminApiTokens() {
     }
   };
 
-  const totalTokens = stats?.total_tokens ?? tokens.length;
-  const activeTokens = stats?.active_tokens ?? tokens.filter((t) => t.is_active).length;
-  const totalRequests = stats?.total_requests ?? 0;
-  const avgResponseTimeMs = stats?.avg_response_time_ms;
+  const totalTokens = tokens.length || stats?.total_tokens || 0;
+  const activeTokens = tokens.filter((t) => t.is_active).length || stats?.active_tokens || 0;
+  const totalRequestsFromList = tokens.reduce((sum, t) => sum + Number(t.request_count || 0), 0);
+  const totalResponseFromList = tokens.reduce((sum, t) => sum + Number(t.total_response_time_ms || 0), 0);
+  const totalRequests = totalRequestsFromList || stats?.total_requests || 0;
+  const avgResponseTimeMs =
+    totalRequestsFromList > 0
+      ? Math.round(totalResponseFromList / totalRequestsFromList)
+      : (stats?.avg_response_time_ms ?? null);
+  const filteredTokens = tokens.filter((t) => {
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
+    return [
+      t.api_token_id,
+      t.token_name,
+      t.system_name,
+      t.token_prefix,
+      t.user_email,
+      t.permissions,
+    ].some((v) => String(v ?? '').toLowerCase().includes(q));
+  });
+  const totalPages = Math.max(1, Math.ceil(filteredTokens.length / PAGE_SIZE));
+  const paginatedTokens = filteredTokens.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  useEffect(() => {
+    setPage(1);
+  }, [search, tokens.length]);
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [page, totalPages]);
 
   return (
     <div className="space-y-6">
@@ -229,7 +299,7 @@ export default function AdminApiTokens() {
         <CardContent>
           {loading ? (
             <p className="text-sm text-muted-foreground">Loading...</p>
-          ) : tokens.length === 0 ? (
+          ) : filteredTokens.length === 0 ? (
             <p className="text-sm text-muted-foreground">No API tokens yet. Create one to get started.</p>
           ) : (
             <div
@@ -240,6 +310,14 @@ export default function AdminApiTokens() {
                 WebkitOverflowScrolling: 'touch',
               }}
             >
+              <div className="mb-3">
+                <Input
+                  placeholder="Search tokens..."
+                  className="max-w-xs"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+              </div>
               <table style={{ width: '100%', minWidth: '700px' }} className="text-sm">
                 <thead>
                   <tr className="border-b">
@@ -254,7 +332,7 @@ export default function AdminApiTokens() {
                   </tr>
                 </thead>
                 <tbody>
-                  {tokens.map((t) => (
+                  {paginatedTokens.map((t) => (
                     <tr key={t.api_token_id} className="border-b">
                       <td className="p-2">{t.api_token_id}</td>
                       <td className="p-2">{t.token_name || '-'}</td>
@@ -264,54 +342,128 @@ export default function AdminApiTokens() {
                       <td className="p-2">{t.is_active ? 'Yes' : 'No'}</td>
                       <td className="p-2">{formatDate(t.created_at)}</td>
                       <td className="p-2 text-right">
-                        {t.is_active ? (
-                          revokeConfirmId === t.api_token_id ? (
-                            <>
-                              <Button
-                                type="button"
-                                variant="destructive"
-                                size="sm"
-                                className="mr-1"
-                                onClick={() => handleRevoke(t.api_token_id)}
-                              >
-                                Confirm
-                              </Button>
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                onClick={() => setRevokeConfirmId(null)}
-                              >
-                                Cancel
-                              </Button>
-                            </>
-                          ) : (
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => setRevokeConfirmId(t.api_token_id)}
-                            >
-                              Revoke
-                            </Button>
-                          )
-                        ) : (
-                          <span className="text-muted-foreground">Revoked</span>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-8 w-8 p-0"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const rect = e.currentTarget.getBoundingClientRect();
+                            if (openMenuId === t.api_token_id) {
+                              setOpenMenuId(null);
+                              setMenuAnchorRect(null);
+                            } else {
+                              setMenuAnchorRect(rect);
+                              setOpenMenuId(t.api_token_id);
+                            }
+                          }}
+                          aria-label="Actions"
+                          aria-expanded={openMenuId === t.api_token_id}
+                        >
+                          <svg className="h-5 w-5" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                            <circle cx="12" cy="6" r="1.5" />
+                            <circle cx="12" cy="12" r="1.5" />
+                            <circle cx="12" cy="18" r="1.5" />
+                          </svg>
+                        </Button>
+                        {openMenuId === t.api_token_id && menuAnchorRect && createPortal(
+                          <div
+                            className="min-w-[150px] rounded-md border border-border bg-background py-1 shadow-lg"
+                            style={{
+                              position: 'fixed',
+                              top: (window.innerHeight - menuAnchorRect.bottom < 220) ? menuAnchorRect.top : menuAnchorRect.bottom,
+                              right: window.innerWidth - menuAnchorRect.right,
+                              transform: (window.innerHeight - menuAnchorRect.bottom < 220) ? 'translateY(-100%)' : 'none',
+                              zIndex: 9999,
+                            }}
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            {!t.is_active ? (
+                              <>
+                                <div className="px-3 py-2 text-sm text-muted-foreground">Revoked</div>
+                                <button
+                                  type="button"
+                                  className="block w-full px-3 py-2 text-left text-sm text-destructive hover:bg-muted"
+                                  onClick={() => {
+                                    setConfirmAction({ type: 'delete', id: t.api_token_id });
+                                    setOpenMenuId(null);
+                                    setMenuAnchorRect(null);
+                                  }}
+                                >
+                                  Delete
+                                </button>
+                              </>
+                            ) : (
+                              <>
+                                <button
+                                  type="button"
+                                  className="block w-full px-3 py-2 text-left text-sm text-destructive hover:bg-muted"
+                                  onClick={() => {
+                                    setConfirmAction({ type: 'revoke', id: t.api_token_id });
+                                    setOpenMenuId(null);
+                                    setMenuAnchorRect(null);
+                                  }}
+                                >
+                                  Revoke
+                                </button>
+                                <button
+                                  type="button"
+                                  className="block w-full px-3 py-2 text-left text-sm text-destructive hover:bg-muted"
+                                  onClick={() => {
+                                    setConfirmAction({ type: 'delete', id: t.api_token_id });
+                                    setOpenMenuId(null);
+                                    setMenuAnchorRect(null);
+                                  }}
+                                >
+                                  Delete
+                                </button>
+                              </>
+                            )}
+                          </div>,
+                          document.body
                         )}
                       </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+              {filteredTokens.length > 0 && (
+                <div className="mt-4 flex items-center justify-between">
+                  <p className="text-sm text-muted-foreground">
+                    Page {page} of {totalPages} ({filteredTokens.length} items)
+                  </p>
+                  <div className="flex gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={page <= 1}
+                      onClick={() => setPage((p) => Math.max(1, p - 1))}
+                    >
+                      Previous
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={page >= totalPages}
+                      onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                    >
+                      Next
+                    </Button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </CardContent>
       </Card>
 
-      {modalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-black/50" onClick={closeModal} aria-hidden />
-          <Card className="relative z-10 max-h-[90vh] w-full max-w-lg overflow-y-auto">
+      {modalOpen && createPortal(
+        <div className="fixed inset-0 z-[100] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={closeModal} aria-hidden />
+          <Card className="relative z-10 mx-4 max-h-[90vh] w-full max-w-lg overflow-y-auto">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
               <CardTitle>{createdToken ? 'Token created' : 'Create API token'}</CardTitle>
               <Button type="button" variant="ghost" size="sm" onClick={closeModal} aria-label="Close">
@@ -406,8 +558,26 @@ export default function AdminApiTokens() {
               )}
             </CardContent>
           </Card>
-        </div>
+        </div>,
+        document.body
       )}
+      <ConfirmModal
+        open={Boolean(confirmAction)}
+        title={confirmAction?.type === 'delete' ? 'Delete API token' : 'Revoke API token'}
+        message={
+          confirmAction?.type === 'delete'
+            ? 'Are you sure you want to permanently delete this API token?'
+            : 'Are you sure you want to revoke this API token?'
+        }
+        confirmText={confirmAction?.type === 'delete' ? 'Delete' : 'Revoke'}
+        onCancel={() => setConfirmAction(null)}
+        onConfirm={() => {
+          if (!confirmAction) return;
+          if (confirmAction.type === 'delete') return handleDelete(confirmAction.id);
+          return handleRevoke(confirmAction.id);
+        }}
+        loading={confirmLoading}
+      />
     </div>
   );
 }

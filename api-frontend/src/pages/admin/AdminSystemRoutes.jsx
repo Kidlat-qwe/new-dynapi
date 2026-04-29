@@ -6,6 +6,7 @@ import { API_BASE, fetchWithToken } from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
 
 export default function AdminSystemRoutes() {
+  const PAGE_SIZE = 10;
   const { id } = useParams();
   const navigate = useNavigate();
   const { getToken } = useAuth();
@@ -13,6 +14,8 @@ export default function AdminSystemRoutes() {
   const [routes, setRoutes] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [showConfigValues, setShowConfigValues] = useState(false);
+  const [page, setPage] = useState(1);
 
   useEffect(() => {
     if (!id) return;
@@ -40,6 +43,22 @@ export default function AdminSystemRoutes() {
   }, [id, getToken]);
 
   const basePath = system?.api_path_slug ? `/api/${system.api_path_slug}` : null;
+  const totalPages = Math.max(1, Math.ceil(routes.length / PAGE_SIZE));
+  const paginatedRoutes = routes.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  const maskConfigValue = (value) => {
+    if (value === null || value === undefined || value === '') return '–';
+    return showConfigValues ? String(value) : '********';
+  };
+
+  useEffect(() => {
+    setPage(1);
+  }, [id, routes.length]);
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [page, totalPages]);
 
   return (
     <div className="space-y-6">
@@ -73,7 +92,17 @@ export default function AdminSystemRoutes() {
       {system && (
         <Card>
           <CardHeader>
-            <CardTitle>Database config</CardTitle>
+            <div className="flex items-center justify-between gap-2">
+              <CardTitle>Database config</CardTitle>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setShowConfigValues((v) => !v)}
+              >
+                {showConfigValues ? 'Hide values' : 'Show values'}
+              </Button>
+            </div>
             {system.system_description && (
               <p className="text-sm text-muted-foreground">{system.system_description}</p>
             )}
@@ -82,7 +111,7 @@ export default function AdminSystemRoutes() {
             <dl className="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-3">
               <div>
                 <dt className="font-medium text-muted-foreground">DB type</dt>
-                <dd className="mt-0.5 font-mono">{system.database_type || '–'}</dd>
+                <dd className="mt-0.5 font-mono">{maskConfigValue(system.database_type)}</dd>
               </div>
               <div>
                 <dt className="font-medium text-muted-foreground">Host</dt>
@@ -90,25 +119,25 @@ export default function AdminSystemRoutes() {
               </div>
               <div>
                 <dt className="font-medium text-muted-foreground">Port</dt>
-                <dd className="mt-0.5 font-mono">{system.database_port != null ? system.database_port : '–'}</dd>
+                <dd className="mt-0.5 font-mono">{maskConfigValue(system.database_port)}</dd>
               </div>
               <div>
                 <dt className="font-medium text-muted-foreground">Database name</dt>
-                <dd className="mt-0.5 font-mono">{system.database_name || '–'}</dd>
+                <dd className="mt-0.5 font-mono">{maskConfigValue(system.database_name)}</dd>
               </div>
               <div>
                 <dt className="font-medium text-muted-foreground">User</dt>
-                <dd className="mt-0.5 font-mono">{system.database_user || '–'}</dd>
+                <dd className="mt-0.5 font-mono">{maskConfigValue(system.database_user)}</dd>
               </div>
               <div>
                 <dt className="font-medium text-muted-foreground">Password</dt>
                 <dd className="mt-0.5 font-mono">
-                  {system.database_password === '[REDACTED]' ? '••••••••' : (system.database_password || '–')}
+                  {maskConfigValue(system.database_password === '[REDACTED]' ? '' : system.database_password)}
                 </dd>
               </div>
               <div>
                 <dt className="font-medium text-muted-foreground">SSL</dt>
-                <dd className="mt-0.5">{system.database_ssl ? 'Yes' : 'No'}</dd>
+                <dd className="mt-0.5">{maskConfigValue(system.database_ssl ? 'Yes' : 'No')}</dd>
               </div>
               <div>
                 <dt className="font-medium text-muted-foreground">Active</dt>
@@ -146,7 +175,7 @@ export default function AdminSystemRoutes() {
                   </tr>
                 </thead>
                 <tbody>
-                  {routes.map((r) => (
+                  {paginatedRoutes.map((r) => (
                     <tr key={r.route_id} className="border-b">
                       <td className="p-2">
                         <span className="rounded bg-muted px-1.5 py-0.5 font-medium">{r.method || '-'}</span>
@@ -158,6 +187,33 @@ export default function AdminSystemRoutes() {
                   ))}
                 </tbody>
               </table>
+              {routes.length > 0 && (
+                <div className="mt-4 flex items-center justify-between">
+                  <p className="text-sm text-muted-foreground">
+                    Page {page} of {totalPages} ({routes.length} items)
+                  </p>
+                  <div className="flex gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={page <= 1}
+                      onClick={() => setPage((p) => Math.max(1, p - 1))}
+                    >
+                      Previous
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={page >= totalPages}
+                      onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                    >
+                      Next
+                    </Button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </CardContent>

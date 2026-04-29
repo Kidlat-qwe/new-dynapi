@@ -106,6 +106,7 @@ const SYSTEMS_CONFIG_TABLE_SQL = `
     is_active BOOLEAN DEFAULT TRUE,
     external_base_url VARCHAR(512),
     api_path_slug VARCHAR(64) UNIQUE,
+    created_by_firebase_uid VARCHAR(128),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
 `;
@@ -153,12 +154,43 @@ const SYSTEM_REQUEST_LOG_INDEX_SQL = `
   CREATE INDEX IF NOT EXISTS idx_system_request_log_system_slug ON system_request_log(system_slug);
 `;
 
+const SYSTEM_SECRETS_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS system_secrets (
+    secret_id SERIAL PRIMARY KEY,
+    system_id INT NOT NULL REFERENCES systems_config(system_id) ON DELETE CASCADE,
+    secret_key VARCHAR(255) NOT NULL,
+    secret_value TEXT,
+    description TEXT,
+    expires_at TIMESTAMP,
+    is_seeded_from_config BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(system_id, secret_key)
+  );
+`;
+const SYSTEM_SECRETS_INDEX_SQL = `
+  CREATE INDEX IF NOT EXISTS idx_system_secrets_system_id ON system_secrets(system_id);
+  CREATE INDEX IF NOT EXISTS idx_system_secrets_key ON system_secrets(secret_key);
+`;
+
+const USER_SYSTEM_PERMISSIONS_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS user_system_permissions (
+    permission_id SERIAL PRIMARY KEY,
+    user_id INT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    system_id INT NOT NULL REFERENCES systems_config(system_id) ON DELETE CASCADE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, system_id)
+  );
+`;
+
 let usersTableEnsured = false;
 let apiTokenTableEnsured = false;
 let systemsConfigTableEnsured = false;
 let systemRoutesTableEnsured = false;
 let systemMonitoringConfigTableEnsured = false;
 let systemRequestLogTableEnsured = false;
+let systemSecretsTableEnsured = false;
+let userSystemPermissionsTableEnsured = false;
 
 /**
  * Ensure users table exists (idempotent). Call before user sync/me.
@@ -244,6 +276,16 @@ export async function ensureSystemsConfigTable() {
       EXCEPTION WHEN duplicate_column THEN NULL;
       END $$;
     `);
+    await client.query(`
+      DO $$ BEGIN
+        ALTER TABLE systems_config ADD COLUMN created_by_firebase_uid VARCHAR(128);
+      EXCEPTION WHEN duplicate_column THEN NULL;
+      END $$;
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_systems_config_created_by_uid
+      ON systems_config(created_by_firebase_uid);
+    `);
     systemsConfigTableEnsured = true;
   } finally {
     client.release();
@@ -288,6 +330,40 @@ export async function ensureSystemRequestLogTable() {
     await client.query(SYSTEM_REQUEST_LOG_TABLE_SQL);
     await client.query(SYSTEM_REQUEST_LOG_INDEX_SQL);
     systemRequestLogTableEnsured = true;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Ensure system_secrets table exists (for Secrets page).
+ */
+export async function ensureSystemSecretsTable() {
+  if (systemSecretsTableEnsured) return;
+  await ensureSystemsConfigTable();
+  const client = await getPool().connect();
+  try {
+    await client.query(SYSTEM_SECRETS_TABLE_SQL);
+    await client.query(SYSTEM_SECRETS_INDEX_SQL);
+    systemSecretsTableEnsured = true;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Ensure user-system permissions table exists.
+ */
+export async function ensureUserSystemPermissionsTable() {
+  if (userSystemPermissionsTableEnsured) return;
+  await ensureUsersTable();
+  await ensureSystemsConfigTable();
+  const client = await getPool().connect();
+  try {
+    await client.query(USER_SYSTEM_PERMISSIONS_TABLE_SQL);
+    await client.query('CREATE INDEX IF NOT EXISTS idx_user_system_permissions_user_id ON user_system_permissions(user_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_user_system_permissions_system_id ON user_system_permissions(system_id)');
+    userSystemPermissionsTableEnsured = true;
   } finally {
     client.release();
   }

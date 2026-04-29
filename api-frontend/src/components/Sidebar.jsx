@@ -11,11 +11,14 @@ const NAV_ITEMS = {
     { to: '/admin/health', label: 'Health monitoring' },
     { to: '/admin/users', label: 'Manage users' },
     { to: '/admin/api-tokens', label: 'API tokens' },
+    { to: '/admin/secrets', label: 'Secrets' },
     { to: '/admin/system-logs', label: 'System logs' },
   ],
   user: [
     { to: '/user', label: 'Dashboard' },
     { to: '/user/systems', label: 'My Systems' },
+    { to: '/user/secrets', label: 'Secrets' },
+    { to: '/user/api-tokens', label: 'API tokens' },
   ],
 };
 

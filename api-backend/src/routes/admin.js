@@ -5,10 +5,19 @@
 
 import { Router } from 'express';
 import crypto from 'crypto';
-import { getPool, ensureUsersTable, ensureApiTokenTable, ensureSystemsConfigTable, ensureSystemRequestLogTable } from '../config/db.js';
-import { verifyIdToken } from '../config/firebaseAdmin.js';
+import { getPool, ensureUsersTable, ensureApiTokenTable, ensureSystemsConfigTable, ensureSystemRequestLogTable, ensureUserSystemPermissionsTable } from '../config/db.js';
+import { admin, verifyIdToken, initializeFirebaseAdmin } from '../config/firebaseAdmin.js';
 
 const router = Router();
+async function syncUserSystemPermissions(pool, userId, systemIds = []) {
+  await pool.query('DELETE FROM user_system_permissions WHERE user_id = $1', [userId]);
+  for (const sid of systemIds) {
+    await pool.query(
+      'INSERT INTO user_system_permissions (user_id, system_id) VALUES ($1, $2) ON CONFLICT (user_id, system_id) DO NOTHING',
+      [userId, sid]
+    );
+  }
+}
 
 function getIdToken(req) {
   const auth = req.headers.authorization;
@@ -57,8 +66,21 @@ async function requireAdmin(req, res, next) {
 router.get('/users', requireAdmin, async (req, res) => {
   const pool = getPool();
   try {
+    await ensureSystemsConfigTable();
+    await ensureUserSystemPermissionsTable();
     const result = await pool.query(
-      'SELECT user_id, email, fname, lname, role, firebase_uid, last_login, is_active, created_at FROM users ORDER BY created_at DESC'
+      `SELECT u.user_id, u.email, u.fname, u.lname, u.role, u.firebase_uid, u.last_login, u.is_active, u.created_at,
+              COALESCE(
+                json_agg(
+                  json_build_object('system_id', s.system_id, 'system_name', s.system_name)
+                ) FILTER (WHERE s.system_id IS NOT NULL),
+                '[]'::json
+              ) AS system_permissions
+       FROM users u
+       LEFT JOIN user_system_permissions usp ON usp.user_id = u.user_id
+       LEFT JOIN systems_config s ON s.system_id = usp.system_id
+       GROUP BY u.user_id
+       ORDER BY u.created_at DESC`
     );
     res.json({ users: result.rows });
   } catch (err) {
@@ -67,14 +89,100 @@ router.get('/users', requireAdmin, async (req, res) => {
   }
 });
 
-/** PATCH /api/admin/users/:id — update user role or is_active */
+/** POST /api/admin/users — create a user row */
+router.post('/users', requireAdmin, async (req, res) => {
+  const { email, fname, lname, role, is_active, password, system_permissions } = req.body || {};
+  const normalizedEmail = String(email || '').trim();
+  const normalizedRole = String(role || 'user').trim() || 'user';
+  if (!normalizedEmail) return res.status(400).json({ error: 'email is required' });
+  if (!['admin', 'user'].includes(normalizedRole)) {
+    return res.status(400).json({ error: 'role must be admin or user' });
+  }
+  initializeFirebaseAdmin();
+  if (!admin.apps.length) {
+    return res.status(503).json({ error: 'Firebase Admin not configured' });
+  }
+  let normalizedUid = '';
+  let createdFirebaseUser = false;
+  try {
+    const fbUser = await admin.auth().getUserByEmail(normalizedEmail);
+    normalizedUid = fbUser.uid;
+  } catch {
+    const normalizedPassword = String(password || '').trim();
+    if (!normalizedPassword || normalizedPassword.length < 6) {
+      return res.status(400).json({ error: 'Password (min 6 chars) is required for new Firebase account' });
+    }
+    try {
+      const created = await admin.auth().createUser({
+        email: normalizedEmail,
+        password: normalizedPassword,
+        disabled: is_active !== undefined ? !Boolean(is_active) : false,
+      });
+      normalizedUid = created.uid;
+      createdFirebaseUser = true;
+    } catch (firebaseCreateErr) {
+      console.error('admin/create user firebase', firebaseCreateErr);
+      return res.status(400).json({ error: 'Failed to create Firebase account' });
+    }
+  }
+  const pool = getPool();
+  try {
+    await ensureSystemsConfigTable();
+    await ensureUserSystemPermissionsTable();
+    const result = await pool.query(
+      `INSERT INTO users (email, fname, lname, role, firebase_uid, is_active, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+       RETURNING user_id, email, fname, lname, role, firebase_uid, last_login, is_active, created_at`,
+      [
+        normalizedEmail,
+        fname != null ? String(fname).trim() : null,
+        lname != null ? String(lname).trim() : null,
+        normalizedRole,
+        normalizedUid,
+        is_active !== undefined ? Boolean(is_active) : true,
+      ]
+    );
+    const createdUser = result.rows[0];
+    const permissionIds = Array.isArray(system_permissions)
+      ? [...new Set(system_permissions.map((v) => Number(v)).filter((n) => !Number.isNaN(n)))]
+      : [];
+    if (permissionIds.length) {
+      const validSystems = await pool.query(
+        'SELECT system_id FROM systems_config WHERE system_id = ANY($1::int[])',
+        [permissionIds]
+      );
+      await syncUserSystemPermissions(pool, createdUser.user_id, validSystems.rows.map((r) => r.system_id));
+    }
+    res.status(201).json({ ...createdUser, created_firebase_user: createdFirebaseUser });
+  } catch (err) {
+    if (err?.code === '23505') {
+      return res.status(409).json({ error: 'email or firebase_uid already exists' });
+    }
+    console.error('admin/create user', err);
+    res.status(500).json({ error: 'Failed to create user' });
+  }
+});
+
+/** PATCH /api/admin/users/:id — update user profile/role/status/permissions */
 router.patch('/users/:id', requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid user id' });
-  const { role, is_active } = req.body || {};
+  const { email, fname, lname, role, is_active, password, system_permissions } = req.body || {};
   const updates = [];
   const values = [];
   let i = 1;
+  if (email !== undefined) {
+    updates.push(`email = $${i++}`);
+    values.push(email ? String(email).trim() : null);
+  }
+  if (fname !== undefined) {
+    updates.push(`fname = $${i++}`);
+    values.push(fname != null ? String(fname).trim() : null);
+  }
+  if (lname !== undefined) {
+    updates.push(`lname = $${i++}`);
+    values.push(lname != null ? String(lname).trim() : null);
+  }
   if (role !== undefined) {
     updates.push(`role = $${i++}`);
     values.push(role);
@@ -83,22 +191,70 @@ router.patch('/users/:id', requireAdmin, async (req, res) => {
     updates.push(`is_active = $${i++}`);
     values.push(Boolean(is_active));
   }
-  if (updates.length === 0) {
-    return res.status(400).json({ error: 'Provide role and/or is_active' });
+  if (updates.length === 0 && system_permissions === undefined && !password) {
+    return res.status(400).json({ error: 'No fields to update' });
   }
   values.push(id);
   const pool = getPool();
   try {
-    const result = await pool.query(
-      `UPDATE users SET ${updates.join(', ')} WHERE user_id = $${i} RETURNING user_id, email, fname, lname, role, firebase_uid, last_login, is_active, created_at`,
-      values
-    );
-    const row = result.rows[0];
+    await ensureUserSystemPermissionsTable();
+    let row;
+    if (updates.length > 0) {
+      const result = await pool.query(
+        `UPDATE users SET ${updates.join(', ')} WHERE user_id = $${i} RETURNING user_id, email, fname, lname, role, firebase_uid, last_login, is_active, created_at`,
+        values
+      );
+      row = result.rows[0];
+    } else {
+      const existing = await pool.query(
+        'SELECT user_id, email, fname, lname, role, firebase_uid, last_login, is_active, created_at FROM users WHERE user_id = $1',
+        [id]
+      );
+      row = existing.rows[0];
+    }
     if (!row) return res.status(404).json({ error: 'User not found' });
+    initializeFirebaseAdmin();
+    if (admin.apps.length) {
+      const fbUpdate = {};
+      if (email !== undefined && row.email) fbUpdate.email = row.email;
+      if (password && String(password).trim().length >= 6) fbUpdate.password = String(password).trim();
+      if (Object.keys(fbUpdate).length) {
+        await admin.auth().updateUser(row.firebase_uid, fbUpdate);
+      }
+    }
+    if (system_permissions !== undefined) {
+      const permissionIds = Array.isArray(system_permissions)
+        ? [...new Set(system_permissions.map((v) => Number(v)).filter((n) => !Number.isNaN(n)))]
+        : [];
+      const validSystems = permissionIds.length
+        ? await pool.query('SELECT system_id FROM systems_config WHERE system_id = ANY($1::int[])', [permissionIds])
+        : { rows: [] };
+      await syncUserSystemPermissions(pool, row.user_id, validSystems.rows.map((r) => r.system_id));
+    }
     res.json(row);
   } catch (err) {
     console.error('admin/patch user', err);
     res.status(500).json({ error: 'Failed to update user' });
+  }
+});
+
+/** DELETE /api/admin/users/:id — remove user and related permissions */
+router.delete('/users/:id', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid user id' });
+  const pool = getPool();
+  try {
+    const existing = await pool.query('SELECT firebase_uid FROM users WHERE user_id = $1', [id]);
+    if (!existing.rows[0]) return res.status(404).json({ error: 'User not found' });
+    await pool.query('DELETE FROM users WHERE user_id = $1', [id]);
+    initializeFirebaseAdmin();
+    if (admin.apps.length) {
+      await admin.auth().deleteUser(existing.rows[0].firebase_uid).catch(() => {});
+    }
+    res.json({ deleted: true, user_id: id });
+  } catch (err) {
+    console.error('admin/delete user', err);
+    res.status(500).json({ error: 'Failed to delete user' });
   }
 });
 
@@ -192,8 +348,10 @@ router.get('/dashboard-stats', requireAdmin, async (req, res) => {
         [fromStr]
       ),
       pool.query(
-        `SELECT COUNT(DISTINCT COALESCE(NULLIF(TRIM(user_email), ''), 'anonymous'))::int AS cnt
-         FROM system_request_log WHERE created_at >= $1::timestamp`,
+        `SELECT COUNT(DISTINCT TRIM(user_email))::int AS cnt
+         FROM system_request_log
+         WHERE created_at >= $1::timestamp
+           AND NULLIF(TRIM(user_email), '') IS NOT NULL`,
         [fromStr]
       ),
       pool.query(
@@ -224,7 +382,7 @@ router.get('/dashboard-stats', requireAdmin, async (req, res) => {
       ),
       pool.query(
         `SELECT DATE(created_at) AS date,
-          COUNT(DISTINCT COALESCE(NULLIF(TRIM(user_email), ''), 'anonymous'))::int AS active_users,
+          COUNT(DISTINCT TRIM(user_email)) FILTER (WHERE NULLIF(TRIM(user_email), '') IS NOT NULL)::int AS active_users,
           COUNT(*)::int AS total_requests
          FROM system_request_log WHERE created_at >= $1::timestamp
          GROUP BY DATE(created_at) ORDER BY date`,
@@ -327,6 +485,8 @@ router.get('/api-tokens', requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT t.api_token_id, t.firebase_uid, t.token_name, t.token_prefix, t.permissions, t.expires_at, t.last_used_at, t.is_active, t.created_at,
+        COALESCE(t.request_count, 0)::bigint AS request_count,
+        COALESCE(t.total_response_time_ms, 0)::bigint AS total_response_time_ms,
         u.email AS user_email,
         s.system_name AS system_name
        FROM api_token t
@@ -421,6 +581,25 @@ router.patch('/api-tokens/:id', requireAdmin, async (req, res) => {
   } catch (err) {
     console.error('admin/revoke token', err);
     res.status(500).json({ error: 'Failed to revoke token' });
+  }
+});
+
+/** DELETE /api/admin/api-tokens/:id — permanently delete token */
+router.delete('/api-tokens/:id', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid token id' });
+  const pool = getPool();
+  try {
+    const result = await pool.query(
+      'DELETE FROM api_token WHERE api_token_id = $1 RETURNING api_token_id',
+      [id]
+    );
+    const row = result.rows[0];
+    if (!row) return res.status(404).json({ error: 'Token not found' });
+    res.json({ deleted: true, api_token_id: row.api_token_id });
+  } catch (err) {
+    console.error('admin/delete token', err);
+    res.status(500).json({ error: 'Failed to delete token' });
   }
 });
 

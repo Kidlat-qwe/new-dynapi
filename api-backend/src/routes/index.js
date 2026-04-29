@@ -8,6 +8,7 @@ import systemsRoutes from './systems.js';
 import externalRoutes from './external.js';
 import usersRoutes from './users.js';
 import adminRoutes from './admin.js';
+import secretsRoutes from './secrets.js';
 
 const API_PREFIX = '/api';
 
@@ -21,6 +22,7 @@ export function mountRoutes(app) {
   app.use(`${API_PREFIX}/external`, externalRoutes);
   app.use(`${API_PREFIX}/users`, usersRoutes);
   app.use(`${API_PREFIX}/admin`, adminRoutes);
+  app.use(`${API_PREFIX}/secrets`, secretsRoutes);
 
   app.get('/', (req, res) => {
     res.json({
@@ -32,6 +34,7 @@ export function mountRoutes(app) {
         `${API_PREFIX}/external`,
         `${API_PREFIX}/users`,
         `${API_PREFIX}/admin`,
+        `${API_PREFIX}/secrets`,
         `${API_PREFIX}/funtalk`,
         `${API_PREFIX}/grading`,
         `${API_PREFIX}/cms`,
