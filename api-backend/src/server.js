@@ -46,22 +46,35 @@ try {
 // Funtalk mount will reuse this app when loaded in-process.
 initializeFirebaseAdmin();
 
+/**
+ * Mount failures must not exit the process (e.g. DB timeout during ensureSystemsConfigTable);
+ * the main API can still start once Postgres is reachable again after retry.
+ */
+async function safeMount(label, mountFn) {
+  try {
+    return await mountFn();
+  } catch (err) {
+    console.error(`${label} mount failed:`, err.message || err);
+    return false;
+  }
+}
+
 // Optional API token for /api/funtalk: accept sk_xxx or pass through so Funtalk can validate JWT (Firebase login)
 app.use('/api/funtalk', optionalApiTokenForSystem('funtalk'));
 // Mount Funtalk at /api/funtalk (same process, one port; DB from systems_config)
-const mountedFuntalk = await mountFuntalk(app);
+const mountedFuntalk = await safeMount('Funtalk', () => mountFuntalk(app));
 
 // Require API token for /api/grading (system-scoped)
 app.use('/api/grading', requireApiTokenForSystem('grading'));
 // Mount Grading at /api/grading (same process, one port; DB from systems_config)
-const mountedGrading = await mountGrading(app);
+const mountedGrading = await safeMount('Grading', () => mountGrading(app));
 
 // Optional API token for /api/cms: accept sk_xxx OR pass Firebase ID tokens through for CMS frontend login
 app.use('/api/cms', optionalApiTokenForSystem('cms'));
 // Alias: CMS frontend currently targets /api/sms
 app.use('/api/sms', optionalApiTokenForSystem('cms'));
 // Mount CMS at /api/cms (same process, one port; DB from systems_config)
-const mountedCms = await mountCms(app);
+const mountedCms = await safeMount('CMS', () => mountCms(app));
 
 app.listen(PORT, () => {
   const origin = `http://localhost:${PORT}`;

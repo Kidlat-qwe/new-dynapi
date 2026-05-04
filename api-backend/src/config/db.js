@@ -22,6 +22,28 @@ const useSSL =
       ? false
       : useSslForHost(dbHost);
 
+function isLocalPostgresHost(host) {
+  const h = String(host || '').toLowerCase();
+  return (
+    h === '' ||
+    h === 'localhost' ||
+    h === '127.0.0.1' ||
+    h === '::1' ||
+    h.startsWith('192.168.') ||
+    h.startsWith('10.') ||
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(h)
+  );
+}
+
+/** Cloud DB first connections (e.g. Neon wake) often exceed 5s; override with DB_CONNECTION_TIMEOUT_MS. */
+const connectionTimeoutMillis = (() => {
+  if (process.env.DB_CONNECTION_TIMEOUT_MS != null && process.env.DB_CONNECTION_TIMEOUT_MS !== '') {
+    const n = Number(process.env.DB_CONNECTION_TIMEOUT_MS);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return isLocalPostgresHost(dbHost) ? 5000 : 30000;
+})();
+
 const dbConfig = {
   host: dbHost,
   port: Number(process.env.DB_PORT) || 5432,
@@ -30,7 +52,8 @@ const dbConfig = {
   password: String(process.env.DB_PASSWORD ?? ''),
   max: 10,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
+  connectionTimeoutMillis,
+  keepAlive: true,
   ssl: useSSL ? { rejectUnauthorized: false } : false,
 };
 

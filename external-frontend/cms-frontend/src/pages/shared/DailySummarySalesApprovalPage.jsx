@@ -14,6 +14,52 @@ const TAB_END_OF_SHIFT = 'endOfShift';
 const TAB_CASH_DEPOSIT = 'cashDeposit';
 const PIE_COLORS = ['#16A34A', '#2563EB', '#F59E0B', '#A855F7', '#EF4444', '#14B8A6', '#6366F1', '#EC4899'];
 
+/** Superadmin/Finance "reject" stores Returned (legacy rows may still be Rejected until migrated). */
+const isFinanceReturnedSummaryStatus = (s) => s === 'Returned' || s === 'Rejected';
+
+/** Normalize GET /daily-summary-sales/:id/payments (object with payments + AR + totals). */
+const parseDailySummaryPaymentsResponse = (res) => {
+  const d = res?.data;
+  if (d && typeof d === 'object' && !Array.isArray(d) && Array.isArray(d.payments)) {
+    return {
+      payments: d.payments || [],
+      arReceipts: d.ar_receipts || [],
+      totals: d.totals || null,
+      submittedSnapshot: d.submitted_snapshot || null,
+    };
+  }
+  if (Array.isArray(d)) {
+    return {
+      payments: d,
+      arReceipts: [],
+      totals: null,
+      submittedSnapshot: null,
+    };
+  }
+  return {
+    payments: [],
+    arReceipts: [],
+    totals: null,
+    submittedSnapshot: null,
+  };
+};
+
+/** Normalize GET /cash-deposit-summaries/:id/payments (payments + live totals + submitted snapshot). */
+const parseCashDepositPaymentsResponse = (res) => {
+  const d = res?.data;
+  if (d && typeof d === 'object' && !Array.isArray(d) && Array.isArray(d.payments)) {
+    return {
+      payments: d.payments || [],
+      totals: d.totals || null,
+      submittedSnapshot: d.submitted_snapshot || null,
+    };
+  }
+  if (Array.isArray(d)) {
+    return { payments: d, totals: null, submittedSnapshot: null };
+  }
+  return { payments: [], totals: null, submittedSnapshot: null };
+};
+
 const DailySummarySalesApprovalPage = () => {
   const location = useLocation();
   const { userInfo } = useAuth();
@@ -64,12 +110,10 @@ const DailySummarySalesApprovalPage = () => {
     if (!id) return null;
     if (isCashDepositTab) {
       const res = await apiRequest(`/cash-deposit-summaries/${id}/payments`);
-      return res?.data || null;
+      return parseCashDepositPaymentsResponse(res);
     }
     const res = await apiRequest(`/daily-summary-sales/${id}/payments`);
-    return {
-      payments: Array.isArray(res?.data) ? res.data : [],
-    };
+    return parseDailySummaryPaymentsResponse(res);
   }, [isCashDepositTab]);
 
   const fetchRecords = useCallback(async (page = 1) => {
@@ -280,11 +324,16 @@ const DailySummarySalesApprovalPage = () => {
     const classes = {
       Submitted: 'bg-yellow-100 text-yellow-800',
       Approved: 'bg-green-100 text-green-800',
+      Returned: 'bg-amber-100 text-amber-800',
       Rejected: 'bg-amber-100 text-amber-800',
     };
-    const label = status === 'Approved' ? 'Verified' : status === 'Rejected' ? 'Flagged' : status;
+    const key = isFinanceReturnedSummaryStatus(status) ? 'Returned' : status;
+    const label =
+      status === 'Approved' ? 'Verified' : isFinanceReturnedSummaryStatus(status) ? 'Returned' : status;
     return (
-      <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${classes[status] || 'bg-gray-100 text-gray-800'}`}>
+      <span
+        className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${classes[key] || classes[status] || 'bg-gray-100 text-gray-800'}`}
+      >
         {label}
       </span>
     );
@@ -299,42 +348,142 @@ const DailySummarySalesApprovalPage = () => {
     setOpenMenuId((prev) => (prev === id ? null : id));
   };
 
+  /** Returned / legacy Rejected rows are not “verified approved”; also clears misleading approved_by from old data. */
+  const summaryVerificationActorLabel = (record) => {
+    if (!record) return '—';
+    if (isFinanceReturnedSummaryStatus(record.status)) return '—';
+    return record.approved_by_name || '—';
+  };
+
+  /**
+   * List uses stored total_amount / payment_count only (API does not send live_grand_*).
+   */
+  const endOfShiftListAmount = (record) => {
+    if (record?.live_grand_total != null && Number.isFinite(Number(record.live_grand_total))) {
+      return Number(record.live_grand_total);
+    }
+    return Number(record?.total_amount ?? 0);
+  };
+
+  const endOfShiftListPaymentCount = (record) => {
+    if (record?.live_grand_count != null && Number.isFinite(Number(record.live_grand_count))) {
+      return Number(record.live_grand_count);
+    }
+    return Number(record?.payment_count ?? 0);
+  };
+
   const selectedRecord = records.find((record) => record[recordIdField] === openMenuId) || null;
   const detailPayments = detailData?.payments || [];
+  const detailArReceipts = detailData?.arReceipts || [];
+  const detailTotals = detailData?.totals;
+  const detailSubmittedSnapshot = detailData?.submittedSnapshot;
+  const cashDetailTotals = isCashDepositTab ? detailData?.totals : null;
   const verifyPayments = verifyData?.payments || [];
+  const verifyArReceipts = verifyData?.arReceipts || [];
+  const verifyTotals = verifyData?.totals;
+
+  const detailPieLines = useMemo(() => {
+    if (isCashDepositTab) return [];
+    const fromPay = detailPayments.map((p) => ({
+      payment_method: p.payment_method,
+      program_level_tag: (p.program_level_tag || 'Unassigned').trim() || 'Unassigned',
+      payable_amount: Number(p.payable_amount) || 0,
+      tip_amount: Number(p.tip_amount) || 0,
+    }));
+    const fromAr = detailArReceipts.map((a) => ({
+      payment_method: a.payment_method,
+      program_level_tag: (a.program_level_tag || a.level_tag || 'Unassigned').trim() || 'Unassigned',
+      payable_amount: Number(a.payment_amount) || 0,
+      tip_amount: Number(a.tip_amount) || 0,
+    }));
+    return [...fromPay, ...fromAr];
+  }, [detailPayments, detailArReceipts, isCashDepositTab]);
+
   const detailMethodPieData = useMemo(() => {
-    if (isCashDepositTab || detailPayments.length === 0) return [];
-    const totals = detailPayments.reduce((acc, payment) => {
+    if (isCashDepositTab || detailPieLines.length === 0) return [];
+    const totals = detailPieLines.reduce((acc, payment) => {
       const key = (payment.payment_method || 'Unknown').trim() || 'Unknown';
       const line = (Number(payment.payable_amount) || 0) + (Number(payment.tip_amount) || 0);
       acc[key] = (acc[key] || 0) + line;
       return acc;
     }, {});
     return Object.entries(totals).map(([name, value]) => ({ name, value }));
-  }, [detailPayments, isCashDepositTab]);
+  }, [detailPieLines, isCashDepositTab]);
 
   const detailLevelPieData = useMemo(() => {
-    if (isCashDepositTab || detailPayments.length === 0) return [];
-    const totals = detailPayments.reduce((acc, payment) => {
+    if (isCashDepositTab || detailPieLines.length === 0) return [];
+    const totals = detailPieLines.reduce((acc, payment) => {
       const key = (payment.program_level_tag || 'Unassigned').trim() || 'Unassigned';
       const line = (Number(payment.payable_amount) || 0) + (Number(payment.tip_amount) || 0);
       acc[key] = (acc[key] || 0) + line;
       return acc;
     }, {});
     return Object.entries(totals).map(([name, value]) => ({ name, value }));
-  }, [detailPayments, isCashDepositTab]);
+  }, [detailPieLines, isCashDepositTab]);
+
+  const detailPieSum = useMemo(
+    () => detailMethodPieData.reduce((s, x) => s + (Number(x.value) || 0), 0),
+    [detailMethodPieData]
+  );
+
+  const cashDepositTotalsDrift =
+    isCashDepositTab &&
+    cashDetailTotals &&
+    detailSubmittedSnapshot &&
+    (Math.abs(
+      Number(detailSubmittedSnapshot.total_deposit_amount ?? 0) - Number(cashDetailTotals.total_deposit_amount ?? 0)
+    ) > 0.01 ||
+      Math.abs(
+        Number(detailSubmittedSnapshot.total_cash_amount ?? 0) - Number(cashDetailTotals.total_cash_amount ?? 0)
+      ) > 0.01 ||
+      Number(detailSubmittedSnapshot.payment_count ?? 0) !== Number(cashDetailTotals.payment_count ?? 0) ||
+      Number(detailSubmittedSnapshot.completed_cash_count ?? 0) !== Number(cashDetailTotals.completed_cash_count ?? 0));
+
   const detailMetrics = isCashDepositTab
     ? [
         { label: 'Period', value: formatPeriod(detailModal.record) },
-        { label: 'Cash to Deposit', value: formatCurrency(detailModal.record?.total_deposit_amount) },
-        { label: 'All Cash in Range', value: formatCurrency(detailModal.record?.total_cash_amount) },
-        { label: 'Completed Cash Rows', value: detailModal.record?.completed_cash_count ?? 0 },
-        { label: 'Cash Rows', value: detailModal.record?.payment_count ?? 0 },
+        {
+          label: 'Cash to Deposit',
+          value: formatCurrency(cashDetailTotals?.total_deposit_amount ?? detailModal.record?.total_deposit_amount),
+        },
+        {
+          label: 'All Cash in Range',
+          value: formatCurrency(cashDetailTotals?.total_cash_amount ?? detailModal.record?.total_cash_amount),
+        },
+        {
+          label: 'Completed Cash Rows',
+          value: cashDetailTotals?.completed_cash_count ?? detailModal.record?.completed_cash_count ?? 0,
+        },
+        {
+          label: 'Cash Rows',
+          value: cashDetailTotals?.payment_count ?? detailModal.record?.payment_count ?? 0,
+        },
       ]
     : [
         { label: 'Date', value: formatPeriod(detailModal.record) },
-        { label: 'Total Amount', value: formatCurrency(detailModal.record?.total_amount) },
-        { label: 'Payments Count', value: detailModal.record?.payment_count ?? 0 },
+        {
+          label: 'Total amount',
+          value: formatCurrency(
+            detailTotals?.grand_total ?? detailModal.record?.total_amount
+          ),
+        },
+        {
+          label: 'Records',
+          value:
+            detailTotals?.grand_count ?? detailModal.record?.payment_count ?? 0,
+        },
+        ...(detailTotals && !detailLoading
+          ? [
+              {
+                label: 'Completed payments',
+                value: `${formatCurrency(detailTotals.completed_total)} · ${detailTotals.completed_count} row(s)`,
+              },
+              {
+                label: 'AR sales (standalone)',
+                value: `${formatCurrency(detailTotals.ar_total)} · ${detailTotals.ar_count} receipt(s)`,
+              },
+            ]
+          : []),
       ];
 
   return (
@@ -389,7 +538,7 @@ const DailySummarySalesApprovalPage = () => {
             <option value="">All</option>
             <option value="Submitted">Submitted</option>
             <option value="Approved">Verified</option>
-            <option value="Rejected">Flagged</option>
+            <option value="Returned">Returned</option>
           </select>
         </div>
         <div>
@@ -454,10 +603,12 @@ const DailySummarySalesApprovalPage = () => {
                   <td className="px-4 py-3 text-sm text-gray-900">{record.branch_name || '-'}</td>
                   <td className="px-4 py-3 text-sm text-gray-900">{formatPeriod(record)}</td>
                   <td className="px-4 py-3 text-sm font-medium text-gray-900">
-                    {formatCurrency(isCashDepositTab ? record.total_deposit_amount : record.total_amount)}
+                    {formatCurrency(
+                      isCashDepositTab ? record.total_deposit_amount : endOfShiftListAmount(record)
+                    )}
                   </td>
                   <td className="px-4 py-3 text-sm text-gray-700">
-                    {isCashDepositTab ? (record.completed_cash_count ?? 0) : (record.payment_count ?? 0)}
+                    {isCashDepositTab ? (record.completed_cash_count ?? 0) : endOfShiftListPaymentCount(record)}
                   </td>
                   <td className="px-4 py-3 text-sm text-gray-700">
                     {isCashDepositTab ? (record.payment_count ?? 0) : statusBadge(record.status)}
@@ -467,7 +618,7 @@ const DailySummarySalesApprovalPage = () => {
                   ) : null}
                   <td className="px-4 py-3 text-sm text-gray-600">{record.submitted_by_name || '-'}</td>
                   {!isCashDepositTab ? (
-                    <td className="px-4 py-3 text-sm text-gray-600">{record.approved_by_name || '-'}</td>
+                    <td className="px-4 py-3 text-sm text-gray-600">{summaryVerificationActorLabel(record)}</td>
                   ) : null}
                   <td className="px-4 py-3 text-right whitespace-nowrap align-middle">
                     <div className="inline-flex items-center justify-end">
@@ -522,7 +673,9 @@ const DailySummarySalesApprovalPage = () => {
               >
                 View details
               </button>
-              {canVerifySummary && selectedRecord?.status === 'Submitted' ? (
+              {canVerifySummary &&
+              selectedRecord &&
+              ['Submitted', 'Returned', 'Rejected'].includes(String(selectedRecord.status || '')) ? (
                 <>
                   <button
                     type="button"
@@ -617,18 +770,21 @@ const DailySummarySalesApprovalPage = () => {
               <span className="text-gray-600">{formatPeriod(verifyModal.record)}</span>
               <span className="font-semibold text-green-600">
                 {isCashDepositTab
-                  ? `Deposit: ${formatCurrency(verifyModal.record.total_deposit_amount)}`
-                  : `Total: ${formatCurrency(verifyModal.record.total_amount)} (${verifyModal.record.payment_count ?? 0} payment(s))`}
+                  ? !verifyLoading && verifyTotals
+                    ? `Deposit: ${formatCurrency(verifyTotals.total_deposit_amount)} · All cash: ${formatCurrency(
+                        verifyTotals.total_cash_amount
+                      )} (${verifyTotals.completed_cash_count ?? 0} completed / ${verifyTotals.payment_count ?? 0} rows)`
+                    : `Deposit: ${formatCurrency(verifyModal.record.total_deposit_amount)} · All cash: ${formatCurrency(
+                        verifyModal.record.total_cash_amount
+                      )} (${verifyModal.record.completed_cash_count ?? 0} completed / ${verifyModal.record.payment_count ?? 0} rows at submit)`
+                  : !verifyLoading && verifyTotals
+                    ? `Total: ${formatCurrency(verifyTotals.grand_total)} (${verifyTotals.grand_count} lines: ${verifyTotals.completed_count} payments + ${verifyTotals.ar_count} AR)`
+                    : `Total: ${formatCurrency(verifyModal.record.total_amount)} (${verifyModal.record.payment_count ?? 0} at submit)`}
               </span>
-              {isCashDepositTab ? (
-                <span className="text-gray-600">
-                  All Cash: {formatCurrency(verifyModal.record.total_cash_amount)} ({verifyModal.record.payment_count ?? 0} row(s))
-                </span>
-              ) : null}
             </div>
             <div className="mt-4 shrink-0">
               <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-2">
-                {isCashDepositTab ? 'Cash payment records (from payment logs)' : 'Payment records (from payment logs)'}
+                {isCashDepositTab ? 'Cash payment records (from payment logs)' : 'Completed payments (payment logs)'}
               </p>
               {verifyLoading ? (
                 <p className="text-sm text-gray-500 py-4">Loading payment records...</p>
@@ -644,7 +800,7 @@ const DailySummarySalesApprovalPage = () => {
                         <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Student</th>
                         <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Issue Date</th>
                         <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Method</th>
-                        <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase">Amount</th>
+                        <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase">Collected</th>
                         <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
                         <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Reference</th>
                       </tr>
@@ -657,8 +813,12 @@ const DailySummarySalesApprovalPage = () => {
                           </td>
                         </tr>
                       ) : (
-                        verifyPayments.map((payment) => (
-                          <tr key={payment.payment_id} className="hover:bg-gray-50/80">
+                        verifyPayments.map((payment) => {
+                          const tip = Number(payment.tip_amount) || 0;
+                          const payable = Number(payment.payable_amount) || 0;
+                          const collected = payable + tip;
+                          return (
+                          <tr key={`verify-cash-${payment.payment_id}`} className="hover:bg-gray-50/80">
                             <td className="px-3 py-2 font-medium text-gray-900 whitespace-nowrap">
                               {payment.invoice_id ? `INV-${payment.invoice_id}` : '-'}
                             </td>
@@ -669,8 +829,13 @@ const DailySummarySalesApprovalPage = () => {
                             </td>
                             <td className="px-3 py-2 text-gray-700 whitespace-nowrap">{formatDateManila(payment.issue_date)}</td>
                             <td className="px-3 py-2 text-gray-700 whitespace-nowrap">{payment.payment_method || '-'}</td>
-                            <td className="px-3 py-2 text-right font-semibold text-green-600 whitespace-nowrap">
-                              {formatCurrency(payment.payable_amount)}
+                            <td className="px-3 py-2 text-right font-semibold text-green-600 whitespace-nowrap align-top">
+                              <div>{formatCurrency(collected)}</div>
+                              {tip > 0 ? (
+                                <div className="text-[10px] text-gray-500 font-normal mt-0.5">
+                                  {formatCurrency(payable)} + tip {formatCurrency(tip)}
+                                </div>
+                              ) : null}
                             </td>
                             <td className="px-3 py-2 whitespace-nowrap">{statusBadge(payment.status)}</td>
                             <td className="px-3 py-2 text-gray-500 min-w-0 max-w-[120px]">
@@ -679,18 +844,24 @@ const DailySummarySalesApprovalPage = () => {
                               </span>
                             </td>
                           </tr>
-                        ))
+                          );
+                        })
                       )}
                     </tbody>
                   </table>
                 </div>
               ) : (
-                <div className="rounded-lg border border-gray-200 max-h-56 overflow-y-auto min-w-0 overflow-x-hidden">
-                  <table className="w-full table-fixed border-collapse text-[11px] sm:text-xs">
+                <>
+                <div
+                  className="rounded-lg border border-gray-200 max-h-56 overflow-y-auto min-w-0"
+                  style={{ scrollbarWidth: 'thin', scrollbarColor: '#cbd5e0 #f7fafc', WebkitOverflowScrolling: 'touch' }}
+                >
+                  <div className="overflow-x-auto rounded-lg" style={{ scrollbarWidth: 'thin', scrollbarColor: '#cbd5e0 #f7fafc', WebkitOverflowScrolling: 'touch' }}>
+                  <table className="border-collapse text-[11px] sm:text-xs" style={{ width: '100%', minWidth: '960px' }}>
                     <thead className="bg-gray-50 sticky top-0">
                       <tr>
                         <th className="w-[8%] py-2 ps-4 pe-2 text-left font-medium text-gray-500 uppercase tracking-wide border-b border-gray-200">Invoice</th>
-                        <th className="w-[9%] py-2 px-2 text-left font-medium text-gray-500 uppercase tracking-wide border-b border-gray-200">Date</th>
+                        <th className="w-[9%] py-2 px-2 text-left font-medium text-gray-500 uppercase tracking-wide border-b border-gray-200">Pay date</th>
                         <th className="w-[15%] py-2 px-2 text-left font-medium text-gray-500 uppercase tracking-wide border-b border-gray-200">Student</th>
                         <th className="w-[10%] py-2 px-2 text-left font-medium text-gray-500 uppercase tracking-wide border-b border-gray-200">Level tag</th>
                         <th className="w-[10%] py-2 px-2 text-left font-medium text-gray-500 uppercase tracking-wide border-b border-gray-200">Payment method</th>
@@ -704,7 +875,7 @@ const DailySummarySalesApprovalPage = () => {
                       {verifyPayments.length === 0 ? (
                         <tr>
                           <td colSpan={9} className="px-3 py-4 text-center text-gray-500 border-b border-gray-100">
-                            No payment records found for this submission.
+                            No completed payment rows for this summary date.
                           </td>
                         </tr>
                       ) : (
@@ -720,7 +891,7 @@ const DailySummarySalesApprovalPage = () => {
                                 {payment.invoice_id ? `INV-${payment.invoice_id}` : '-'}
                               </td>
                               <td className="py-2 px-2 text-gray-700 truncate align-top">
-                                {payment.invoice_date ? formatDateManila(payment.invoice_date) : '-'}
+                                {payment.issue_date ? formatDateManila(payment.issue_date) : '-'}
                               </td>
                               <td className="py-2 px-2 text-gray-700 min-w-0 align-top">
                                 <span className="truncate block" title={payment.student_name || '-'}>
@@ -768,7 +939,78 @@ const DailySummarySalesApprovalPage = () => {
                       )}
                     </tbody>
                   </table>
+                  </div>
                 </div>
+
+                <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-2 mt-6">
+                  Standalone AR receipts
+                </p>
+                <div
+                  className="rounded-lg border border-gray-200 max-h-40 overflow-y-auto min-w-0"
+                  style={{ scrollbarWidth: 'thin', scrollbarColor: '#cbd5e0 #f7fafc', WebkitOverflowScrolling: 'touch' }}
+                >
+                  <div className="overflow-x-auto rounded-lg" style={{ scrollbarWidth: 'thin', scrollbarColor: '#cbd5e0 #f7fafc', WebkitOverflowScrolling: 'touch' }}>
+                    <table className="border-collapse text-[11px] sm:text-xs" style={{ width: '100%', minWidth: '720px' }}>
+                      <thead className="bg-gray-50 sticky top-0">
+                        <tr>
+                          <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">AR #</th>
+                          <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Pay date</th>
+                          <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Prospect</th>
+                          <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Level</th>
+                          <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Method</th>
+                          <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase">Collected</th>
+                          <th className="px-3 py-2 text-center text-xs font-medium text-gray-500 uppercase">Image</th>
+                          <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Reference</th>
+                        </tr>
+                      </thead>
+                      <tbody className="bg-white divide-y divide-gray-200">
+                        {verifyArReceipts.length === 0 ? (
+                          <tr>
+                            <td colSpan={8} className="px-3 py-3 text-center text-gray-500">
+                              No standalone AR receipts for this date.
+                            </td>
+                          </tr>
+                        ) : (
+                          verifyArReceipts.map((ar) => {
+                            const tip = Number(ar.tip_amount) || 0;
+                            const pam = Number(ar.payment_amount) || 0;
+                            const collected = pam + tip;
+                            const attUrl = (ar.payment_attachment_url || '').trim();
+                            return (
+                              <tr key={`verify-ar-${ar.ack_receipt_id}`}>
+                                <td className="px-3 py-2 font-medium whitespace-nowrap">{ar.ack_receipt_number || `#${ar.ack_receipt_id}`}</td>
+                                <td className="px-3 py-2 whitespace-nowrap">{ar.issue_date ? formatDateManila(ar.issue_date) : '-'}</td>
+                                <td className="px-3 py-2 min-w-0 max-w-[160px] truncate" title={ar.prospect_student_name || ''}>
+                                  {ar.prospect_student_name || '-'}
+                                </td>
+                                <td className="px-3 py-2 min-w-0 max-w-[100px] truncate">{ar.program_level_tag || '-'}</td>
+                                <td className="px-3 py-2 whitespace-nowrap">{ar.payment_method || '-'}</td>
+                                <td className="px-3 py-2 text-right font-semibold text-green-600">{formatCurrency(collected)}</td>
+                                <td className="px-3 py-2 text-center">
+                                  {attUrl ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => setPaymentAttachmentViewerUrl(attUrl)}
+                                      className="text-xs text-primary-600 hover:underline"
+                                    >
+                                      View
+                                    </button>
+                                  ) : (
+                                    '—'
+                                  )}
+                                </td>
+                                <td className="px-3 py-2 text-gray-500 truncate max-w-[120px]" title={ar.reference_number || ''}>
+                                  {ar.reference_number || '-'}
+                                </td>
+                              </tr>
+                            );
+                          })
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+                </>
               )}
             </div>
             <div className="mt-6 flex justify-end gap-2 shrink-0">
@@ -866,7 +1108,9 @@ const DailySummarySalesApprovalPage = () => {
                 </div>
                 <div className="rounded-lg border border-gray-100 bg-gray-50 px-3 py-2">
                   <p className="text-[11px] font-medium text-gray-500 uppercase tracking-wide">Verified By</p>
-                  <p className="mt-1 text-gray-900 font-medium truncate">{detailModal.record.approved_by_name || '-'}</p>
+                  <p className="mt-1 text-gray-900 font-medium truncate">
+                    {summaryVerificationActorLabel(detailModal.record)}
+                  </p>
                 </div>
                 <div className="rounded-lg border border-gray-100 bg-gray-50 px-3 py-2">
                   <p className="text-[11px] font-medium text-gray-500 uppercase tracking-wide">Verified At</p>
@@ -897,6 +1141,25 @@ const DailySummarySalesApprovalPage = () => {
                   </div>
                 ) : null}
               </div>
+
+              {isCashDepositTab && !detailLoading && cashDepositTotalsDrift ? (
+                <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                  Submitted amounts: Cash to Deposit{' '}
+                  <span className="font-semibold">
+                    {formatCurrency(detailSubmittedSnapshot.total_deposit_amount)}
+                  </span>
+                  , All cash{' '}
+                  <span className="font-semibold">{formatCurrency(detailSubmittedSnapshot.total_cash_amount)}</span>
+                  {' '}
+                  ({detailSubmittedSnapshot.completed_cash_count ?? 0} completed / {detailSubmittedSnapshot.payment_count ?? 0}{' '}
+                  rows). Current recalculated for this period: Cash to Deposit{' '}
+                  <span className="font-semibold">{formatCurrency(cashDetailTotals.total_deposit_amount)}</span>, All cash{' '}
+                  <span className="font-semibold">{formatCurrency(cashDetailTotals.total_cash_amount)}</span>
+                  {' '}
+                  ({cashDetailTotals.completed_cash_count ?? 0} completed / {cashDetailTotals.payment_count ?? 0} rows) — payment
+                  lines may have changed after submission (includes payable + tip on cash rows).
+                </div>
+              ) : null}
 
               <div className="mt-4">
               {!isCashDepositTab && (
@@ -967,8 +1230,18 @@ const DailySummarySalesApprovalPage = () => {
                   </div>
                 </div>
               )}
+              {!isCashDepositTab && detailTotals && detailMethodPieData.length > 0 ? (
+                <p className="mb-4 text-[11px] text-gray-500">
+                  Segment totals match <span className="font-medium text-gray-700">total amount</span> (
+                  {formatCurrency(detailTotals.grand_total)}
+                  {Math.abs(detailPieSum - Number(detailTotals.grand_total || 0)) > 0.02
+                    ? ` · segment sum ${formatCurrency(detailPieSum)}`
+                    : ''}
+                  ) for this summary date (completed payments + standalone AR).
+                </p>
+              ) : null}
               <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-2">
-                {isCashDepositTab ? 'Cash payment records (from payment logs)' : 'Payment records (from payment logs)'}
+                {isCashDepositTab ? 'Cash payment records (from payment logs)' : 'Completed payments (payment logs)'}
               </p>
               {detailLoading ? (
                 <p className="text-sm text-gray-500 py-4">Loading payment records...</p>
@@ -985,7 +1258,7 @@ const DailySummarySalesApprovalPage = () => {
                         <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Program/Level Tag</th>
                         <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Issue Date</th>
                         <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Method</th>
-                        <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase">Amount</th>
+                        <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase">Collected</th>
                         <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
                         <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Reference</th>
                       </tr>
@@ -998,8 +1271,12 @@ const DailySummarySalesApprovalPage = () => {
                           </td>
                         </tr>
                       ) : (
-                        detailPayments.map((payment) => (
-                          <tr key={payment.payment_id} className="hover:bg-gray-50/80">
+                        detailPayments.map((payment) => {
+                          const tip = Number(payment.tip_amount) || 0;
+                          const payable = Number(payment.payable_amount) || 0;
+                          const collected = payable + tip;
+                          return (
+                          <tr key={`cash-detail-${payment.payment_id}`} className="hover:bg-gray-50/80">
                             <td className="px-3 py-2 font-medium text-gray-900 whitespace-nowrap">
                               {payment.invoice_id ? `INV-${payment.invoice_id}` : '-'}
                             </td>
@@ -1015,8 +1292,13 @@ const DailySummarySalesApprovalPage = () => {
                             </td>
                             <td className="px-3 py-2 text-gray-700 whitespace-nowrap">{formatDateManila(payment.issue_date)}</td>
                             <td className="px-3 py-2 text-gray-700 whitespace-nowrap">{payment.payment_method || '-'}</td>
-                            <td className="px-3 py-2 text-right font-semibold text-green-600 whitespace-nowrap">
-                              {formatCurrency(payment.payable_amount)}
+                            <td className="px-3 py-2 text-right font-semibold text-green-600 whitespace-nowrap align-top">
+                              <div>{formatCurrency(collected)}</div>
+                              {tip > 0 ? (
+                                <div className="text-[10px] text-gray-500 font-normal mt-0.5">
+                                  {formatCurrency(payable)} + tip {formatCurrency(tip)}
+                                </div>
+                              ) : null}
                             </td>
                             <td className="px-3 py-2 whitespace-nowrap">{statusBadge(payment.status)}</td>
                             <td className="px-3 py-2 text-gray-500 min-w-0 max-w-[120px]">
@@ -1025,18 +1307,24 @@ const DailySummarySalesApprovalPage = () => {
                               </span>
                             </td>
                           </tr>
-                        ))
+                          );
+                        })
                       )}
                     </tbody>
                   </table>
                 </div>
               ) : (
-                <div className="rounded-lg border border-gray-200 max-h-56 overflow-y-auto min-w-0 overflow-x-hidden">
-                  <table className="w-full table-fixed border-collapse text-[11px] sm:text-xs">
+                <>
+                <div
+                  className="rounded-lg border border-gray-200 max-h-56 overflow-y-auto min-w-0"
+                  style={{ scrollbarWidth: 'thin', scrollbarColor: '#cbd5e0 #f7fafc', WebkitOverflowScrolling: 'touch' }}
+                >
+                  <div className="overflow-x-auto rounded-lg" style={{ scrollbarWidth: 'thin', scrollbarColor: '#cbd5e0 #f7fafc', WebkitOverflowScrolling: 'touch' }}>
+                  <table className="border-collapse text-[11px] sm:text-xs" style={{ width: '100%', minWidth: '960px' }}>
                     <thead className="bg-gray-50 sticky top-0">
                       <tr>
                         <th className="w-[8%] py-2 ps-4 pe-2 text-left font-medium text-gray-500 uppercase tracking-wide border-b border-gray-200">Invoice</th>
-                        <th className="w-[9%] py-2 px-2 text-left font-medium text-gray-500 uppercase tracking-wide border-b border-gray-200">Date</th>
+                        <th className="w-[9%] py-2 px-2 text-left font-medium text-gray-500 uppercase tracking-wide border-b border-gray-200">Pay date</th>
                         <th className="w-[15%] py-2 px-2 text-left font-medium text-gray-500 uppercase tracking-wide border-b border-gray-200">Student</th>
                         <th className="w-[10%] py-2 px-2 text-left font-medium text-gray-500 uppercase tracking-wide border-b border-gray-200">Level tag</th>
                         <th className="w-[10%] py-2 px-2 text-left font-medium text-gray-500 uppercase tracking-wide border-b border-gray-200">Payment method</th>
@@ -1050,7 +1338,7 @@ const DailySummarySalesApprovalPage = () => {
                       {detailPayments.length === 0 ? (
                         <tr>
                           <td colSpan={9} className="px-3 py-4 text-center text-gray-500 border-b border-gray-100">
-                            No payment records found for this submission.
+                            No completed payment rows for this summary date (payments with status Completed).
                           </td>
                         </tr>
                       ) : (
@@ -1066,7 +1354,7 @@ const DailySummarySalesApprovalPage = () => {
                                 {payment.invoice_id ? `INV-${payment.invoice_id}` : '-'}
                               </td>
                               <td className="py-2 px-2 text-gray-700 truncate align-top">
-                                {payment.invoice_date ? formatDateManila(payment.invoice_date) : '-'}
+                                {payment.issue_date ? formatDateManila(payment.issue_date) : '-'}
                               </td>
                               <td className="py-2 px-2 text-gray-700 min-w-0 align-top">
                                 <span className="truncate block" title={payment.student_name || '-'}>
@@ -1114,13 +1402,103 @@ const DailySummarySalesApprovalPage = () => {
                       )}
                     </tbody>
                   </table>
+                  </div>
                 </div>
+
+                <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-2 mt-6">
+                  Standalone AR receipts (included in total; not yet posted as invoice payments)
+                </p>
+                <div
+                  className="rounded-lg border border-gray-200 max-h-48 overflow-y-auto min-w-0"
+                  style={{ scrollbarWidth: 'thin', scrollbarColor: '#cbd5e0 #f7fafc', WebkitOverflowScrolling: 'touch' }}
+                >
+                  <div className="overflow-x-auto rounded-lg" style={{ scrollbarWidth: 'thin', scrollbarColor: '#cbd5e0 #f7fafc', WebkitOverflowScrolling: 'touch' }}>
+                    <table className="border-collapse text-[11px] sm:text-xs" style={{ width: '100%', minWidth: '720px' }}>
+                      <thead className="bg-gray-50 sticky top-0">
+                        <tr>
+                          <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">AR #</th>
+                          <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Pay date</th>
+                          <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Prospect / student</th>
+                          <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Level</th>
+                          <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Method</th>
+                          <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase">Collected</th>
+                          <th className="px-3 py-2 text-center text-xs font-medium text-gray-500 uppercase">Image</th>
+                          <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Reference</th>
+                        </tr>
+                      </thead>
+                      <tbody className="bg-white divide-y divide-gray-200">
+                        {detailArReceipts.length === 0 ? (
+                          <tr>
+                            <td colSpan={8} className="px-3 py-4 text-center text-gray-500">
+                              No standalone AR receipts for this summary date.
+                            </td>
+                          </tr>
+                        ) : (
+                          detailArReceipts.map((ar) => {
+                            const tip = Number(ar.tip_amount) || 0;
+                            const pam = Number(ar.payment_amount) || 0;
+                            const collected = pam + tip;
+                            const attUrl = (ar.payment_attachment_url || '').trim();
+                            return (
+                              <tr key={`ar-${ar.ack_receipt_id}`} className="hover:bg-gray-50/80">
+                                <td className="px-3 py-2 font-medium text-gray-900 whitespace-nowrap">
+                                  {ar.ack_receipt_number || `#${ar.ack_receipt_id}`}
+                                </td>
+                                <td className="px-3 py-2 text-gray-700 whitespace-nowrap">
+                                  {ar.issue_date ? formatDateManila(ar.issue_date) : '-'}
+                                </td>
+                                <td className="px-3 py-2 text-gray-700 min-w-0 max-w-[180px]">
+                                  <span className="truncate block" title={ar.prospect_student_name || '-'}>
+                                    {ar.prospect_student_name || '-'}
+                                  </span>
+                                </td>
+                                <td className="px-3 py-2 text-gray-700 min-w-0 max-w-[120px]">
+                                  <span className="truncate block" title={ar.program_level_tag || '-'}>
+                                    {ar.program_level_tag || '-'}
+                                  </span>
+                                </td>
+                                <td className="px-3 py-2 text-gray-700 whitespace-nowrap">{ar.payment_method || '-'}</td>
+                                <td className="px-3 py-2 text-right font-semibold text-green-600 tabular-nums whitespace-nowrap">
+                                  <div>{formatCurrency(collected)}</div>
+                                  {tip > 0 ? (
+                                    <div className="text-[10px] text-gray-500 mt-0.5">
+                                      {formatCurrency(pam)} + tip {formatCurrency(tip)}
+                                    </div>
+                                  ) : null}
+                                </td>
+                                <td className="px-3 py-2 text-center whitespace-nowrap">
+                                  {attUrl ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => setPaymentAttachmentViewerUrl(attUrl)}
+                                      className="text-xs font-medium text-primary-600 hover:text-primary-800 hover:underline"
+                                    >
+                                      View
+                                    </button>
+                                  ) : (
+                                    <span className="text-gray-400">—</span>
+                                  )}
+                                </td>
+                                <td className="px-3 py-2 text-gray-500 min-w-0 max-w-[140px]">
+                                  <span className="truncate block" title={ar.reference_number || '-'}>
+                                    {ar.reference_number || '-'}
+                                  </span>
+                                </td>
+                              </tr>
+                            );
+                          })
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+                </>
               )}
               </div>
 
               <div className="mt-4">
                 <p className="text-xs font-medium text-gray-500">
-                  {detailModal.record.status === 'Rejected' ? 'Flag reason' : 'Remarks'}
+                  {isFinanceReturnedSummaryStatus(detailModal.record.status) ? 'Return reason' : 'Remarks'}
                 </p>
                 <p className="mt-1 text-sm text-gray-800 whitespace-pre-line">
                   {detailModal.record.remarks && detailModal.record.remarks.trim()

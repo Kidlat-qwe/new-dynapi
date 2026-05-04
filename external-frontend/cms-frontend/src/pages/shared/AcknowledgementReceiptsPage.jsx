@@ -149,6 +149,12 @@ const AcknowledgementReceiptsPage = () => {
     return latest;
   };
 
+  /** Finance return adds "[Returned]" to notes; issue_date must stay fixed for EOD (including after resubmit to Submitted). */
+  const isAckIssueDateLocked = (receipt) =>
+    !!receipt &&
+    (String(receipt.status || '') === 'Returned' ||
+      String(receipt.prospect_student_notes || '').includes('[Returned]'));
+
   useEffect(() => {
     fetchReceipts(initialPage);
 
@@ -564,8 +570,8 @@ const AcknowledgementReceiptsPage = () => {
       appAlert('Please select an image (JPEG, PNG, WebP, or GIF).');
       return;
     }
-    if (file.size > 5 * 1024 * 1024) {
-      appAlert('Image must be 5 MB or less.');
+    if (file.size > 50 * 1024 * 1024) {
+      appAlert('Image must be 50 MB or less.');
       return;
     }
     setAttachmentUploading(true);
@@ -578,8 +584,23 @@ const AcknowledgementReceiptsPage = () => {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
         body: formData,
       });
-      const data = await res.json();
-      if (!res.ok || !data.success) throw new Error(data.message || 'Upload failed');
+      const contentType = res.headers.get('content-type') || '';
+      let data = null;
+      if (contentType.includes('application/json')) {
+        data = await res.json();
+      } else {
+        const text = await res.text();
+        if (!res.ok) {
+          const msg =
+            res.status === 413
+              ? 'Image is too large for the server. Please compress the image and try again.'
+              : `Upload failed (HTTP ${res.status}).`;
+          throw new Error(msg);
+        }
+        // Unexpected non-JSON success response; fail safely
+        throw new Error('Upload failed: unexpected server response.');
+      }
+      if (!res.ok || !data?.success) throw new Error(data?.message || 'Upload failed');
       setCreateFormData((prev) => ({ ...prev, payment_attachment_url: data.imageUrl || '' }));
     } catch (err) {
       console.error('AR attachment upload error:', err);
@@ -602,8 +623,8 @@ const AcknowledgementReceiptsPage = () => {
       appAlert('Please select an image (JPEG, PNG, WebP, or GIF).');
       return;
     }
-    if (file.size > 5 * 1024 * 1024) {
-      appAlert('Image must be 5 MB or less.');
+    if (file.size > 50 * 1024 * 1024) {
+      appAlert('Image must be 50 MB or less.');
       return;
     }
     setEditAttachmentUploading(true);
@@ -616,8 +637,22 @@ const AcknowledgementReceiptsPage = () => {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
         body: formData,
       });
-      const data = await res.json();
-      if (!res.ok || !data.success) throw new Error(data.message || 'Upload failed');
+      const contentType = res.headers.get('content-type') || '';
+      let data = null;
+      if (contentType.includes('application/json')) {
+        data = await res.json();
+      } else {
+        const text = await res.text();
+        if (!res.ok) {
+          const msg =
+            res.status === 413
+              ? 'Image is too large for the server. Please compress the image and try again.'
+              : `Upload failed (HTTP ${res.status}).`;
+          throw new Error(msg);
+        }
+        throw new Error('Upload failed: unexpected server response.');
+      }
+      if (!res.ok || !data?.success) throw new Error(data?.message || 'Upload failed');
       setEditFormData((prev) => ({ ...prev, payment_attachment_url: data.imageUrl || '' }));
       setEditFormErrors((prev) => {
         const next = { ...prev };
@@ -645,8 +680,8 @@ const AcknowledgementReceiptsPage = () => {
       appAlert('Please select an image (JPEG, PNG, WebP, or GIF).');
       return;
     }
-    if (file.size > 5 * 1024 * 1024) {
-      appAlert('Image must be 5 MB or less.');
+    if (file.size > 50 * 1024 * 1024) {
+      appAlert('Image must be 50 MB or less.');
       return;
     }
     setViewModalAttachmentUploading(true);
@@ -659,8 +694,22 @@ const AcknowledgementReceiptsPage = () => {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
         body: formData,
       });
-      const data = await res.json();
-      if (!res.ok || !data.success) throw new Error(data.message || 'Upload failed');
+      const contentType = res.headers.get('content-type') || '';
+      let data = null;
+      if (contentType.includes('application/json')) {
+        data = await res.json();
+      } else {
+        const text = await res.text();
+        if (!res.ok) {
+          const msg =
+            res.status === 413
+              ? 'Image is too large for the server. Please compress the image and try again.'
+              : `Upload failed (HTTP ${res.status}).`;
+          throw new Error(msg);
+        }
+        throw new Error('Upload failed: unexpected server response.');
+      }
+      if (!res.ok || !data?.success) throw new Error(data?.message || 'Upload failed');
       setViewModalAttachmentUrl(data.imageUrl || '');
     } catch (err) {
       console.error('AR view modal attachment upload error:', err);
@@ -720,7 +769,19 @@ const AcknowledgementReceiptsPage = () => {
       appAlert('Invalid payment method on this receipt.');
       return;
     }
-    const issueToday = todayManilaYMD();
+    const fromReceipt =
+      viewReceipt.issue_date != null && String(viewReceipt.issue_date).trim() !== ''
+        ? String(viewReceipt.issue_date).slice(0, 10)
+        : '';
+    const fromForm =
+      viewFormData.issue_date != null && String(viewFormData.issue_date).trim() !== ''
+        ? String(viewFormData.issue_date).slice(0, 10)
+        : '';
+    const issueYmd = fromReceipt || fromForm;
+    if (!issueYmd) {
+      appAlert('Issue date is missing on this receipt.');
+      return;
+    }
     const tipNum =
       viewFormData.tip_amount == null || viewFormData.tip_amount === ''
         ? 0
@@ -741,11 +802,13 @@ const AcknowledgementReceiptsPage = () => {
         level_tag: (viewFormData.level_tag || '').trim() || null,
         reference_number: (viewFormData.reference_number || '').trim() || null,
         payment_method: viewFormData.payment_method || 'Cash',
-        issue_date: issueToday,
         tip_amount: tipNum,
         payment_attachment_url: attach,
         package_id: pkgId,
       };
+      if (!isAckIssueDateLocked(viewReceipt)) {
+        payload.issue_date = issueYmd;
+      }
 
       await apiRequest(`/acknowledgement-receipts/${id}`, {
         method: 'PUT',
@@ -987,11 +1050,10 @@ const AcknowledgementReceiptsPage = () => {
       level_tag: receipt.level_tag || '',
       reference_number: receipt.reference_number || '',
       payment_method: receipt.payment_method || 'Cash',
-      issue_date: asResubmit
-        ? todayManilaYMD()
-        : receipt.issue_date
+      issue_date:
+        receipt.issue_date != null && String(receipt.issue_date).trim() !== ''
           ? String(receipt.issue_date).slice(0, 10)
-          : todayManilaYMD(),
+          : '',
       tip_amount:
         receipt.tip_amount == null || Number(receipt.tip_amount) === 0
           ? ''
@@ -1022,7 +1084,10 @@ const AcknowledgementReceiptsPage = () => {
       level_tag: receipt.level_tag || '',
       reference_number: receipt.reference_number || '',
       payment_method: receipt.payment_method || 'Cash',
-      issue_date: todayManilaYMD(),
+      issue_date:
+        receipt.issue_date != null && String(receipt.issue_date).trim() !== ''
+          ? String(receipt.issue_date).slice(0, 10)
+          : '',
       tip_amount:
         receipt.tip_amount == null || Number(receipt.tip_amount) === 0
           ? ''
@@ -1054,7 +1119,7 @@ const AcknowledgementReceiptsPage = () => {
 
   const handleEditInputChange = (e) => {
     const { name, value } = e.target;
-    if (isResubmitFlow && name === 'issue_date') return;
+    if (isAckIssueDateLocked(editingReceiptMeta) && name === 'issue_date') return;
     if (name === 'package_id') {
       const pkg = packages.find((p) => String(p.package_id) === String(value));
       const packagePrice = Number(pkg?.package_price || 0);
@@ -1091,7 +1156,7 @@ const AcknowledgementReceiptsPage = () => {
     if (!AR_PAYMENT_METHOD_OPTIONS.includes(editFormData.payment_method || '')) {
       errors.payment_method = 'Payment method is required';
     }
-    if (!(editFormData.issue_date || '').trim()) {
+    if (!isAckIssueDateLocked(editingReceiptMeta) && !(editFormData.issue_date || '').trim()) {
       errors.issue_date = 'Issue date is required';
     }
     if (editFormData.tip_amount !== '' && Number(editFormData.tip_amount) < 0) {
@@ -1119,10 +1184,12 @@ const AcknowledgementReceiptsPage = () => {
         level_tag: (editFormData.level_tag || '').trim() || null,
         reference_number: (editFormData.reference_number || '').trim() || null,
         payment_method: editFormData.payment_method || 'Cash',
-        issue_date: isResubmitFlow ? todayManilaYMD() : editFormData.issue_date,
         tip_amount: editFormData.tip_amount === '' ? 0 : Math.max(0, parseFloat(editFormData.tip_amount || '0')),
         payment_attachment_url: (editFormData.payment_attachment_url || '').trim() || null,
       };
+      if (!isAckIssueDateLocked(editingReceiptMeta)) {
+        payload.issue_date = editFormData.issue_date;
+      }
       if (isResubmitFlow && editingReceiptMeta?.ar_type === 'Package') {
         payload.package_id = parseInt(editFormData.package_id, 10);
       }
@@ -1195,8 +1262,8 @@ const AcknowledgementReceiptsPage = () => {
     actionMenuReceipt &&
     actionMenuReceipt.ar_type === 'Package' &&
     actionMenuReceipt.status === 'Returned' &&
-    currentUserId != null &&
-    Number(actionMenuReceipt.created_by) === Number(currentUserId);
+    (arAdminTab === 'return' ||
+      (currentUserId != null && Number(actionMenuReceipt.created_by) === Number(currentUserId)));
   const actionMenuWidthPx = 176;
 
   return (
@@ -2065,7 +2132,7 @@ const AcknowledgementReceiptsPage = () => {
                     </div>
                     <div>
                       <label className="label-field text-xs">Attachment (image) <span className="text-red-600">*</span></label>
-                      <p className="text-xs text-gray-500 mb-1">Required: upload receipt/proof (JPEG, PNG, WebP, GIF – max 5 MB)</p>
+                  <p className="text-xs text-gray-500 mb-1">Required: upload receipt/proof (JPEG, PNG, WebP, GIF – max 50 MB)</p>
                       <input
                         type="file"
                         accept="image/jpeg,image/png,image/webp,image/gif"
@@ -2377,7 +2444,7 @@ const AcknowledgementReceiptsPage = () => {
                 <div>
                   <label className="label-field text-xs">Attachment (image) <span className="text-red-600">*</span></label>
                   <p className="text-xs text-gray-500 mb-1">
-                    Required: upload a receipt or proof of payment (JPEG, PNG, WebP, GIF - max 5 MB)
+                    Required: upload a receipt or proof of payment (JPEG, PNG, WebP, GIF - max 50 MB)
                   </p>
                   <input
                     type="file"
@@ -2615,15 +2682,17 @@ const AcknowledgementReceiptsPage = () => {
                     <input
                       type="date"
                       name="issue_date"
-                      value={isResubmitFlow ? todayManilaYMD() : editFormData.issue_date}
+                      value={editFormData.issue_date}
                       onChange={handleEditInputChange}
-                      readOnly={isResubmitFlow}
-                      tabIndex={isResubmitFlow ? -1 : undefined}
-                      className={`input-field text-sm ${editFormErrors.issue_date ? 'border-red-500' : ''} ${isResubmitFlow ? 'bg-gray-100 cursor-not-allowed' : ''}`}
+                      readOnly={isAckIssueDateLocked(editingReceiptMeta)}
+                      tabIndex={isAckIssueDateLocked(editingReceiptMeta) ? -1 : undefined}
+                      className={`input-field text-sm ${editFormErrors.issue_date ? 'border-red-500' : ''} ${isAckIssueDateLocked(editingReceiptMeta) ? 'bg-gray-100 cursor-not-allowed' : ''}`}
                       disabled={editSaving}
                     />
-                    {isResubmitFlow ? (
-                      <p className="mt-1 text-xs text-gray-500">Always set to today (Manila time) when resubmitting.</p>
+                    {isAckIssueDateLocked(editingReceiptMeta) ? (
+                      <p className="mt-1 text-xs text-gray-500">
+                        Original issue date cannot be changed after Finance returned this AR (used for daily summaries and reports), including after you resubmit.
+                      </p>
                     ) : null}
                     {editFormErrors.issue_date && <p className="mt-1 text-xs text-red-500">{editFormErrors.issue_date}</p>}
                   </div>
@@ -2673,7 +2742,7 @@ const AcknowledgementReceiptsPage = () => {
                   <div className="sm:col-span-2">
                     <label className="label-field text-xs">Attachment <span className="text-red-600">*</span></label>
                     <p className="text-xs text-gray-500 mb-1">
-                      Upload or replace proof of payment (JPEG, PNG, WebP, GIF — max 5 MB)
+                      Upload or replace proof of payment (JPEG, PNG, WebP, GIF — max 50 MB)
                     </p>
                     <input
                       type="file"
@@ -3003,11 +3072,16 @@ const AcknowledgementReceiptsPage = () => {
                           readOnly
                           tabIndex={-1}
                           className="input-field text-sm bg-gray-100 cursor-not-allowed"
-                          value={todayManilaYMD()}
+                          value={
+                            viewFormData.issue_date ||
+                            (viewReceipt?.issue_date ? String(viewReceipt.issue_date).slice(0, 10) : '')
+                          }
                           aria-readonly="true"
                           disabled={viewResubmitSaving}
                         />
-                        <p className="mt-1 text-xs text-gray-500">Always set to today (Manila time).</p>
+                        <p className="mt-1 text-xs text-gray-500">
+                          Issue date stays as recorded on this receipt (not changed on resubmit).
+                        </p>
                       </div>
                     </div>
                     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -3047,7 +3121,7 @@ const AcknowledgementReceiptsPage = () => {
                     Attachment (image) <span className="text-red-600">*</span>
                   </label>
                   <p className="mb-1 text-xs text-gray-500">
-                    Upload or replace proof of payment before resubmitting (JPEG, PNG, WebP, GIF — max 5 MB).
+                    Upload or replace proof of payment before resubmitting (JPEG, PNG, WebP, GIF — max 50 MB).
                   </p>
                   <input
                     type="file"

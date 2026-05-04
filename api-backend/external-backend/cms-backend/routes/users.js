@@ -3,7 +3,7 @@ import { body, param, query as queryValidator } from 'express-validator';
 import { verifyFirebaseToken, requireRole, requireBranchAccess } from '../middleware/auth.js';
 import { handleValidationErrors } from '../middleware/validation.js';
 import { query } from '../config/database.js';
-import admin from '../config/firebase.js';
+import { getCmsAuth } from '../config/firebase.js';
 import { updateFirebaseUserEmail, updateFirebaseUserPassword } from '../utils/firebaseAuthRest.js';
 
 const router = express.Router();
@@ -494,7 +494,7 @@ router.delete(
       // Step 1: Delete from Firebase using Admin SDK (as per requirements)
       if (firebase_uid) {
         try {
-          await admin.auth().deleteUser(firebase_uid);
+          await getCmsAuth().deleteUser(firebase_uid);
           console.log('✅ Firebase user deleted:', firebase_uid);
         } catch (firebaseError) {
           // If Firebase deletion fails, log but continue with database deletion

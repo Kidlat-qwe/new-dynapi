@@ -3,7 +3,7 @@ import { body } from 'express-validator';
 import { verifyFirebaseToken } from '../middleware/auth.js';
 import { handleValidationErrors } from '../middleware/validation.js';
 import { query } from '../config/database.js';
-import admin from '../config/firebase.js';
+import { getCmsAuth } from '../config/firebase.js';
 import { createFirebaseUser } from '../utils/firebaseAuthRest.js';
 
 const router = express.Router();
@@ -292,7 +292,7 @@ router.post(
         // If PostgreSQL insert fails, delete the Firebase user to maintain consistency
         // Use Admin SDK for deletion (as per requirements)
         try {
-          await admin.auth().deleteUser(firebaseUser.uid);
+          await getCmsAuth().deleteUser(firebaseUser.uid);
           console.log('🗑️ Rolled back Firebase user creation due to database error');
         } catch (deleteError) {
           console.error('Error deleting Firebase user during rollback:', deleteError);
